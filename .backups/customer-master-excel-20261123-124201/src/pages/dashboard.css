@@ -1,0 +1,126 @@
+.app-shell .dashboard-page { gap: 20px; }
+.app-shell .dashboard-page-header { margin-bottom: 0; }
+.app-shell .dashboard-page-header .page-description { max-width: 620px; }
+.app-shell .dashboard-approval { padding: 18px 20px; }
+.app-shell .dashboard-section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 14px; }
+.app-shell .dashboard-section-title { display: flex; align-items: center; gap: 9px; color: var(--erp-teal-dark); }
+.app-shell .dashboard-section-title h2 { margin: 0; color: var(--erp-navy); font-size: 15px; font-weight: 500; line-height: 22px; }
+.app-shell .dashboard-count { padding: 4px 8px; color: var(--erp-navy); background: var(--erp-raised); border: 1px solid var(--erp-border); border-radius: 5px; font-size: 11px; font-variant-numeric: tabular-nums; }
+.app-shell .dashboard-empty { margin: 0; color: var(--erp-muted); font-size: 13px; }
+.app-shell .dashboard-metric-section { display: flex; flex-direction: column; gap: 12px; }
+.app-shell .dashboard-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+.app-shell .dashboard-section-heading h2 { margin: 0; color: var(--erp-navy); font-size: 17px; font-weight: 500; line-height: 24px; }
+.app-shell .dashboard-section-heading p { margin: 2px 0 0; color: var(--erp-muted); font-size: 12px; line-height: 18px; }
+.app-shell .dashboard-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.app-shell .dashboard-metric { display: flex; flex-direction: column; min-width: 0; min-height: 116px; padding: 15px 16px 14px; background: #fff; border: 1px solid var(--erp-border); border-radius: 8px; }
+.app-shell .dashboard-metric-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--erp-teal-dark); }
+.app-shell .dashboard-metric-label { color: var(--erp-muted); font-size: 12px; font-weight: 400; line-height: 17px; }
+.app-shell .dashboard-metric-value { margin-top: 10px; overflow: hidden; color: var(--erp-navy); font-size: clamp(17px, 1.55vw, 22px); font-weight: 500; line-height: 1.2; letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.app-shell .dashboard-metric-note { margin-top: 6px; color: var(--erp-muted); font-size: 11px; line-height: 16px; }
+.app-shell .dashboard-metric--positive .dashboard-metric-value { color: var(--erp-navy); }
+.app-shell .dashboard-metric--attention .dashboard-metric-value { color: #80520a; }
+.app-shell .dashboard-metric.is-clickable { cursor: pointer; transition: border-color 140ms ease, background-color 140ms ease; }
+.app-shell .dashboard-metric.is-clickable:hover { background: #f9fcfd; border-color: #adc5cd; }
+.app-shell .dashboard-metric.is-clickable:focus-visible { outline: 2px solid var(--erp-teal); outline-offset: 2px; }
+.app-shell .dashboard-metric--sales-blue { --metric-bg: #f1f6fd; --metric-border: #d4e2f3; --metric-accent: #245c99; }
+.app-shell .dashboard-metric--receivable-amber { --metric-bg: #fff8e9; --metric-border: #f0dfb5; --metric-accent: #8a5a00; }
+.app-shell .dashboard-metric--orders-purple { --metric-bg: #f5f2fb; --metric-border: #e1d8f1; --metric-accent: #624394; }
+.app-shell .dashboard-metric--inventory-teal { --metric-bg: #edf8f7; --metric-border: #cce7e3; --metric-accent: #176d67; }
+.app-shell .dashboard-metric--quotation-violet { --metric-bg: #f6f2fc; --metric-border: #e2d8f2; --metric-accent: #694a9e; }
+.app-shell .dashboard-metric--payable-rose { --metric-bg: #fff2f4; --metric-border: #f0d6dc; --metric-accent: #963d55; }
+.app-shell .dashboard-metric--stock-orange { --metric-bg: #fff5eb; --metric-border: #f1dcc5; --metric-accent: #965014; }
+.app-shell .dashboard-metric--dispatch-green { --metric-bg: #eff8f1; --metric-border: #d2e7d6; --metric-accent: #28683b; }
+.app-shell .dashboard-metric[class*="dashboard-metric--sales-blue"],
+.app-shell .dashboard-metric[class*="dashboard-metric--receivable-amber"],
+.app-shell .dashboard-metric[class*="dashboard-metric--orders-purple"],
+.app-shell .dashboard-metric[class*="dashboard-metric--inventory-teal"],
+.app-shell .dashboard-metric[class*="dashboard-metric--quotation-violet"],
+.app-shell .dashboard-metric[class*="dashboard-metric--payable-rose"],
+.app-shell .dashboard-metric[class*="dashboard-metric--stock-orange"],
+.app-shell .dashboard-metric[class*="dashboard-metric--dispatch-green"] {
+  background: var(--metric-bg);
+  border-color: var(--metric-border);
+  box-shadow: inset 0 3px 0 var(--metric-accent);
+}
+.app-shell .dashboard-metric[class*="dashboard-metric--sales-blue"] .dashboard-metric-top,
+.app-shell .dashboard-metric[class*="dashboard-metric--receivable-amber"] .dashboard-metric-top,
+.app-shell .dashboard-metric[class*="dashboard-metric--orders-purple"] .dashboard-metric-top,
+.app-shell .dashboard-metric[class*="dashboard-metric--inventory-teal"] .dashboard-metric-top,
+.app-shell .dashboard-metric[class*="dashboard-metric--quotation-violet"] .dashboard-metric-top,
+.app-shell .dashboard-metric[class*="dashboard-metric--payable-rose"] .dashboard-metric-top,
+.app-shell .dashboard-metric[class*="dashboard-metric--stock-orange"] .dashboard-metric-top,
+.app-shell .dashboard-metric[class*="dashboard-metric--dispatch-green"] .dashboard-metric-top { color: var(--metric-accent); }
+.app-shell .dashboard-metric[class*="dashboard-metric--sales-blue"] .dashboard-metric-value,
+.app-shell .dashboard-metric[class*="dashboard-metric--receivable-amber"] .dashboard-metric-value,
+.app-shell .dashboard-metric[class*="dashboard-metric--orders-purple"] .dashboard-metric-value,
+.app-shell .dashboard-metric[class*="dashboard-metric--inventory-teal"] .dashboard-metric-value,
+.app-shell .dashboard-metric[class*="dashboard-metric--quotation-violet"] .dashboard-metric-value,
+.app-shell .dashboard-metric[class*="dashboard-metric--payable-rose"] .dashboard-metric-value,
+.app-shell .dashboard-metric[class*="dashboard-metric--stock-orange"] .dashboard-metric-value,
+.app-shell .dashboard-metric[class*="dashboard-metric--dispatch-green"] .dashboard-metric-value { color: var(--metric-accent); }
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--sales-blue"]:hover,
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--receivable-amber"]:hover,
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--orders-purple"]:hover,
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--inventory-teal"]:hover,
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--quotation-violet"]:hover,
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--payable-rose"]:hover,
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--stock-orange"]:hover,
+.app-shell .dashboard-metric.is-clickable[class*="dashboard-metric--dispatch-green"]:hover { background: var(--metric-bg); border-color: var(--metric-accent); }
+.app-shell .dashboard-monthly-summary { padding: 18px 20px; }
+.app-shell .dashboard-monthly-header { align-items: flex-start; margin-bottom: 10px; }
+.app-shell .dashboard-monthly-header h2 { margin: 0; color: var(--erp-navy); font-size: 15px; font-weight: 500; line-height: 22px; }
+.app-shell .dashboard-monthly-header p { margin: 2px 0 0; color: var(--erp-muted); font-size: 12px; }
+.app-shell .dashboard-monthly-table { min-width: 0; }
+.app-shell .dashboard-monthly-table th:nth-child(2), .app-shell .dashboard-monthly-table td:nth-child(2) { width: 140px; text-align: right; }
+.app-shell .dashboard-monthly-table th:last-child, .app-shell .dashboard-monthly-table td:last-child { width: 220px; text-align: right; font-variant-numeric: tabular-nums; }
+.app-shell .dashboard-monthly-empty { margin: 0; padding: 12px 0; color: var(--erp-muted); font-size: 13px; }
+.app-shell .dashboard-action-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.app-shell .dashboard-action { display: inline-flex; align-items: center; justify-content: flex-start; gap: 9px; min-height: 40px; padding: 8px 10px; border-radius: 7px; font-size: 12px; font-weight: 400; line-height: 17px; text-align: left; }
+.app-shell .dashboard-action svg { flex: 0 0 16px; }
+.app-shell .dashboard-actions { padding: 18px 20px; }
+.app-shell .dashboard-type-tag { padding: 3px 7px; color: var(--erp-navy); background: var(--erp-raised); border: 1px solid var(--erp-border); border-radius: 4px; font-size: 11px; }
+.app-shell .dashboard-pending-status { color: #80520a; font-size: 12px; }
+.app-shell .dashboard-empty-cell { padding: 20px; color: var(--erp-muted); text-align: center; }
+.app-shell .dashboard-active-quotations tbody tr[tabindex="0"] { cursor: pointer; }
+.app-shell .dashboard-active-quotations tbody tr[tabindex="0"]:focus-visible { outline: 2px solid var(--erp-teal); outline-offset: -2px; }
+
+@media (max-width: 1150px) {
+  .app-shell .dashboard-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .app-shell .dashboard-action-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 620px) {
+  .app-shell .dashboard-page { gap: 16px; }
+  .app-shell .dashboard-metric-grid, .app-shell .dashboard-metric-grid--store { grid-template-columns: minmax(0, 1fr); }
+  .app-shell .dashboard-metric { min-height: 104px; }
+  .app-shell .dashboard-action-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .app-shell .dashboard-monthly-summary { padding: 16px 12px; }
+  .app-shell .dashboard-monthly-table th:nth-child(2), .app-shell .dashboard-monthly-table td:nth-child(2) { width: auto; }
+  .app-shell .dashboard-monthly-table th:last-child, .app-shell .dashboard-monthly-table td:last-child { width: auto; }
+}
+
+@media (prefers-color-scheme: dark) {
+  .app-shell .dashboard-metric--sales-blue { --metric-bg: #1b2a3e; --metric-border: #344c68; --metric-accent: #a7c9f3; }
+  .app-shell .dashboard-metric--receivable-amber { --metric-bg: #302a1d; --metric-border: #5d4b2d; --metric-accent: #f0ca79; }
+  .app-shell .dashboard-metric--orders-purple { --metric-bg: #29243a; --metric-border: #4d426c; --metric-accent: #c8b4ef; }
+  .app-shell .dashboard-metric--inventory-teal { --metric-bg: #1c302f; --metric-border: #365c59; --metric-accent: #92d2c9; }
+  .app-shell .dashboard-metric--quotation-violet { --metric-bg: #2a2439; --metric-border: #50436d; --metric-accent: #c9b5f0; }
+  .app-shell .dashboard-metric--payable-rose { --metric-bg: #33242a; --metric-border: #62414b; --metric-accent: #edaabb; }
+  .app-shell .dashboard-metric--stock-orange { --metric-bg: #34291f; --metric-border: #624a35; --metric-accent: #efbd8b; }
+  .app-shell .dashboard-metric--dispatch-green { --metric-bg: #213027; --metric-border: #3d5c47; --metric-accent: #aad7b4; }
+  .app-shell .dashboard-metric[class*="dashboard-metric--sales-blue"] .dashboard-metric-label,
+  .app-shell .dashboard-metric[class*="dashboard-metric--receivable-amber"] .dashboard-metric-label,
+  .app-shell .dashboard-metric[class*="dashboard-metric--orders-purple"] .dashboard-metric-label,
+  .app-shell .dashboard-metric[class*="dashboard-metric--inventory-teal"] .dashboard-metric-label,
+  .app-shell .dashboard-metric[class*="dashboard-metric--quotation-violet"] .dashboard-metric-label,
+  .app-shell .dashboard-metric[class*="dashboard-metric--payable-rose"] .dashboard-metric-label,
+  .app-shell .dashboard-metric[class*="dashboard-metric--stock-orange"] .dashboard-metric-label,
+  .app-shell .dashboard-metric[class*="dashboard-metric--dispatch-green"] .dashboard-metric-label { color: #e1e8f0; }
+  .app-shell .dashboard-metric[class*="dashboard-metric--sales-blue"] .dashboard-metric-note,
+  .app-shell .dashboard-metric[class*="dashboard-metric--receivable-amber"] .dashboard-metric-note,
+  .app-shell .dashboard-metric[class*="dashboard-metric--orders-purple"] .dashboard-metric-note,
+  .app-shell .dashboard-metric[class*="dashboard-metric--inventory-teal"] .dashboard-metric-note,
+  .app-shell .dashboard-metric[class*="dashboard-metric--quotation-violet"] .dashboard-metric-note,
+  .app-shell .dashboard-metric[class*="dashboard-metric--payable-rose"] .dashboard-metric-note,
+  .app-shell .dashboard-metric[class*="dashboard-metric--stock-orange"] .dashboard-metric-note,
+  .app-shell .dashboard-metric[class*="dashboard-metric--dispatch-green"] .dashboard-metric-note { color: #c0cad6; }
+}

@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Pragmatics1 - Design Diagrams (ER, DFD, UML, Sequence)</title>
+<style>
+  :root { --ink:#0f172a; --muted:#64748b; --acc:#0ea5e9; --g:#10b981; --amber:#f59e0b; --red:#ef4444; --violet:#8b5cf6; }
+  * { box-sizing:border-box; }
+  body { font-family:'Segoe UI', Roboto, Arial, sans-serif; margin:0; color:var(--ink); background:#fff; }
+  .page { page-break-after:always; padding:18mm 14mm; position:relative; }
+  .page:last-child { page-break-after:auto; }
+  .cover { display:flex; flex-direction:column; justify-content:center; min-height:250mm; text-align:center; }
+  h1 { font-size:34px; margin:0 0 6px; letter-spacing:.5px; }
+  .sub { color:var(--muted); font-size:16px; margin-bottom:34px; }
+  .meta { color:var(--muted); font-size:13px; line-height:1.9; }
+  .meta b { color:var(--ink); }
+  .kicker { display:inline-block; border:1px solid #cbd5e1; border-radius:999px; padding:6px 16px; font-size:13px; color:var(--muted); margin-bottom:18px; }
+  .page-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:6px; }
+  .page-head h2 { margin:0; font-size:21px; }
+  .page-head span { font-size:12.5px; color:var(--muted); }
+  .rule { height:4px; border-radius:2px; background:linear-gradient(90deg,var(--acc),var(--g)); margin:8px 0 16px; }
+  .legend { font-size:12px; color:var(--muted); }
+  svg { display:block; }
+  .note { font-size:12.5px; color:var(--muted); margin-top:8px; line-height:1.7; }
+  table.meta-table { border-collapse:collapse; font-size:13.5px; margin:26px auto 0; }
+  table.meta-table td { padding:8px 18px; border:1px solid #e2e8f0; text-align:left; }
+  table.meta-table td:first-child { color:var(--muted); }
+  .badge { font-size:9.5px; font-weight:700; padding:1px 6px; border-radius:4px; }
+  .b-pk { background:#dcfce7; color:#15803d; }
+  .b-fk { background:#fff3cd; color:#b45309; }
+  .b-enum { background:#e0f2fe; color:#0369a1; }
+</style>
+</head>
+<body>
+
+<!-- ============ COVER ============ -->
+<section class="page cover">
+  <div>
+    <div class="kicker">Software Design Document</div>
+    <h1>Pragmatics1 &mdash; Engineering ERP</h1>
+    <div class="sub">ER Diagram &bull; Data Flow Diagrams (Level 0 / 1 / 2) &bull; UML Class Diagram &bull; Sequence Diagrams</div>
+    <table class="meta-table">
+      <tr><td>Application</td><td>Production Management System (Job Card / Route Card), Sales &amp; Purchase, Store &amp; Inventory</td></tr>
+      <tr><td>Stack</td><td>React 18 (SPA) &bull; Vite &bull; React Router &bull; jsPDF / jspdf-autotable &bull; exceljs &bull; Node + Express (SMTP quotation email)</td></tr>
+      <tr><td>Persistence</td><td>Browser localStorage (offline-first) + Node/Express backend for quotation PDF email</td></tr>
+      <tr><td>Modules</td><td>Sales (Quotation, Customer PO, Sales Order) &bull; Production (Job Card, Process Routing) &bull; Purchase (Vendor, PO, Supplier Invoice) &bull; Store/Inventory &bull; HR/Employee &bull; Admin</td></tr>
+      <tr><td>Document Ref</td><td>Job Card / Route Card &mdash; F/PROD/01 &bull; F/PROD/02 (landscape PDF)</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ ER DIAGRAM ============ -->
+<section class="page">
+  <div class="page-head"><h2>Entity&ndash;Relationship Diagram</h2><span>Core domain: Job Card centric, with supporting sales / purchase / store entities</span></div>
+  <div class="rule"></div>
+  <svg viewBox="0 0 1000 1330" width="1000" height="1030" style="border:1px solid #e2e8f0; border-radius:12px;">
+    <defs>
+      <style>
+        .ert { font:600 14px 'Segoe UI'; fill:#1e293b; }
+        .err { font:12px 'Segoe UI'; fill:#334155; }
+        .erk { font:11px 'Segoe UI'; fill:#64748b; }
+        .ent-head { rx:8; }
+        .crow { stroke:#64748b; fill:none; }
+        .rel { font:italic 12px 'Segoe UI'; fill:#0ea5e9; }
+        .swim { fill:#f8fafc; }
+      </style>
+    </defs>
+
+    <!-- JOB CARD (central) -->
+    <g>
+      <rect x="650" y="40" width="300" height="250" rx="10" class="ent-head" fill="#e0f2fe" stroke="#0284c7"/>
+      <text x="800" y="66" text-anchor="middle" class="ert" fill="#0c4a6e">JOB CARD</text>
+      <text x="800" y="86" text-anchor="middle" class="erk">routeCard (localStorage key)</text>
+      <line x1="650" y1="98" x2="950" y2="98" stroke="#0284c7"/>
+      <text x="662" y="118" class="err"><tspan class="badge b-pk">PK</tspan> id</text>
+      <text x="662" y="140" class="err">poNo</text>
+      <text x="662" y="162" class="err">invNo</text>
+      <text x="662" y="184" class="err">partNumber</text>
+      <text x="662" y="206" class="err">drawingRev</text>
+      <text x="662" y="228" class="err">lotQty</text>
+      <text x="662" y="250" class="err">material</text>
+      <text x="662" y="272" class="err"><tspan class="badge b-fk">FK</tspan> poNo &rarr; CUSTOMER_PO</text>
+    </g>
+
+    <!-- PROCESS (weak) -->
+    <g>
+      <rect x="650" y="380" width="300" height="116" rx="10" class="ent-head" fill="#fef3c7" stroke="#d97706"/>
+      <text x="800" y="406" text-anchor="middle" class="ert" fill="#78350f">PROCESS &#123;1..*&#125;</text>
+      <text x="800" y="424" text-anchor="middle" class="erk">processes[] embedded</text>
+      <line x1="650" y1="434" x2="950" y2="434" stroke="#d97706"/>
+      <text x="662" y="454" class="err">process / machineNo</text>
+      <text x="662" y="476" class="err">inputQty &rarr; outputQty (A10 / A17 cascade)</text>
+    </g>
+
+    <!-- CUSTOMER PO -->
+    <g>
+      <rect x="40" y="60" width="280" height="150" rx="10" class="ent-head" fill="#dcfce7" stroke="#16a34a"/>
+      <text x="180" y="86" text-anchor="middle" class="ert" fill="#14532d">CUSTOMER_PO</text>
+      <line x1="40" y1="98" x2="320" y2="98" stroke="#16a34a"/>
+      <text x="52" y="118" class="err"><tspan class="badge b-pk">PK</tspan> customerPoNumber</text>
+      <text x="52" y="140" class="err">company · reference</text>
+      <text x="52" y="162" class="err">partName · drawingNumber</text>
+      <text x="52" y="184" class="err">drawingRev · material · orderQty</text>
+    </g>
+
+    <!-- CUSTOMER -->
+    <g>
+      <rect x="40" y="300" width="280" height="116" rx="10" class="ent-head" fill="#dcfce7" stroke="#16a34a"/>
+      <text x="180" y="326" text-anchor="middle" class="ert" fill="#14532d">CUSTOMER</text>
+      <line x1="40" y1="338" x2="320" y2="338" stroke="#16a34a"/>
+      <text x="52" y="358" class="err"><tspan class="badge b-pk">PK</tspan> customerId</text>
+      <text x="52" y="380" class="err">companyName · contact · email</text>
+    </g>
+
+    <!-- SALES ORDER -->
+    <g>
+      <rect x="380" y="60" width="250" height="150" rx="10" class="ent-head" fill="#fce7f3" stroke="#db2777"/>
+      <text x="505" y="86" text-anchor="middle" class="ert" fill="#831843">SALES_ORDER</text>
+      <line x1="380" y1="98" x2="630" y2="98" stroke="#db2777"/>
+      <text x="392" y="118" class="err"><tspan class="badge b-pk">PK</tspan> soNumber</text>
+      <text x="392" y="140" class="err">customer · part · qty</text>
+      <text x="392" y="162" class="err">status · date</text>
+    </g>
+
+    <!-- MATERIAL / CERT -->
+    <g>
+      <rect x="40" y="520" width="280" height="140" rx="10" class="ent-head" fill="#dcfce7" stroke="#16a34a"/>
+      <text x="180" y="546" text-anchor="middle" class="ert" fill="#14532d">MATERIAL_CERT</text>
+      <line x1="40" y1="558" x2="320" y2="558" stroke="#16a34a"/>
+      <text x="52" y="578" class="err"><tspan class="badge b-pk">PK</tspan> mtcNo</text>
+      <text x="52" y="600" class="err">material / grade</text>
+      <text x="52" y="622" class="err">issueDate · qty</text>
+    </g>
+
+    <!-- USER / ROLE -->
+    <g>
+      <rect x="40" y="760" width="280" height="196" rx="10" class="ent-head" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="180" y="786" text-anchor="middle" class="ert" fill="#4c1d95">USER (RBAC)</text>
+      <line x1="40" y1="798" x2="320" y2="798" stroke="#7c3aed"/>
+      <text x="52" y="818" class="err"><tspan class="badge b-pk">PK</tspan> userId</text>
+      <text x="52" y="840" class="err">email · passwordHash</text>
+      <text x="52" y="862" class="err">department (5 depts)</text>
+      <text x="52" y="884" class="err">role (mgr / employee)</text>
+      <text x="52" y="906" class="err">permissions[] (Guard)</text>
+    </g>
+
+    <!-- EMPLOYEE -->
+    <g>
+      <rect x="40" y="1030" width="280" height="116" rx="10" class="ent-head" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="180" y="1056" text-anchor="middle" class="ert" fill="#4c1d95">EMPLOYEE_MASTER</text>
+      <line x1="40" y1="1068" x2="320" y2="1068" stroke="#7c3aed"/>
+      <text x="52" y="1088" class="err"><tspan class="badge b-pk">PK</tspan> empId</text>
+      <text x="52" y="1110" class="err">name · dept · designation</text>
+    </g>
+
+    <!-- VENDOR -->
+    <g>
+      <rect x="720" y="560" width="260" height="116" rx="10" class="ent-head" fill="#fef3c7" stroke="#d97706"/>
+      <text x="850" y="586" text-anchor="middle" class="ert" fill="#78350f">VENDOR</text>
+      <line x1="720" y1="598" x2="980" y2="598" stroke="#d97706"/>
+      <text x="732" y="618" class="err"><tspan class="badge b-pk">PK</tspan> vendorCode</text>
+      <text x="732" y="640" class="err">name · email · phone</text>
+    </g>
+
+    <!-- PURCHASE ORDER -->
+    <g>
+      <rect x="720" y="760" width="260" height="140" rx="10" class="ent-head" fill="#fef3c7" stroke="#d97706"/>
+      <text x="850" y="786" text-anchor="middle" class="ert" fill="#78350f">PURCHASE_ORDER</text>
+      <line x1="720" y1="798" x2="980" y2="798" stroke="#d97706"/>
+      <text x="732" y="818" class="err"><tspan class="badge b-pk">PK</tspan> poNumber</text>
+      <text x="732" y="840" class="err">vendor · items · amount</text>
+      <text x="732" y="862" class="err">status · deliveryDate</text>
+    </g>
+
+    <!-- STORE / INVENTORY -->
+    <g>
+      <rect x="380" y="330" width="250" height="160" rx="10" class="ent-head" fill="#cffafe" stroke="#0891b2"/>
+      <text x="505" y="356" text-anchor="middle" class="ert" fill="#164e63">INVENTORY</text>
+      <line x1="380" y1="368" x2="630" y2="368" stroke="#0891b2"/>
+      <text x="392" y="388" class="err"><tspan class="badge b-pk">PK</tspan> itemId</text>
+      <text x="392" y="410" class="err">itemCode · name · unit</text>
+      <text x="392" y="432" class="err">qtyIn / qtyOut / balance</text>
+    </g>
+
+    <!-- MATERIAL REQUEST -->
+    <g>
+      <rect x="380" y="590" width="250" height="140" rx="10" class="ent-head" fill="#cffafe" stroke="#0891b2"/>
+      <text x="505" y="616" text-anchor="middle" class="ert" fill="#164e63">MATERIAL_REQUEST</text>
+      <line x1="380" y1="628" x2="630" y2="628" stroke="#0891b2"/>
+      <text x="392" y="648" class="err"><tspan class="badge b-pk">PK</tspan> reqNo</text>
+      <text x="392" y="670" class="err">material · qty · fromDept</text>
+      <text x="392" y="692" class="err">status (pending/issued)</text>
+    </g>
+
+    <!-- ============ RELATIONSHIPS ============ -->
+    <!-- JobCard 1---N Process -->
+    <path d="M800 290 L800 378" class="crow"/>
+    <text x="812" y="340" class="rel">1</text>
+    <text x="805" y="355" class="rel">&#8734;</text>
+    <text x="732" y="372" class="rel" text-anchor="end">contains</text>
+
+    <!-- CustomerPO 1---1 JobCard -->
+    <polyline class="crow" points="320,120 560,120 560,150 648,150"/>
+    <text x="488" y="112" class="rel">1&rarr;1</text>
+
+    <!-- Customer 1---N CustomerPO -->
+    <line x1="180" y1="300" x2="180" y2="280" class="crow"/>
+    <path d="M180 288 l6 10 h-12 z" transform="rotate(90 180 288)" class="crow"/>
+    <text x="196" y="292" class="rel">1:N</text>
+
+    <!-- SalesOrder N---1 Customer -->
+    <line x1="505" y1="212" x2="184" y2="298" class="crow"/>
+    <text x="330" y="268" class="rel">N:1</text>
+
+    <!-- CustomerPO N---1 SalesOrder -->
+    <line x1="322" y1="150" x2="378" y2="150" class="crow" stroke-dasharray="4 4"/>
+    <text x="320" y="140" class="rel">links</text>
+
+    <!-- JobCard N---1 MaterialCert -->
+    <path d="M650 240 C 540 330 420 470 300 580" class="crow"/>
+    <text x="420" y="430" class="rel">uses MTC</text>
+
+    <!-- USER --- EMPLOYEE -->
+    <line x1="180" y1="860" x2="180" y2="1030" class="crow" stroke-dasharray="4 4"/>
+    <text x="196" y="950" class="rel">maps to 1:1</text>
+
+    <!-- VENDOR 1---N PURCHASE_ORDER -->
+    <line x1="850" y1="678" x2="850" y2="758" class="crow"/>
+    <text x="866" y="722" class="rel">1:N</text>
+
+    <!-- INVENTORY 1---N MATERIAL_REQUEST -->
+    <line x1="505" y1="490" x2="505" y2="588" class="crow"/>
+    <text x="521" y="542" class="rel">1:N</text>
+
+    <!-- JOB CARD N---1 SALES_ORDER -->
+    <path d="M650 220 C 620 180 640 150 630 140" class="crow" stroke-dasharray="4 4"/>
+  </svg>
+  <div class="legend">PK = Primary Key &nbsp;&bull;&nbsp; FK = Foreign Key &nbsp;&bull;&nbsp; &#8734; = one-to-many &nbsp;&bull;&nbsp; dashed = soft reference (query-time join across localStorage keys)</div>
+  <div class="note">Data model reflects the actual implementation: Job Card documents (F/PROD/02) with embedded Process Routing rows where each row's <b>Input Qty</b> auto-carries the previous row's <b>Output Qty</b> (A10 / A17 quantity flow), auto-filled from the Customer PO.</div>
+</section>
+
+<!-- ============ DFD LEVEL 0 ============ -->
+<section class="page">
+  <div class="page-head"><h2>Data Flow Diagram &mdash; Level 0 (Context)</h2><span>Single process: the ERP system, with 6 external entities</span></div>
+  <div class="rule"></div>
+  <svg viewBox="0 0 1000 760" width="1000" height="580" style="border:1px solid #e2e8f0; border-radius:12px;">
+    <ellipse cx="500" cy="380" rx="240" ry="150" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>
+    <text x="500" y="372" text-anchor="middle" font-size="18" font-weight="700" fill="#0c4a6e">ENGINEERING ERP</text>
+    <text x="500" y="394" text-anchor="middle" font-size="12" fill="#0369a1">0. Production Management System</text>
+
+    <g font-size="14" font-weight="600" fill="#334155">
+      <rect x="30" y="160" width="150" height="52" rx="8" fill="#fff7ed" stroke="#ea580c"/>
+      <text x="105" y="199" text-anchor="middle">CUSTOMER</text>
+      <rect x="820" y="160" width="150" height="52" rx="8" fill="#fff7ed" stroke="#ea580c"/>
+      <text x="895" y="199" text-anchor="middle">VENDOR</text>
+      <rect x="30" y="520" width="170" height="52" rx="8" fill="#fff7ed" stroke="#ea580c"/>
+      <text x="115" y="559" text-anchor="middle">PRODUCTION STAFF</text>
+      <rect x="820" y="520" width="170" height="52" rx="8" fill="#fff7ed" stroke="#ea580c"/>
+      <text x="905" y="559" text-anchor="middle">ADMIN / DIRECTOR</text>
+      <rect x="430" y="30" width="140" height="52" rx="8" fill="#fff7ed" stroke="#ea580c"/>
+      <text x="500" y="69" text-anchor="middle">SALES DEPT</text>
+      <rect x="430" y="660" width="140" height="52" rx="8" fill="#fff7ed" stroke="#ea580c"/>
+      <text x="500" y="699" text-anchor="middle">STORE DEPT</text>
+    </g>
+
+    <g font-size="11.5" fill="#0ea5e9" font-style="italic">
+      <path d="M185 186 H420" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="300" y="178">Enquiry / Quotation request</text>
+      <path d="M420 186 H615" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="430" y="168">Customer PO</text>
+      <path d="M615 330 H500" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="512" y="318">Quotation PDF</text>
+      <path d="M790 186 H615" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="700" y="178">Vendor enquiry / PO</text>
+      <path d="M615 353 H880" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="700" y="345">Supplier invoice</text>
+      <path d="M185 570 H400" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="290" y="560">Create / view Job Card</text>
+      <path d="M560 353 H790" fill="none" stroke="#475569" marker-end="url(#a)" transform="translate(0,120)"/><text x="620" y="480">Material request / issue</text>
+      <path d="M100 430 H380" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="240" y="440">Manufacturing data (route/qty)</text>
+      <path d="M615 290 H490" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="560" y="260">Print Job Card (F/PROD/02)</text>
+    </g>
+    <defs><marker id="a" markerWidth="10" markerHeight="10" refX="6" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#475569"/></marker></defs>
+  </svg>
+  <div class="note">Context diagram: the system is a single node. All in/out flows between the ERP and the 6 external actors are shown. Quotation PDF email is delegated to the Node/Express (nodemailer) backend.</div>
+</section>
+
+<!-- ============ DFD LEVEL 1 ============ -->
+<section class="page">
+  <div class="page-head"><h2>Data Flow Diagram &mdash; Level 1</h2><span>6 main processes + shared data stores</span></div>
+  <div class="rule"></div>
+  <svg viewBox="0 0 1000 1180" width="1000" height="900" style="border:1px solid #e2e8f0; border-radius:12px;">
+    <rect x="40" y="30" width="190" height="86" rx="10" fill="#e0f2fe" stroke="#0284c7"/>
+    <text x="135" y="58" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0c4a6e">1.0 Sales Mgmt</text>
+    <text x="135" y="78" text-anchor="middle" font-size="11" fill="#0369a1">Quotation · C.PO · S.Order</text>
+    <rect x="40" y="240" width="190" height="86" rx="10" fill="#e0f2fe" stroke="#0284c7"/>
+    <text x="135" y="268" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0c4a6e">2.0 Customer Master</text>
+    <text x="135" y="288" text-anchor="middle" font-size="11" fill="#0369a1">CRM data</text>
+    <rect x="400" y="30" width="200" height="86" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+    <text x="500" y="58" text-anchor="middle" font-size="12.5" font-weight="700" fill="#064e3b">3.0 Production / Job Card</text>
+    <text x="500" y="78" text-anchor="middle" font-size="11" fill="#047857">create · routing · print</text>
+    <rect x="400" y="300" width="200" height="86" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+    <text x="500" y="328" text-anchor="middle" font-size="12.5" font-weight="700" fill="#064e3b">4.0 Store &amp; Inventory</text>
+    <text x="500" y="348" text-anchor="middle" font-size="11" fill="#047857">requests · issues · returns</text>
+    <rect x="770" y="30" width="190" height="86" rx="10" fill="#fef3c7" stroke="#d97706"/>
+    <text x="865" y="58" text-anchor="middle" font-size="12.5" font-weight="700" fill="#78350f">5.0 Purchase Mgmt</text>
+    <text x="865" y="78" text-anchor="middle" font-size="11" fill="#b45309">vendor · PO · invoice</text>
+    <rect x="770" y="300" width="190" height="86" rx="10" fill="#fef3c7" stroke="#d97706"/>
+    <text x="865" y="328" text-anchor="middle" font-size="12.5" font-weight="700" fill="#78350f">6.0 Reporting / Backup</text>
+    <text x="865" y="348" text-anchor="middle" font-size="11" fill="#b45309">dashboards · export · email</text>
+
+    <g>
+      <rect x="130" y="470" width="300" height="120" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="280" y="500" text-anchor="middle" font-size="12.5" font-weight="700" fill="#334155">D1 Sales Data</text>
+      <text x="280" y="525" text-anchor="middle" font-size="11" fill="#64748b">Customers · Quotations · POs · S.O.</text>
+      <rect x="130" y="640" width="300" height="120" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="280" y="670" text-anchor="middle" font-size="12.5" font-weight="700" fill="#334155">D2 Production Data</text>
+      <text x="280" y="695" text-anchor="middle" font-size="11" fill="#64748b">Job Cards · Routing · Material Certs</text>
+      <rect x="130" y="810" width="300" height="120" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="280" y="840" text-anchor="middle" font-size="12.5" font-weight="700" fill="#334155">D3 Store Data</text>
+      <text x="280" y="865" text-anchor="middle" font-size="11" fill="#64748b">Inventory · Material Requests</text>
+      <rect x="570" y="470" width="300" height="120" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="720" y="500" text-anchor="middle" font-size="12.5" font-weight="700" fill="#334155">D4 Purchase Data</text>
+      <text x="720" y="525" text-anchor="middle" font-size="11" fill="#64748b">Vendors · POs · Supplier Inv.</text>
+      <rect x="570" y="640" width="300" height="120" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="720" y="670" text-anchor="middle" font-size="12.5" font-weight="700" fill="#334155">D5 Admin / Users</text>
+      <text x="720" y="695" text-anchor="middle" font-size="11" fill="#64748b">RBAC · Employees · Permissions</text>
+    </g>
+
+    <g font-size="10.5" fill="#0ea5e9">
+      <path d="M135 116 V240" fill="none" stroke="#475569" marker-end="url(#a)"/>
+      <text x="90" y="185">1: enquiry</text>
+      <path d="M230 230 H400" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="290" y="222">sell trx</text>
+      <path d="M500 116 V300" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="508" y="210">prod flows</text>
+      <path d="M500 470 V408" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="508" y="445">store↔prod</text>
+    </g>
+  </svg>
+  <div class="note">Level 1 shows the six major subsystems and the five logical data stores. Process 3.0 (Job Card) is decomposed further in Level 2.</div>
+</section>
+
+<!-- ============ DFD LEVEL 2 ============ -->
+<section class="page">
+  <div class="page-head"><h2>Data Flow Diagram &mdash; Level 2</h2><span>Decomposition of Process 3.0: Job Card (Route Card) lifecycle</span></div>
+  <div class="rule"></div>
+  <svg viewBox="0 0 1000 1080" width="1000" height="820" style="border:1px solid #e2e8f0; border-radius:12px;">
+    <rect x="30" y="20" width="260" height="74" rx="10" fill="#e0f2fe" stroke="#0284c7"/>
+    <text x="160" y="50" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0c4a6e">3.1 Select Customer PO</text>
+    <text x="160" y="70" text-anchor="middle" font-size="11" fill="#0369a1">auto-fill header fields</text>
+
+    <rect x="340" y="20" width="260" height="74" rx="10" fill="#e0f2fe" stroke="#0284c7"/>
+    <text x="470" y="50" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0c4a6e">3.2 Create Job Card Header</text>
+    <text x="470" y="70" text-anchor="middle" font-size="11" fill="#0369a1">poNo · invNo · part · drawingRev</text>
+
+    <rect x="650" y="20" width="290" height="74" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+    <text x="795" y="50" text-anchor="middle" font-size="12.5" font-weight="700" fill="#064e3b">3.3 Process Routing</text>
+    <text x="795" y="70" text-anchor="middle" font-size="11" fill="#047857">A10/A17 qty flow per step</text>
+
+    <rect x="30" y="210" width="260" height="74" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+    <text x="160" y="240" text-anchor="middle" font-size="12.5" font-weight="700" fill="#064e3b">3.4 Lot Qty &amp; Material</text>
+    <text x="160" y="260" text-anchor="middle" font-size="11" fill="#047857">MTC no · doc no · rev no</text>
+
+    <rect x="340" y="210" width="260" height="74" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+    <text x="470" y="240" text-anchor="middle" font-size="12.5" font-weight="700" fill="#064e3b">3.5 Save &amp; Update</text>
+    <text x="470" y="260" text-anchor="middle" font-size="11" fill="#047857">persist to localStorage</text>
+
+    <rect x="650" y="210" width="290" height="74" rx="10" fill="#fef3c7" stroke="#d97706"/>
+    <text x="795" y="240" text-anchor="middle" font-size="12.5" font-weight="700" fill="#78350f">3.6 Print / Download PDF</text>
+    <text x="795" y="260" text-anchor="middle" font-size="11" fill="#b45309">landscape F/PROD/02</text>
+
+    <g>
+      <rect x="340" y="380" width="300" height="200" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="490" y="420" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">D2.1 Job Cards</text>
+      <text x="490" y="450" text-anchor="middle" font-size="11" fill="#64748b">routeCard[] · localStorage</text>
+      <text x="490" y="475" text-anchor="middle" font-size="11" fill="#64748b">processes[] embedded</text>
+      <text x="490" y="500" text-anchor="middle" font-size="11" fill="#64748b">quantities (A10/A17)</text>
+      <rect x="340" y="640" width="300" height="160" fill="#f1f5f9" stroke="#94a3b8"/>
+      <text x="490" y="670" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">D2.2 PDF Docs</text>
+      <text x="490" y="700" text-anchor="middle" font-size="11" fill="#64748b">generated on demand</text>
+      <text x="490" y="725" text-anchor="middle" font-size="11" fill="#64748b">jsPDF landscape A4</text>
+    </g>
+
+    <g font-size="11" fill="#0ea5e9">
+      <path d="M290 57 H340" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="300" y="48">PO no</text>
+      <path d="M600 57 H650" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="614" y="48">fields</text>
+      <path d="M160 116 V210" fill="none" stroke="#475569" marker-end="url(#a)"/><text x="118" y="170">material</text>
+      <path d="M470 116 V210" fill="none" stroke="#475569" marker-end="url(#a)"/>
+      <path d="M490 280 V380" fill="none" stroke="#475569" marker-end="url(#a)"/>
+      <text x="497" y="340">save</text>
+      <path d="M795 280 V430" fill="none" stroke="#475569" marker-end="url(#a)"/>
+      <path d="M795 116 V210" fill="none" stroke="#475569" marker-end="url(#a)"/>
+      <path d="M490 680 H290" fill="none" stroke="#475569" marker-end="url(#a)"/>
+      <path d="M340 580 V640" fill="none" stroke="#475569" marker-end="url(#a)"/>
+    </g>
+  </svg>
+  <div class="note">Every process in Level 2 belongs to the Job Card lifecycle. Process 3.3 enforces the quantity continuity rule: row N+1 Input = row N Output (auto-cascade, matching handleProcessChange).</div>
+</section>
+
+<!-- ============ UML CLASS ============ -->
+<section class="page">
+  <div class="page-head"><h2>UML Class Diagram</h2><span>Domain model + service layer (users are the actual React components)</span></div>
+  <div class="rule"></div>
+  <svg viewBox="0 0 1000 1000" width="1000" height="760" style="border:1px solid #e2e8f0; border-radius:12px;">
+    <g font-size="11.5" fill="#334155">
+      <!-- JobCard -->
+      <rect x="40" y="40" width="260" height="250" rx="8" fill="#e0f2fe" stroke="#0284c7"/>
+      <text x="170" y="66" text-anchor="middle" font-size="13" font-weight="700" fill="#0c4a6e">JobCard</text>
+      <text x="170" y="86" text-anchor="middle" font-size="11" font-style="italic" fill="#64748b">«routeCard entity»</text>
+      <line x1="40" y1="96" x2="300" y2="96" stroke="#0284c7"/>
+      <text x="50" y="118">- id : string</text>
+      <text x="50" y="138">- poNo · invNo : string</text>
+      <text x="50" y="158">- partNumber · drawingRev : string</text>
+      <text x="50" y="178">- lotQty : number</text>
+      <text x="50" y="198">- material : string</text>
+      <text x="50" y="218">- runningQty : number</text>
+      <text x="50" y="238">- processes : Process[]</text>
+      <line x1="40" y1="250" x2="300" y2="250" stroke="#0284c7"/>
+      <text x="50" y="270">+ normalize() : JobCard</text>
+
+      <!-- Process -->
+      <rect x="360" y="40" width="240" height="230" rx="8" fill="#fef3c7" stroke="#d97706"/>
+      <text x="480" y="66" text-anchor="middle" font-size="13" font-weight="700" fill="#78350f">Process</text>
+      <line x1="360" y1="76" x2="600" y2="76" stroke="#d97706"/>
+      <text x="370" y="98">- process : string</text>
+      <text x="370" y="118">- machineNo : string</text>
+      <text x="370" y="138">- inputQty : number</text>
+      <text x="370" y="158">- outputQty : number</text>
+      <text x="370" y="178">- reworkQty / rejectQty : number</text>
+      <text x="370" y="198">- startTime · endTime : time</text>
+      <text x="370" y="218">- operator : string</text>
+      <line x1="360" y1="230" x2="600" y2="230" stroke="#d97706"/>
+      <text x="370" y="250">+ cascadeQty(next) : void</text>
+
+      <!-- User -->
+      <rect x="360" y="350" width="240" height="230" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="480" y="376" text-anchor="middle" font-size="13" font-weight="700" fill="#4c1d95">User</text>
+      <line x1="360" y1="386" x2="600" y2="386" stroke="#7c3aed"/>
+      <text x="370" y="408">- userId : string</text>
+      <text x="370" y="428">- email · passwordHash : string</text>
+      <text x="370" y="448">- department : enum</text>
+      <text x="370" y="468">- role : enum (mgr/emp)</text>
+      <text x="370" y="488">- permissions : string[]</text>
+      <text x="370" y="508">- active : boolean</text>
+      <line x1="360" y1="520" x2="600" y2="520" stroke="#7c3aed"/>
+      <text x="370" y="540">+ has(perm) : boolean</text>
+
+      <!-- ProductionPage -->
+      <rect x="660" y="350" width="300" height="260" rx="8" fill="#ecfdf5" stroke="#10b981"/>
+      <text x="810" y="376" text-anchor="middle" font-size="13" font-weight="700" fill="#064e3b">ProductionPage</text>
+      <text x="810" y="394" text-anchor="middle" font-size="11" font-style="italic" fill="#64748b">«React page · /production»</text>
+      <line x1="660" y1="404" x2="960" y2="404" stroke="#10b981"/>
+      <text x="670" y="426">- mode : create | view | edit</text>
+      <text x="670" y="446">- formData : JobCard</text>
+      <text x="670" y="466">- selectedJC · processes</text>
+      <line x1="660" y1="478" x2="960" y2="478" stroke="#10b981"/>
+      <text x="670" y="500">+ handleSelectCustomerPO(ref)</text>
+      <text x="670" y="520">+ handleProcessChange(idx, field, val)</text>
+      <text x="670" y="540">+ handleSaveJobCard()</text>
+      <text x="670" y="560">+ generateJobCardPDF()</text>
+
+      <!-- PDF Service -->
+      <rect x="660" y="40" width="300" height="240" rx="8" fill="#fce7f3" stroke="#db2777"/>
+      <text x="810" y="66" text-anchor="middle" font-size="13" font-weight="700" fill="#831843">PDF Service</text>
+      <text x="810" y="84" text-anchor="middle" font-size="11" font-style="italic" fill="#64748b">«utils/pdfGenerator·service»</text>
+      <line x1="660" y1="94" x2="960" y2="94" stroke="#db2777"/>
+      <text x="670" y="116">- title : 'JOB CARD'</text>
+      <text x="670" y="136">- pdf : jsPDF (landscape A4)</text>
+      <text x="670" y="156">- generateJobCardPDF()</text>
+      <text x="670" y="176">- generateQuotationPDF()</text>
+      <text x="670" y="196">- generateDeliveryChallanPDF()</text>
+      <line x1="660" y1="208" x2="960" y2="208" stroke="#db2777"/>
+      <text x="670" y="228">+ text / textCol / borderedTable</text>
+      <text x="670" y="248">+ grid / image helpers</text>
+
+      <!-- CustomerPO -->
+      <rect x="720" y="650" width="240" height="150" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+      <text x="840" y="676" text-anchor="middle" font-size="13" font-weight="700" fill="#14532d">CustomerPO</text>
+      <line x1="720" y1="686" x2="960" y2="686" stroke="#16a34a"/>
+      <text x="730" y="708">- customerPoNumber : PK</text>
+      <text x="730" y="728">- partName · drawingNumber</text>
+      <text x="730" y="748">- drawingRev · material · orderQty</text>
+      <line x1="720" y1="760" x2="960" y2="760" stroke="#16a34a"/>
+      <text x="730" y="780">+ toJobCardHeader()</text>
+    </g>
+    <defs>
+      <marker id="ah" markerWidth="12" markerHeight="12" refX="cx" refY="6" orient="auto"><path d="M0 0 L12 6 L0 12 z" fill="#0f172a"/></marker>
+    </defs>
+  </svg>
+  <div class="note">Class diagram is simplified to essentials. Aggregation: JobCard 1&ndash;&#8734; Process (composition, processes[]). Dependency: ProductionPage &rarr; PDF Service, ProductionPage &rarr; CustomerPO.</div>
+</section>
+
+<!-- ============ SEQUENCE: Create ============ -->
+<section class="page">
+  <div class="page-head"><h2>Sequence Diagram &mdash; Create Job Card with Auto-fill</h2><span>Customer PO &#8594; header autofill &#8594; save &#8594; PDF</span></div>
+  <div class="rule"></div>
+  <svg viewBox="0 0 1000 700" width="1000" height="540" style="border:1px solid #e2e8f0; border-radius:12px;">
+    <g font-size="11.5" fill="#334155">
+      <rect x="20" y="20" width="180" height="40" rx="8" fill="#fff7ed" stroke="#ea580c"/><text x="110" y="47" text-anchor="middle" font-weight="700">Production Employee</text>
+      <rect x="280" y="20" width="160" height="40" rx="8" fill="#e0f2fe" stroke="#0284c7"/><text x="360" y="47" text-anchor="middle" font-weight="700">: ProductionPage</text>
+      <rect x="520" y="20" width="160" height="40" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="600" y="47" text-anchor="middle" font-weight="700">: CustomerPO Store</text>
+      <rect x="760" y="20" width="200" height="40" rx="8" fill="#fce7f3" stroke="#db2777"/><text x="860" y="47" text-anchor="middle" font-weight="700">: PDF Service</text>
+
+      <line x1="110" y1="60" x2="110" y2="600" stroke="#94a3b8" stroke-dasharray="compare"/>
+      <line x1="360" y1="60" x2="360" y2="600" stroke="#94a3b8" stroke-dasharray="compute"/>
+      <line x1="600" y1="60" x2="600" y2="600" stroke="#94a3b8" stroke-dasharray="compare"/>
+      <line x1="860" y1="60" x2="860" y2="600" stroke="#94a3b8" stroke-dasharray="compare"/>
+
+      <path d="M110 100 L360 110" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="150" y="98" font-weight="700">select Customer PO</text>
+      <path d="M360 150 L600 160" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="400" y="148">get(customerPoNumber)</text>
+      <path d="M600 195 L360 185" fill="none" stroke="#64748b" marker-end="url(#a)" stroke-dasharray="5 3"/><text x="410" y="215">part · drawing · mat · qty</text>
+      <path d="M360 245 L600 255" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="460" y="243">READ CustomerPO</text>
+      <path d="M600 280 L360 270" fill="none" stroke="#64748b" marker-end="url(#a)" stroke-dasharray="5 3"/>
+      <text x="420" y="300">po list (localStorage)</text>
+      <path d="M360 330 L110 320" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="150" y="350">render Job Card form</text>
+      <path d="M110 380 L360 390" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="170" y="378" font-weight="700">enter process steps + qty</text>
+      <path d="M360 430 L360 465" fill="none" stroke="#f59e0b" stroke-width="2"/>
+      <text x="430" y="452" fill="#b45309">A10/A17: next In = prev Out</text>
+      <path d="M110 500 L360 510" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="170" y="498" font-weight="700">Save Job Card</text>
+      <path d="M360 545 L360 580" fill="none" stroke="#f59e0b" stroke-width="2"/>
+      <rect x="340" y="570" width="40" height="18" fill="#fff" stroke="#f59e0b"/><text x="360" y="584" text-anchor="middle" font-size="10">opt</text>
+      <text x="430" y="600" fill="#b45309">Print / Download PDF (landscape)</text>
+    </g>
+    <defs><marker id="a" markerWidth="10" markerHeight="10" refX="6" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#64748b"/></marker></defs>
+  </svg>
+</section>
+
+<!-- ============ SEQUENCE: quantity flow ============ -->
+<section class="page">
+  <div class="page-head"><h2>Sequence Diagram &mdash; Process Quantity Cascade (A10 / A17)</h2><span>Guarantees continuity across routing steps</span></div>
+  <div class="rule"></div>
+  <svg viewBox="0 0 1000 650" width="1000" height="500" style="border:1px solid #e2e8f0; border-radius:12px;">
+    <rect x="40" y="20" width="180" height="40" rx="8" fill="#fff7ed" stroke="#ea580c"/><text x="130" y="47" text-anchor="middle" font-weight="700">Operator</text>
+    <rect x="360" y="20" width="200" height="40" rx="8" fill="#e0f2fe" stroke="#0284c7"/><text x="460" y="47" text-anchor="middle" font-weight="700">: JobCardForm</text>
+    <rect x="700" y="20" width="240" height="40" rx="8" fill="#ecfdf5" stroke="#10b981"/><text x="820" y="50" text-anchor="middle" font-size="11">Process[] row (idx N+1)</text>
+    <line x1="130" y1="60" x2="130" y2="560" stroke="#94a3b8" stroke-dasharray="8 4"/>
+    <line x1="460" y1="60" x2="460" y2="560" stroke="#94a3b8" stroke-dasharray="8 4"/>
+    <line x1="820" y1="60" x2="820" y2="560" stroke="#94a3b8" stroke-dasharray="8 4"/>
+    <path d="M130 100 L460 118" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="160" y="98" font-weight="700">set outputQty(row N)</text>
+    <path d="M460 155 L820 118" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="500" y="152">onChange → handleProcessChange</text>
+    <path d="M820 160 L460 195" fill="none" stroke="#64748b" marker-end="url(#a)" stroke-dasharray="5 3"/><text x="500" y="205">inputQty(row N+1) = outputQty(row N)</text>
+    <path d="M460 265 L130 290" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="210" y="285" font-weight="700">rework / reject qty recorded</text>
+    <path d="M130 320 L460 300" fill="none" stroke="#64748b" marker-end="url(#a)"/><text x="210" y="340">next operator fills step</text>
+    <path d="M460 360 L460 560" fill="none" stroke="#64748b" stroke-dasharray="8 4"/>
+    <text x="470" y="520" font-size="11" fill="#94a3b8" text-anchor="start" transform="rotate(-90 470 500)">continues for each process step…</text>
+  </svg>
+  <div class="note">This matches handleProcessChange in ProductionPage — the UI auto-fills each new row's Input QTY from the previous row's Output QTY, keeping the lot quantity closed-loop.</div>
+</section>
+
+</body>
+</html>

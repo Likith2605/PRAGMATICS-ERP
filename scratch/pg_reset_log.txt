@@ -1,0 +1,11 @@
+=== PostgreSQL password reset started 10/28/2026 08:42:10 ===
+[08:42:10] Step 1: backup created -> C:\Program Files\PostgreSQL\18\data\pg_hba.conf.bak-20261028-084210
+[08:42:10] Step 2: temporary trust rules prepended
+[08:42:11] Step 3: service restarted
+[08:42:12] Step 3: server ready under trust auth
+[08:42:12] Step 4: password of role 'postgres' set to 'postgres'
+[08:42:12] Step 5: databases present: newDB, postgres, qualityapp_db
+[08:42:12] Step 6: original pg_hba.conf restored from backup
+[08:42:13] Step 7: service restarted (scram-sha-256 enforced again)
+[08:42:16] Step 8: VERIFIED as postgres
+[08:42:16] === Finished with exit code 0 ===

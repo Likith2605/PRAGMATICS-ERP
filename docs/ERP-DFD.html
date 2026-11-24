@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pragmatics ERP — DFD</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+    header {
+      background: #0f172a;
+      color: #fff;
+      padding: 20px 28px;
+    }
+    header h1 { margin: 0 0 6px; font-size: 22px; }
+    header p { margin: 0; color: #94a3b8; font-size: 13px; }
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 12px 28px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }
+    nav a {
+      color: #e2e8f0;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 6px;
+      background: #334155;
+    }
+    nav a:hover { background: #2563eb; color: #fff; }
+    main { padding: 20px 28px 48px; max-width: 1400px; margin: 0 auto; }
+    section {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 18px 18px 8px;
+      margin-bottom: 22px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    section h2 { margin: 0 0 4px; font-size: 17px; }
+    section .note { margin: 0 0 12px; color: #64748b; font-size: 13px; line-height: 1.45; }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin: 0 0 14px;
+      font-size: 12px;
+      color: #475569;
+    }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .swatch {
+      width: 14px; height: 14px; border-radius: 3px; border: 1px solid #94a3b8; display: inline-block;
+    }
+    .mermaid { display: flex; justify-content: center; overflow: auto; padding-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0 16px; }
+    th, td { border: 1px solid #e2e8f0; padding: 8px 10px; text-align: left; vertical-align: top; }
+    th { background: #f8fafc; font-weight: 700; }
+    tr:nth-child(even) td { background: #fafafa; }
+    code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    footer { text-align: center; color: #94a3b8; font-size: 12px; padding: 0 0 32px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Pragmatics ERP — Data Flow Diagram (DFD)</h1>
+    <p>React + localStorage ERP · Sales → Production → Store → Purchase · Generated from app structure</p>
+  </header>
+
+  <nav>
+    <a href="#level0">0 · Context</a>
+    <a href="#level1">1 · Main processes</a>
+    <a href="#level2-sales">2 · Sales</a>
+    <a href="#level2-prod">2 · Production &amp; Store</a>
+    <a href="#level2-purch">2 · Purchase</a>
+    <a href="#entities">Entities</a>
+    <a href="#stores">Data stores</a>
+    <a href="#flows">Flow list</a>
+  </nav>
+
+  <main>
+    <section id="level0">
+      <h2>Level 0 — Context Diagram</h2>
+      <p class="note">Whole system as one process. External actors in rounded boxes; data stores on the right.</p>
+      <div class="legend">
+        <span><i class="swatch" style="background:#dbeafe"></i> External entity</span>
+        <span><i class="swatch" style="background:#fef3c7"></i> Process</span>
+        <span><i class="swatch" style="background:#dcfce7"></i> Data store</span>
+      </div>
+      <pre class="mermaid">
+flowchart LR
+  classDef entity fill:#dbeafe,stroke:#1d4ed8,stroke-width:1.5px,color:#0f172a
+  classDef process fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#0f172a
+  classDef store fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#0f172a
+
+  subgraph EXT_IN["External / Inputs"]
+    direction TB
+    ADM["Administrator"]:::entity
+    SAL["Sales User"]:::entity
+    PUR["Purchase User"]:::entity
+    PRO["Production User"]:::entity
+    STO["Store User"]:::entity
+    CUS["Customer"]:::entity
+    VEN["Vendor / Supplier"]:::entity
+  end
+
+  ERP["P1 · Pragmatics ERP\n(Sales · Production · Store · Purchase · Inventory)"]:::process
+
+  subgraph ST["Data Stores (browser localStorage)"]
+    direction TB
+    D1["D1 Project / Quotation / Orders"]:::store
+    D2["D2 Job Cards / BOM / Material Requests"]:::store
+    D3["D3 Inventory / Stock Ledger"]:::store
+    D4["D4 Vendor / RFQ / PO / Supplier Bills"]:::store
+    D5["D5 Employees / Settings / Audit / Backup"]:::store
+  end
+
+  subgraph EXT_OUT["Outputs"]
+    direction TB
+    PDF["PDF / Excel / Print"]:::entity
+    WA["WhatsApp / Email"]:::entity
+    BKP["Backup JSON / CSV"]:::entity
+  end
+
+  ADM -->|"Login · master data · approve"| ERP
+  SAL -->|"Enquiry · Quotation · SO · Invoice"| ERP
+  PUR -->|"RFQ · Vendor Quotation · PO · Bill"| ERP
+  PRO -->|"Job Card · Material Request · QC"| ERP
+  STO -->|"Issue · Receipt · Adjust stock"| ERP
+  CUS -->|"PO · requirements (via Sales)"| ERP
+  VEN -->|"Quotation · supply"| ERP
+
+  ERP --> D1 & D2 & D3 & D4 & D5
+  D1 & D2 & D3 & D4 & D5 --> ERP
+
+  ERP --> PDF
+  ERP --> WA
+  ERP --> BKP
+      </pre>
+    </section>
+
+    <section id="level1">
+      <h2>Level 1 — Main Processes</h2>
+      <p class="note">Seven top-level processes with primary data flows. Dashed lines show cross-module handoffs.</p>
+      <pre class="mermaid">
+flowchart TB
+  classDef entity fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+  classDef process fill:#fef3c7,stroke:#d97706,color:#0f172a
+  classDef store fill:#dcfce7,stroke:#16a34a,color:#0f172a
+
+  USERS["Users by role\n(Admin / Sales / Purchase / Production / Store)"]:::entity
+  CUST["Customer"]:::entity
+  VEND["Vendor"]:::entity
+
+  P1["P1.0 Auth & Access\nLogin · Roles · Permissions"]:::process
+  P2["P2.0 Sales / Enquiry\nProject Request · Quotation"]:::process
+  P3["P3.0 Orders & Billing\nCPO · SO · Delivery · Cust. Invoice"]:::process
+  P4["P4.0 Production & QC\nJob Card · BOM · Route Card · QC"]:::process
+  P5["P5.0 Store & Inventory\nMR · Issue · Return · Stock"]:::process
+  P6["P6.0 Procurement\nPR · RFQ · Vendor Quo · PO · Bill"]:::process
+  P7["P7.0 Admin & Reports\nDashboard · Audit · Backup · Settings"]:::process
+
+  S1[("D1 Sales Docs")]:::store
+  S2[("D2 Production / MR")]:::store
+  S3[("D3 Inventory / Stock")]:::store
+  S4[("D4 Purchase Docs")]:::store
+  S5[("D5 Masters / Audit / Backup")]:::store
+
+  USERS --> P1
+  P1 --> P2 & P3 & P4 & P5 & P6 & P7
+  P1 --> S5
+
+  CUST -->|"requirement"| P2
+  P2 -->|"Quotation"| P3
+  P3 -->|"Send to Production"| P4
+  P4 -->|"Material Request"| P5
+  P5 -->|"Shortage → Purchase Request"| P6
+  VEND -->|"Vendor Quotation"| P6
+  P6 -->|"PO Receipt → Stock IN"| P3
+  P5 -->|"Stock OUT on Issue"| S3
+
+  P2 <--> S1
+  P3 <--> S1
+  P4 <--> S2
+  P5 <--> S2 & S3
+  P6 <--> S4
+  P7 <--> S1 & S2 & S3 & S4 & S5
+
+  P2 -->|"status · KPI"| P7
+  P5 -->|"alerts · audit"| P7
+  P6 -->|"PO / Bill"| P7
+      </pre>
+    </section>
+
+    <section id="level2-sales">
+      <h2>Level 2 — Sales spine (P2 → P3)</h2>
+      <p class="note">Customer-facing flow. All documents join on Project ID <code>PE-YYMMNNNN</code>.</p>
+      <pre class="mermaid">
+flowchart LR
+  classDef entity fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+  classDef process fill:#fef3c7,stroke:#d97706,color:#0f172a
+  classDef store fill:#dcfce7,stroke:#16a34a,color:#0f172a
+
+  CUS["Customer"]:::entity
+  SALES["Sales User"]:::entity
+
+  A1["P2.1 Create Project Enquiry\n+ Drawings"]:::process
+  A2["P2.2 Prepare Quotation\nTotals · GST · Terms"]:::process
+  A3["P3.1 Record Customer PO"]:::process
+  A4["P3.2 Create Sales Order"]:::process
+  A5["P3.3 Delivery Challan\nStock OUT"]:::process
+  A6["P3.4 Customer Invoice\n+ Advance"]:::process
+
+  DA[("projectRequests\nquotationHistory\ncustomerPOHistory\nsalesOrderHistory\ndeliveryChallanHistory\ncustomerInvoiceHistory")]:::store
+  DI[("inventoryItems\nstockTransactions")]:::store
+
+  SALES --> A1
+  CUS -.->|"PO / feedback"| A3
+  A1 -->|"Project ID"| A2
+  A2 -->|"Convert"| A3
+  A3 --> A4
+  A2 -->|"optional"| A4
+  A4 --> A5
+  A4 --> A6
+  A5 --> A6
+  A5 -->|"deduct qty"| DI
+  A1 & A2 & A3 & A4 & A5 & A6 <--> DA
+  A2 -->|"Share PDF / WA / Email"| OUT1["PDF · WhatsApp · Email"]:::entity
+      </pre>
+    </section>
+
+    <section id="level2-prod">
+      <h2>Level 2 — Production &amp; Store (P4 → P5)</h2>
+      <p class="note">Internal material cycle: Job Card → Material Request → approval → issue → optional purchase if shortage.</p>
+      <pre class="mermaid">
+flowchart TB
+  classDef entity fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+  classDef process fill:#fef3c7,stroke:#d97706,color:#0f172a
+  classDef store fill:#dcfce7,stroke:#16a34a,color:#0f172a
+
+  PROD["Production User / Mgr"]:::entity
+  STOR["Store User"]:::entity
+
+  B1["P4.1 Create Job Card\nfrom SO / CPO"]:::process
+  B2["P4.2 List of Items (BOM)"]:::process
+  B3["P4.3 Raise Material Request\nDraft → Submit"]:::process
+  B4["P4.4 Approve / Reject MR\n(Production Mgr)"]:::process
+  B5["P5.1 Claim & Issue Material\nStock OUT + Issue Doc"]:::process
+  B6["P5.2 Material Return\nStock IN"]:::process
+  B7["P5.3 Shortage → Purchase Request"]:::process
+  B8["P4.5 In-process / Final QC\nPass · Rework"]:::process
+  B9["P4.6 Dispatch to Challan"]:::process
+
+  DP[("productionJobCards\nbomMasterList\nmaterialRequests")]:::store
+  DI[("inventoryItems\nstoreIssueHistory\nmaterialReturnHistory\nstockTransactions")]:::store
+  DPR[("storePurchaseRequests")]:::store
+
+  PROD --> B1 & B2 & B3 & B4 & B8
+  STOR --> B5 & B6
+  B1 --> B3
+  B2 --> B3
+  B3 --> B4
+  B4 -->|"Approved"| B5
+  B5 --> B7
+  B5 --> B6
+  B7 --> PUR["→ P6 Procurement"]:::process
+  B8 --> B9
+  B9 --> CH["→ Delivery Challan"]:::process
+
+  B1 & B3 & B4 & B8 <--> DP
+  B5 & B6 <--> DI
+  B7 <--> DPR
+      </pre>
+    </section>
+
+    <section id="level2-purch">
+      <h2>Level 2 — Procurement (P6)</h2>
+      <p class="note">From shortage/low stock through RFQ to PO receipt and supplier bill.</p>
+      <pre class="mermaid">
+flowchart LR
+  classDef entity fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+  classDef process fill:#fef3c7,stroke:#d97706,color:#0f172a
+  classDef store fill:#dcfce7,stroke:#16a34a,color:#0f172a
+
+  IN["Shortage / Low stock\n(from Store)"]:::entity
+  BUY["Purchase User"]:::entity
+  V["Vendor"]:::entity
+
+  C1["P6.1 Purchase Request\nApprove / Reject"]:::process
+  C2["P6.2 Vendor Enquiry (RFQ)\nShare PDF/Excel"]:::process
+  C3["P6.3 Record Vendor Quotation\nAccept / Reject"]:::process
+  C4["P6.4 Create Supplier PO"]:::process
+  C5["P6.5 Receive / Inward Stock\nStock IN"]:::process
+  C6["P6.6 Supplier Invoice / Bill\nPayable · Paid"]:::store
+  C6p["P6.6 Supplier Invoice / Bill"]:::process
+
+  D[("storePurchaseRequests\nvendorEnquiries\nvendorQuotations\nsupplierPOHistory\nsupplierInvoiceHistory\nvendorMaster")]:::store
+  DI[("inventoryItems\nstockTransactions")]:::store
+
+  IN --> C1
+  BUY --> C1 & C2 & C3 & C4 & C5 & C6p
+  C1 --> C2
+  C2 -->|"RFQ"| V
+  V -->|"Quote"| C3
+  C3 --> C4
+  C4 --> C5
+  C4 --> C6p
+  C5 -->|"qty IN"| DI
+  C1 & C2 & C3 & C4 & C6p <--> D
+  C5 <--> D
+  C2 --> OUT["PDF · Excel · WhatsApp · Email"]:::entity
+      </pre>
+    </section>
+
+    <section id="entities">
+      <h2>External entities</h2>
+      <table>
+        <thead>
+          <tr><th>Entity</th><th>Role</th><th>Typical inputs → system</th><th>Outputs ← system</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Administrator</td><td>Full access</td><td>Employees, settings, backup/restore, all modules</td><td>Dashboard, audit, reports</td></tr>
+          <tr><td>Sales Manager / Employee</td><td><code>sales.*</code></td><td>Enquiry, quotation, CPO, SO, delivery, customer invoice</td><td>PDF / share / status</td></tr>
+          <tr><td>Purchase Manager / Employee</td><td><code>purchase.*</code></td><td>RFQ, vendor quote, PO, supplier bill, vendor master</td><td>PO / bill PDFs</td></tr>
+          <tr><td>Production Manager / Employee</td><td><code>production.*</code>, <code>material_request.*</code></td><td>Job card, BOM, material request, QC</td><td>Route card, MR status</td></tr>
+          <tr><td>Store Manager / Employee</td><td><code>store.*</code>, <code>material_issue.*</code></td><td>Issue, return, receipt, adjust, purchase request</td><td>Issue docs, stock reports</td></tr>
+          <tr><td>Customer</td><td>External</td><td>Requirements / PO (via Sales)</td><td>Quotation, SO, invoice, challan</td></tr>
+          <tr><td>Vendor / Supplier</td><td>External</td><td>Quotation response, goods, bill</td><td>RFQ, Purchase Order</td></tr>
+          <tr><td>WhatsApp / Gmail / SMTP</td><td>Channel</td><td>—</td><td>Share quotation / RFQ</td></tr>
+          <tr><td>File system (download)</td><td>Channel</td><td>Backup JSON restore</td><td>PDF, Excel, CSV, backup</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="stores">
+      <h2>Data stores (logical)</h2>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Data store</th><th>Main keys / content</th><th>Updated by</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>D1</td><td>Sales documents</td><td><code>projectRequests</code>, <code>quotationHistory</code>, <code>customerPOHistory</code>, <code>salesOrderHistory</code>, <code>deliveryChallanHistory</code>, <code>customerInvoiceHistory</code></td><td>P2, P3</td></tr>
+          <tr><td>D2</td><td>Production &amp; MR</td><td><code>productionJobCards</code>, <code>bomMasterList</code>, <code>materialRequests</code></td><td>P4, P5 (claim/issue status)</td></tr>
+          <tr><td>D3</td><td>Inventory / stock</td><td><code>inventoryItems</code>, <code>stockTransactions</code>, <code>storeIssueHistory</code>, <code>materialReturnHistory</code>, adjustments</td><td>P5, P6 (inward), P3 (dispatch)</td></tr>
+          <tr><td>D4</td><td>Procurement</td><td><code>storePurchaseRequests</code>, <code>vendorEnquiries</code>, <code>vendorQuotations</code>, <code>supplierPOHistory</code>, <code>supplierInvoiceHistory</code>, <code>vendorMaster</code></td><td>P6</td></tr>
+          <tr><td>D5</td><td>Masters &amp; system</td><td><code>employees</code>, <code>companySettings</code>, <code>erp_auth</code>, <code>storeAuditLog</code>, <code>notifications</code>, backups</td><td>P1, P7</td></tr>
+        </tbody>
+      </table>
+      <p class="note">Physical storage: browser <strong>localStorage</strong> (no server DB). Drawings: <strong>IndexedDB</strong>. Optional mailer: <code>server.js</code> port 3001.</p>
+    </section>
+
+    <section id="flows">
+      <h2>Key data flows (DFD flow list)</h2>
+      <table>
+        <thead>
+          <tr><th>#</th><th>From → To</th><th>Flow name</th><th>Data</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>F1</td><td>User → P1</td><td>Login</td><td>email, password → session role + permissions</td></tr>
+          <tr><td>F2</td><td>P2 → D1</td><td>Save enquiry / quotation</td><td>customer, items, drawings, totals, Project ID</td></tr>
+          <tr><td>F3</td><td>P2 → External</td><td>Share document</td><td>PDF / Excel / WhatsApp / Email payload</td></tr>
+          <tr><td>F4</td><td>P3 → P4</td><td>Send to production</td><td>SO / CPO reference + part + qty</td></tr>
+          <tr><td>F5</td><td>P4 → P5</td><td>Material request</td><td>MR Draft → Submitted → Approved (items, qty, JC)</td></tr>
+          <tr><td>F6</td><td>P5 → D3</td><td>Issue material</td><td>issue qty, receiver ack → stock OUT + issue doc</td></tr>
+          <tr><td>F7</td><td>P5 → D3</td><td>Return material</td><td>return qty → stock IN + return doc</td></tr>
+          <tr><td>F8</td><td>P5 → P6</td><td>Purchase request</td><td>shortage lines → PR pending approval</td></tr>
+          <tr><td>F9</td><td>P6 → Vendors</td><td>RFQ</td><td>items, specs, due date (PDF/Excel share)</td></tr>
+          <tr><td>F10</td><td>Vendor → P6</td><td>Vendor quotation</td><td>rates, GST, validity → accept/reject</td></tr>
+          <tr><td>F11</td><td>P6 → D4</td><td>Supplier PO</td><td>vendor, lines, terms → PR marked converted</td></tr>
+          <tr><td>F12</td><td>P6 → D3</td><td>PO inward</td><td>received qty → stock IN + PO Received</td></tr>
+          <tr><td>F13</td><td>P6 → D4</td><td>Supplier bill</td><td>invoice no, amount, due → payable status</td></tr>
+          <tr><td>F14</td><td>P3 → D3</td><td>Customer dispatch</td><td>DC qty → stock OUT</td></tr>
+          <tr><td>F15</td><td>P4 → P3</td><td>QC pass → challan</td><td>accepted qty → delivery challan</td></tr>
+          <tr><td>F16</td><td>P3 → External</td><td>Customer invoice</td><td>bill + advance → print/PDF</td></tr>
+          <tr><td>F17</td><td>All → P7</td><td>Audit / notification</td><td>action, user, reference, target dept/role</td></tr>
+          <tr><td>F18</td><td>P7 → File</td><td>Backup / restore</td><td>full JSON snapshot / CSV export</td></tr>
+          <tr><td>F19</td><td>Masters → all P</td><td>Reference data</td><td>company profile, employees, vendor/customer master</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <footer>Pragmatics ERP DFD · Level 0–2 · Mermaid (open this file in Chrome/Edge)</footer>
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({
+      startOnLoad: true,
+      securityLevel: 'loose',
+      theme: 'neutral',
+      flowchart: { htmlLabels: true, curve: 'basis', nodeSpacing: 40, rankSpacing: 50 }
+    });
+  </script>
+</body>
+</html>

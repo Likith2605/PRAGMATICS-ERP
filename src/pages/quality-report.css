@@ -1,0 +1,30 @@
+.app-shell .quality-report-page,
+.app-shell .quality-report-connection { --quality-navy: #17324d; --quality-teal: #087f8c; --quality-border: #dbe3e8; }
+.app-shell .quality-report-page .page-title,
+.app-shell .quality-report-connection .page-title { color: #17324d; }
+.app-shell .quality-report-page .page-description { max-width: 760px; line-height: 1.55; }
+.app-shell .quality-report-page .content-block,
+.app-shell .quality-report-connection .quotation-form-card { border: 1px solid #dbe3e8; border-radius: 8px; box-shadow: none; }
+.app-shell .quality-report-page .list-filters { gap: 8px !important; margin-bottom: 16px; }
+.app-shell .quality-report-page .list-filters .button-primary { background: #17324d; border-color: #17324d; }
+.app-shell .quality-report-page .list-filters .button-secondary { border-color: #cbd5df; color: #17324d; }
+.app-shell .quality-report-page .search-input,
+.app-shell .quality-report-page .action-select,
+.app-shell .quality-report-connection .search-input { min-height: 38px; border: 1px solid #cbd5df; border-radius: 6px; }
+.app-shell .quality-report-page .search-input:focus,
+.app-shell .quality-report-page .action-select:focus,
+.app-shell .quality-report-connection .search-input:focus { border-color: #087f8c; outline: 2px solid rgb(8 127 140 / 14%); outline-offset: 1px; }
+.app-shell .quality-report-page .history-table-wrapper { overflow-x: auto; }
+.app-shell .quality-report-page .history-table th { background: #f5f8fa; color: #475569; font-size: 12px; font-weight: 650; white-space: nowrap; }
+.app-shell .quality-report-page .history-table td { vertical-align: middle; }
+.app-shell .quality-report-page .status-badge { border-radius: 5px; font-weight: 650; }
+.app-shell .quality-report-page .table-actions .button-primary { background: #17324d; border-color: #17324d; }
+.app-shell .quality-report-page .field-hint { color: #64748b; }
+.app-shell .quality-report-page details.content-block { padding: 14px 16px; }
+.app-shell .quality-report-page .report-viewer-toolbar { display: flex; flex-wrap: wrap; gap: 8px; }
+
+@media (max-width: 760px) {
+  .app-shell .quality-report-page { padding-left: 12px; padding-right: 12px; }
+  .app-shell .quality-report-page .list-filters { align-items: stretch !important; }
+  .app-shell .quality-report-page .list-filters > * { max-width: 100%; }
+}
