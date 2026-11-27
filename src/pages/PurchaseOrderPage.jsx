@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { FileText, ReceiptText, Upload } from 'lucide-react';
 import ExcelImportDialog from '../components/ExcelImportDialog.jsx';
-import { getVendorMaster } from '../utils/vendorMaster.js';
+import { loadVendorMaster } from '../utils/vendorMaster.js';
 import AddableSelect from '../components/AddableSelect.jsx';
 import { DEFAULT_UNITS } from '../utils/addableMasters.js';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -17,11 +17,8 @@ import { pushNotification, appendAuditLog, dateOnly } from '../utils/storeServic
 import {
   getIndent,
   getIndents,
-  markIndentConverted,
-  getPOProgress,
   INDENT_STATUS,
   validatePOProcurementChain,
-  linkPOToProcurementChain,
   buildPOFromQuotation,
   createPurchaseOrderFromQuotation,
   canCreatePOFromQuotation,
@@ -33,6 +30,8 @@ import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterMaterialRecords } from '../utils/historySearch.js';
 import VendorMasterAutocomplete from '../components/VendorMasterAutocomplete.jsx';
 import TermsTemplateEditor from '../components/TermsTemplateEditor.jsx';
+import { listPurchaseOrders, getPurchaseOrder, updatePurchaseOrderApi, listProcurementRecords, getSupplierInvoiceApi, importPurchaseOrdersApi } from '../services/procurementIntakeApi.js';
+import { listPurchaseRequestsApi } from '../services/purchaseRequestApi.js';
 
 const parseINR = (v) => Number(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
 
@@ -76,6 +75,23 @@ const hasPurchaseOrderForIndent = (indent, purchaseOrders) => {
   ].some((reference) => normalizeReference(reference) === indentRef));
 };
 
+/** Maps the PostgreSQL reconciliation block onto the display fields previously
+ *  derived from localStorage. No local progress derivation is used for PG rows. */
+const progressOf = (row) => {
+  const p = row?.progress && typeof row.progress === 'object' ? row.progress : null;
+  if (!p) return { ordered: 0, received: 0, pending: 0, lines: [], status: row?.status || '', fulfillmentStatus: row?.status || '' };
+  return {
+    ...p,
+    originalArrived: p.originalReceived ?? p.originalArrived ?? 0,
+    replacementArrived: p.replacementReceived ?? p.replacementArrived ?? 0,
+    totalAccepted: p.totalAccepted ?? p.accepted ?? 0,
+    finalAccepted: p.creditedAccepted ?? p.finalAccepted ?? p.totalAccepted ?? p.accepted ?? 0,
+    physicalReceiptBalance: p.physicalReceiptBalance ?? p.pending ?? 0,
+    acceptedQuantityShortage: p.acceptedQuantityShortage ?? p.pendingAccepted ?? 0,
+    fulfillmentStatus: p.fulfillmentStatus || p.status || row?.status || ''
+  };
+};
+
 const emptyItem = {
   itemCode: '',
   itemName: '',
@@ -117,9 +133,9 @@ const PO_TERMS_TEMPLATES = [
 ];
 
 /** The vendor quotation a PO was raised from — used for the read-only quoted-terms block. */
-const findSourceQuotation = (ref) => {
+const findSourceQuotation = (quotations, ref) => {
   if (!ref) return null;
-  return readStoredList('vendorQuotations').find((q) => String(q.quotationNumber) === String(ref)) || null;
+  return (Array.isArray(quotations) ? quotations : []).find((q) => String(q.quotationNumber) === String(ref)) || null;
 };
 
 const PurchaseOrderPage = () => {
@@ -129,6 +145,11 @@ const PurchaseOrderPage = () => {
 
   const [mode, setMode] = useState('list'); // 'list' | 'create' | 'view'
   const [history, setHistory] = useState([]);
+  const [vendorMasterList, setVendorMasterList] = useState([]);
+  const [vendorMasterError, setVendorMasterError] = useState('');
+  const [purchaseRequests, setPurchaseRequests] = useState([]);
+  const [purchaseRequestLoadError, setPurchaseRequestLoadError] = useState('');
+  const [poLoadError, setPoLoadError] = useState('');
   const [inventoryList, setInventoryList] = useState([]);
   const [selectedPO, setSelectedPO] = useState(null);
   const [reportTab, setReportTab] = useState('orders'); // 'orders' | 'open'
@@ -148,9 +169,10 @@ const PurchaseOrderPage = () => {
     const expectedTotal = (Number(row.Quantity) || 0) * (Number(row.Rate) || 0) + expectedTax;
     if (row['Total Amount'] !== '' && row['Total Amount'] != null && Math.abs(Number(row['Total Amount']) - expectedTotal) > 0.02) errors.push('Total Amount does not match line value plus tax');
     const po = String(row['PO Number'] || '').trim().toLowerCase();
-    if (po && readStoredList('supplierPOHistory').some((entry) => String(entry.reference || '').trim().toLowerCase() === po)) errors.push('Duplicate PO Number');
+    if (po && history.some((entry) => String(entry.reference || '').trim().toLowerCase() === po)) errors.push('Duplicate PO Number');
     if (row['Item Code'] && !readStoredList('inventoryItems').some((item) => String(item.itemCode).trim().toLowerCase() === String(row['Item Code']).trim().toLowerCase())) errors.push('Invalid Item Code');
-    const vendorList = getVendorMaster();
+    const vendorList = vendorMasterList;
+    if (vendorMasterError) errors.push('Vendor Master could not be loaded from PostgreSQL');
     if (row['Vendor Code'] && !vendorList.some((vendor) => String(vendor.code || vendor.vendorCode || vendor.id || '').toLowerCase() === String(row['Vendor Code']).trim().toLowerCase())) errors.push('Vendor Code not found');
     if (!row['Vendor Code'] && row['Vendor Name'] && !vendorList.some((vendor) => String(vendor.name || vendor.companyName || '').trim().toLowerCase() === String(row['Vendor Name']).trim().toLowerCase())) errors.push('Vendor Name not found');
     return errors;
@@ -160,7 +182,7 @@ const PurchaseOrderPage = () => {
     rows.forEach((row) => { const key = String(row['PO Number']).trim(); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); });
     const historyRows = [...groups.entries()].map(([number, lines]) => {
       const first = lines[0];
-      const vendor = getVendorMaster().find((entry) => (first['Vendor Code'] && String(entry.code || entry.vendorCode || entry.id).toLowerCase() === String(first['Vendor Code']).trim().toLowerCase()) || (first['Vendor Name'] && String(entry.name || entry.companyName).trim().toLowerCase() === String(first['Vendor Name']).trim().toLowerCase()));
+      const vendor = vendorMasterList.find((entry) => (first['Vendor Code'] && String(entry.code || entry.vendorCode || entry.id).toLowerCase() === String(first['Vendor Code']).trim().toLowerCase()) || (first['Vendor Name'] && String(entry.name || entry.companyName).trim().toLowerCase() === String(first['Vendor Name']).trim().toLowerCase()));
       const items = lines.map((line) => { const quantity = Number(line.Quantity), unitPrice = Number(line.Rate), gst = Number(line.GST) || 0, amount = quantity * unitPrice; return { itemCode: String(line['Item Code']).trim(), itemName: String(line['Item Description'] || '').trim() || readStoredList('inventoryItems').find((item) => String(item.itemCode).toLowerCase() === String(line['Item Code']).trim().toLowerCase())?.itemName || '', quantity, unit: String(line.Unit || 'Nos').trim(), unitPrice, gst: String(gst), amount, gstAmount: amount * gst / 100 }; });
       const importedTotals = calculateTotals(items);
       const total = importedTotals.grandTotal;
@@ -169,11 +191,17 @@ const PurchaseOrderPage = () => {
       const payload = { poDetails, vendorDetails, companyDetails, items, totals: importedTotals, amountInWords: numberToWords(total) };
       return { date: poDetails.poDate, reference: number, vendor: vendorDetails.companyName, projectRef: poDetails.projectRef || '-', dueDate: poDetails.deliveryDueDate || '-', total: `₹ ${total.toFixed(2)}`, status: 'Draft', payload };
     });
-    const current = readStoredList('supplierPOHistory');
-    localStorage.setItem('supplierPOHistory', JSON.stringify([...historyRows, ...current]));
-    appendAuditLog({ action: 'PURCHASE ORDERS IMPORTED', reference: historyRows.map((row) => row.reference).join(', '), details: `${historyRows.length} imported as Draft` });
-    setHistory([...historyRows, ...current]);
-    return { success: rows.length, skipped: 0 };
+    /* Rows are written to PostgreSQL through the import API; the browser list
+     * is only refreshed from the server afterwards, never used as the target. */
+    const result = await importPurchaseOrdersApi(historyRows);
+    const refreshed = await listPurchaseOrders();
+    setHistory(refreshed);
+    appendAuditLog({ action: 'PURCHASE ORDERS IMPORTED', reference: historyRows.map((row) => row.reference).join(', '), details: `${result.imported?.length || 0} imported as Draft` });
+    const notImported = (result.conflicts?.length || 0) + (result.skipped?.length || 0);
+    if (result.conflicts?.length) {
+      console.warn('Purchase Order import conflicts preserved:', result.conflicts);
+    }
+    return { success: result.imported?.length || 0, skipped: notImported };
   };
 
   // Form states
@@ -213,67 +241,38 @@ const PurchaseOrderPage = () => {
     state: ''
   });
 
-  const [companyDetails, setCompanyDetails] = useState(() => {
-    try {
-      const stored = localStorage.getItem('companySettings');
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    const profile = getCompanyProfile();
-    return {
-      companyName: profile.companyName || '',
-      phone: profile.phone || '',
-      email: profile.email || '',
-      address: profile.address || '',
-      gstin: profile.gstin || '',
-      state: profile.state || ''
-    };
-  });
+  const [companyDetails, setCompanyDetails] = useState(() => getCompanyProfile());
 
   const [items, setItems] = useState([{ ...emptyItem }]);
 
-  // Load from localStorage & auto-sync with bills
+  // Purchase Orders are loaded from PostgreSQL. The local list is only a cache.
+  // null = not answered yet (compatibility cache shown); [] = server confirmed empty.
+  const [serverEnquiries, setServerEnquiries] = useState(null);
+  const [serverQuotations, setServerQuotations] = useState(null);
   useEffect(() => {
-    try {
-      const storedPOs = localStorage.getItem('supplierPOHistory');
-      let poList = storedPOs ? JSON.parse(storedPOs) : [];
-
-      // Cross-reference with supplier invoices to ensure billing link is always live
-      try {
-        const storedBills = JSON.parse(localStorage.getItem('supplierInvoiceHistory') || '[]');
-        if (Array.isArray(storedBills) && storedBills.length > 0) {
-          poList = poList.map((po) => {
-            const bill = storedBills.find(
-              (b) =>
-                (b.poRef && b.poRef !== '-' && b.poRef.trim().toLowerCase() === po.reference?.trim().toLowerCase()) ||
-                (b.payload?.invoiceDetails?.poReference &&
-                  b.payload.invoiceDetails.poReference.trim().toLowerCase() === po.reference?.trim().toLowerCase())
-            );
-            if (bill) {
-              return {
-                ...po,
-                billedInvoiceRef: bill.reference || bill.payload?.invoiceDetails?.supplierInvoiceNumber,
-                billingStatus: 'Billed'
-              };
-            }
-            return po;
-          });
-        }
-      } catch {}
-
-      // Ordered / Received / Pending / status projection for the PO register
-      poList = poList.map((po) => {
-        try {
-          const progress = getPOProgress(po.reference);
-          return { ...po, status: progress.status || po.status, progress };
-        } catch {
-          return po;
-        }
-      });
-
+    let active = true;
+    loadVendorMaster()
+      .then((records) => { if (active) { setVendorMasterList(records); setVendorMasterError(''); } })
+      .catch((error) => { if (active) { setVendorMasterList([]); setVendorMasterError(`Vendor Master could not be loaded from PostgreSQL: ${error.message}`); } });
+    Promise.all([
+      listPurchaseOrders(),
+      listProcurementRecords('purchaseIndent'),
+      listProcurementRecords('vendorEnquiry'),
+      listProcurementRecords('vendorQuotation')
+    ]).then(([serverOrders, , enquiries, quotations]) => {
+      if (!active) return;
+      /* PostgreSQL computes ordered/received/accepted/rejected/invoiced on the
+       * row itself; no browser-local projection is used as an authority. */
+      const poList = serverOrders.map((po) => ({ ...po, status: po.progress?.status || po.status }));
+      setPoLoadError('');
       setHistory(poList);
-    } catch {
+      setServerEnquiries(Array.isArray(enquiries) ? enquiries : []);
+      setServerQuotations(Array.isArray(quotations) ? quotations : []);
+    }).catch((error) => {
+      if (!active) return;
       setHistory([]);
-    }
+      setPoLoadError(`Purchase Orders could not be loaded from PostgreSQL: ${error.message}`);
+    });
 
     try {
       const storedInv = localStorage.getItem('inventoryItems');
@@ -281,19 +280,33 @@ const PurchaseOrderPage = () => {
     } catch {
       setInventoryList([]);
     }
+    return () => { active = false; };
   }, []);
 
-  const handleViewVendorBill = (invoiceNumber) => {
+  useEffect(() => {
+    let active = true;
+    listPurchaseRequestsApi()
+      .then((records) => { if (active) { setPurchaseRequests(records); setPurchaseRequestLoadError(''); } })
+      .catch((error) => { if (active) setPurchaseRequestLoadError(`Purchase Requests could not be loaded from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
+  }, []);
+
+  /** Reloads the Purchase Order list from PostgreSQL. The browser list written
+   *  by listPurchaseOrders is only a cache, so every save/version flow reads
+   *  its authority from the server instead of trusting a local copy. */
+  const reloadPurchaseOrderHistory = async () => {
+    const serverOrders = await listPurchaseOrders();
+    setHistory(serverOrders);
+    setPoLoadError('');
+    return serverOrders;
+  };
+
+  const handleViewVendorBill = async (invoiceNumber) => {
     try {
-      const storedBills = JSON.parse(localStorage.getItem('supplierInvoiceHistory') || '[]');
-      const match = storedBills.find((b) => b.reference === invoiceNumber);
-      navigate('/supplier-invoice', {
-        state: {
-          viewInvoice: match ? match.payload : null
-        }
-      });
-    } catch {
-      navigate('/supplier-invoice');
+      const match = await getSupplierInvoiceApi(invoiceNumber);
+      navigate('/supplier-invoice', { state: { viewInvoice: match.payload } });
+    } catch (error) {
+      window.alert(`Supplier Invoice ${invoiceNumber} could not be loaded from PostgreSQL: ${error.message}`);
     }
   };
 
@@ -332,13 +345,15 @@ const PurchaseOrderPage = () => {
   };
 
   /** Open an existing Purchase Order (e.g. "View Purchase Order" from a quotation). */
-  const loadPOForView = (poNumber) => {
-    const po = readStoredList('supplierPOHistory').find((h) => String(h.reference) === String(poNumber));
+  const loadPOForView = async (poNumber) => {
+    let po;
+    try { po = await getPurchaseOrder(poNumber); }
+    catch (error) { setPoLoadError(`Purchase Order ${poNumber} could not be retrieved from PostgreSQL: ${error.message}`); return; }
     if (!po) return;
     setHistory((prev) =>
       prev.some((h) => String(h.reference) === String(poNumber))
-        ? prev.map((h) => (String(h.reference) === String(poNumber) ? { ...h, progress: getPOProgress(poNumber) } : h))
-        : [{ ...po, progress: getPOProgress(poNumber) }, ...prev]
+        ? prev.map((h) => (String(h.reference) === String(poNumber) ? { ...h, ...po } : h))
+        : [po, ...prev]
     );
     setSelectedPO(po.payload);
     setMode('view');
@@ -425,16 +440,15 @@ const PurchaseOrderPage = () => {
     try {
       const previousDocs = payload.poDocuments || [];
       const blob = await generatePurchaseOrderPDF(payload, { blob: true });
-      if (!blob) return payload;
+      if (!blob) throw new Error('Purchase Order PDF could not be generated.');
       const meta = await saveWorkflowDocument(
         new File([blob], `PurchaseOrder-${poNumber}.pdf`, { type: 'application/pdf' })
       );
       meta.kind = 'Purchase Order';
       const stamped = { ...payload, poDocuments: [meta] };
-      const stored = readStoredList('supplierPOHistory').map((h) =>
-        String(h.reference) === String(poNumber) ? { ...h, payload: stamped } : h
-      );
-      localStorage.setItem('supplierPOHistory', JSON.stringify(stored));
+      const current = await getPurchaseOrder(poNumber).catch(() => null);
+      if (!current || !current.version) throw new Error(`Purchase Order ${poNumber} has no confirmed PostgreSQL version.`);
+      const confirmed = await updatePurchaseOrderApi(poNumber, { ...current, payload: stamped }, Number(current.version));
       previousDocs.forEach((old) => {
         if (old?.id && old.id !== meta.id) deleteWorkflowDocument(old.id);
       });
@@ -452,7 +466,7 @@ const PurchaseOrderPage = () => {
       return stamped;
     } catch (err) {
       console.error('Failed to send the Purchase Order PDF to Store', err);
-      return payload;
+      throw new Error(`Purchase Order was saved, but its Store PDF was not confirmed in PostgreSQL: ${err.message}`);
     }
   };
 
@@ -506,7 +520,7 @@ const PurchaseOrderPage = () => {
        * notification). Existing PO edits retain the direct update path below.
        * ------------------------------------------------------------------ */
       if (poDetails.quotationRef && !editingExistingPO) {
-        const created = createPurchaseOrderFromQuotation(poDetails.quotationRef, {
+        const created = await createPurchaseOrderFromQuotation(poDetails.quotationRef, {
           poNumber: poDetails.poNumber,
           poDate: poDetails.poDate,
           deliveryDueDate: poDetails.deliveryDueDate,
@@ -519,25 +533,39 @@ const PurchaseOrderPage = () => {
           termsAndConditions: poDetails.termsAndConditions,
           yourRefNo: poDetails.yourRefNo,
           yourRefDate: poDetails.yourRefDate,
+          prRef: poDetails.prRef || '',
           shipToName: poDetails.shipToName,
           shipToAddress: poDetails.shipToAddress,
           shipToMobile: poDetails.shipToMobile,
           packingCharges: poDetails.packingCharges,
           freight: poDetails.freight
         });
-        const stamped = await sendPODocumentToStore(created.reference, created.payload);
-        setHistory(readStoredList('supplierPOHistory').map((h) => ({ ...h, progress: getPOProgress(h.reference) })));
+        await reloadPurchaseOrderHistory().catch(() => {});
+        setSelectedPO(created.payload);
+        setMode('view');
+        let stamped;
+        try {
+          stamped = await sendPODocumentToStore(created.reference, created.payload);
+        } catch (error) {
+          alert(error.message);
+          return;
+        }
+        await reloadPurchaseOrderHistory().catch(() => {});
         setSelectedPO(stamped);
         setMode('view');
         return;
       }
 
-      const stored = localStorage.getItem('supplierPOHistory');
-      let current = stored ? JSON.parse(stored) : [];
-      const existingIndex = current.findIndex((h) => h.reference === poDetails.poNumber);
+      /* Version authority is the PostgreSQL row fetched now — never the
+       * browser cache, which may hold a stale version after another screen,
+       * a reconciliation, or a refresh changed the record. */
+      const authoritative = await getPurchaseOrder(poDetails.poNumber).catch(() => null);
+      if (!authoritative || !authoritative.version) {
+        throw new Error('Purchase Orders must be loaded from PostgreSQL before they can be edited.');
+      }
       /* Keep the current document on the entry until the new PDF is written, so
          the superseded file can be purged once the fresh one is stored. */
-      const previousDocs = existingIndex !== -1 ? (current[existingIndex]?.payload?.poDocuments || []) : [];
+      const previousDocs = authoritative.payload?.poDocuments || [];
       const entry = {
         date: poDetails.poDate,
         reference: poDetails.poNumber,
@@ -551,15 +579,10 @@ const PurchaseOrderPage = () => {
         payload: previousDocs.length ? { ...payload, poDocuments: previousDocs } : payload
       };
 
-      if (existingIndex !== -1) {
-        current[existingIndex] = entry;
-      } else {
-        current.unshift(entry);
-      }
+      const confirmedEntry = (await updatePurchaseOrderApi(entry.reference, entry, Number(authoritative.version))).record;
       saveDocSequence('purchaseOrderSequence', poDetails.poNumber);
-      localStorage.setItem('supplierPOHistory', JSON.stringify(current));
-      const stamped = await sendPODocumentToStore(entry.reference, entry.payload);
-      setHistory(readStoredList('supplierPOHistory').map((h) => ({ ...h, progress: getPOProgress(h.reference) })));
+      const stamped = await sendPODocumentToStore(entry.reference, confirmedEntry.payload);
+      await reloadPurchaseOrderHistory().catch(() => {});
       setSelectedPO(stamped);
       setMode('view');
 
@@ -567,35 +590,7 @@ const PurchaseOrderPage = () => {
       pushNotification({ title: 'New Purchase Order — delivery to be recorded by Store', message: `PO ${poDetails.poNumber} created for ${vendorDetails.companyName || vendorDetails.vendorName}. Amount: ₹${poTotals.grandTotal.toFixed(2)}. Record the vendor delivery on the Tax Invoice / Material Receipt screen — it is shared with Quality and Purchase.`, type: 'info', reference: poDetails.poNumber, targetDept: 'Store Department', link: `/material-receipts?po=${encodeURIComponent(poDetails.poNumber)}` });
       pushNotification({ title: 'PO Raised for Material Shortage', message: `PO ${poDetails.poNumber} issued for ${vendorDetails.companyName || vendorDetails.vendorName}. Short materials will be procured.`, type: 'info', reference: poDetails.poNumber, targetDept: 'Production Department', link: '/production' });
 
-      if (poDetails.prRef) {
-        try {
-          const storedPRs = JSON.parse(localStorage.getItem('storePurchaseRequests') || '[]');
-          const updatedPRs = storedPRs.map((p) => p.prNumber === poDetails.prRef ? { ...p, status: 'Converted to PO', poNumber: poDetails.poNumber, convertedAt: new Date().toISOString() } : p);
-          localStorage.setItem('storePurchaseRequests', JSON.stringify(updatedPRs));
-          appendAuditLog({ action: 'PR CONVERTED TO PO', reference: poDetails.prRef, details: `Converted to PO ${poDetails.poNumber}` });
-        } catch (e) { /* ignore */ }
-      }
-
       // Sales Order → Purchase Indent → Vendor Enquiry → Quotation → Purchase Order traceability
-      try {
-        linkPOToProcurementChain(poDetails.poNumber, {
-          enquiryNumber: poDetails.enquiryRef || '',
-          quotationNumber: poDetails.quotationRef || ''
-        });
-      } catch (e) {
-        console.warn('Procurement chain linking failed', e);
-      }
-
-      if (poDetails.indentRef) {
-        try {
-          const indent = getIndent(poDetails.indentRef);
-          if (indent && indent.status !== INDENT_STATUS.CONVERTED) {
-            markIndentConverted(poDetails.indentRef, poDetails.poNumber);
-          }
-        } catch (e) {
-          console.warn('Indent conversion failed', e);
-        }
-      }
     } catch (err) {
       console.error('Failed to save Purchase Order', err);
       alert(err.message || 'Failed to save Purchase Order.');
@@ -610,7 +605,7 @@ const PurchaseOrderPage = () => {
   const handleInwardStock = (poPayload) => {
     const poNumber = poPayload?.poDetails?.poNumber;
     if (!poNumber) return;
-    const progress = getPOProgress(poNumber);
+    const progress = progressOf(history.find((row) => String(row.reference) === String(poNumber)));
     if (progress.pending === 0 && progress.ordered > 0) {
       alert(
         `PO ${poNumber} is already fully received (Pending 0) and closed.\nRejected quantity must be re-ordered on a new replacement PO.`
@@ -674,12 +669,16 @@ const PurchaseOrderPage = () => {
         </div>
       </div>
 
+      {poLoadError && <div role="alert" className="content-block" style={{ color: '#b91c1c' }}>{poLoadError}</div>}
+      {vendorMasterError && <div role="alert" className="content-block" style={{ color: '#b91c1c' }}>{vendorMasterError}</div>}
+
       {showExcelImport && <ExcelImportDialog title="Purchase Orders" columns={poImportColumns} example={['PO-IMPORT-001','2026-01-15','Example Steel Suppliers','VEND-001','PRJ-001','PRAG-101','MS Plate 10mm',10,'Kg',85,18,153,1003,'2026-02-15','30 Days','Sample import']} instructions={['Required: PO Number, PO Date, Vendor Name or Vendor Code, Item Code, Quantity, Rate.', 'One item per row. Repeat the same PO Number to group multiple items into one Purchase Order.', 'Vendor and Item Code must match existing masters. Tax Amount and Total Amount are checked per line when supplied.', 'Imported Purchase Orders are created as Draft; normal quotation approval, approval and receiving workflows remain required.']} validate={validatePOImportRow} onImport={importPurchaseOrders} onClose={() => setShowExcelImport(false)}/>}
 
       {mode === 'list' && hasPermission('indent.convert') && (() => {
         const convertible = [INDENT_STATUS.SUBMITTED, INDENT_STATUS.AWAITING_PRODUCTION, INDENT_STATUS.UNDER_REVIEW];
-        const vendorEnquiries = readStoredList('vendorEnquiries');
-        const purchaseOrders = readStoredList('supplierPOHistory');
+        const vendorEnquiries = (serverEnquiries || readStoredList('vendorEnquiries'));
+        /* Purchase Orders come from the PostgreSQL-backed list loaded above. */
+        const purchaseOrders = history;
         const pendingIndents = getIndents().filter(
           (i) => i.sourceType !== 'storeDirect' && convertible.includes(i.status)
             && !hasVendorEnquiryForIndent(i, vendorEnquiries)
@@ -786,7 +785,7 @@ const PurchaseOrderPage = () => {
                 <tbody>
                   {filterMaterialRecords(history, poSearch, ['reference','vendor','projectRef','soRef','date','dueDate','status']).length > 0 ? (
                     filterMaterialRecords(history, poSearch, ['reference','vendor','projectRef','soRef','date','dueDate','status']).map((po, idx) => {
-                      const prog = getPOProgress(po.reference);
+                      const prog = progressOf(po);
                       const displayStatus = prog.fulfillmentStatus || po.status;
                       return (
                       <tr key={idx}>
@@ -849,7 +848,7 @@ const PurchaseOrderPage = () => {
                         </td>
                         <td>
                           {(() => {
-                            const prog = getPOProgress(po.reference);
+                            const prog = progressOf(po);
                             if (prog.ordered === 0) return <span style={{ color: '#94a3b8' }}>—</span>;
                             const cell = (label, value, color) => (
                               <div style={{ whiteSpace: 'nowrap' }}>
@@ -971,7 +970,7 @@ const PurchaseOrderPage = () => {
                   { key: 'status', label: 'Status' }
                 ]}
                 rows={history.map((r) => {
-                  const progress = getPOProgress(r.reference);
+                  const progress = progressOf(r);
                   return { ...r, status: progress.fulfillmentStatus || r.status,
                     orderedQuantity: progress.ordered, originalReceived: progress.originalArrived,
                     originalAccepted: progress.originalAccepted, rejected: progress.rejected,
@@ -1069,15 +1068,11 @@ const PurchaseOrderPage = () => {
                     onChange={(e) => setPoDetails({ ...poDetails, prRef: e.target.value })}
                   >
                     <option value="">-- None --</option>
-                    {(() => {
-                      try {
-                        const prs = JSON.parse(localStorage.getItem('storePurchaseRequests') || '[]');
-                        return prs.filter((p) => p.status === 'Approved').map((p) => (
-                          <option key={p.prNumber} value={p.prNumber}>{p.prNumber} - {p.partName || p.projectId || 'N/A'} ({p.items?.length || 0} items)</option>
-                        ));
-                      } catch { return []; }
-                    })()}
+                    {purchaseRequests.filter((pr) => pr.status === 'Approved').map((pr) => (
+                      <option key={pr.prNumber} value={pr.prNumber}>{pr.prNumber} - {pr.partName || pr.projectId || 'N/A'} ({pr.items?.length || 0} items)</option>
+                    ))}
                   </select>
+                  {purchaseRequestLoadError && <small className="status-badge st-out">{purchaseRequestLoadError}</small>}
                 </div>
                 <div className="field-group">
                   <label>Link to Purchase Indent (Optional)</label>
@@ -1134,7 +1129,7 @@ const PurchaseOrderPage = () => {
                     value={poDetails.enquiryRef || ''}
                     onChange={(e) => {
                       const enqNo = e.target.value;
-                      const enq = readStoredList('vendorEnquiries').find(
+                      const enq = ((serverEnquiries || readStoredList('vendorEnquiries'))).find(
                         (x) => String(x.enquiryNumber) === String(enqNo)
                       );
                       setPoDetails((prev) => ({
@@ -1149,7 +1144,7 @@ const PurchaseOrderPage = () => {
                     }}
                   >
                     <option value="">-- None --</option>
-                    {readStoredList('vendorEnquiries')
+                    {((serverEnquiries || readStoredList('vendorEnquiries')))
                       .filter((e) => {
                         const sourceIndent = e.indentNumber ? getIndent(e.indentNumber) : null;
                         return sourceIndent?.sourceType !== 'storeDirect' && (!sourceIndent || sourceIndent.status !== 'Converted to PO');
@@ -1178,7 +1173,7 @@ const PurchaseOrderPage = () => {
                     }}
                   >
                     <option value="">-- None --</option>
-                    {readStoredList('vendorQuotations')
+                    {((serverQuotations || readStoredList('vendorQuotations')))
                       .filter((q) => canCreatePOFromQuotation(q.quotationNumber).allowed)
                       .map((q) => (
                         <option key={q.quotationNumber} value={q.quotationNumber}>
@@ -1506,7 +1501,7 @@ const PurchaseOrderPage = () => {
 
               {/* B. What the vendor actually offered — carried from the quotation, read-only */}
               {(() => {
-                const src = findSourceQuotation(poDetails.quotationRef);
+                const src = findSourceQuotation((serverQuotations || readStoredList('vendorQuotations')), poDetails.quotationRef);
                 if (!src) return null;
                 const quotedTerms = poDetails.quotationTerms || src.otherTerms || '';
                 return (
@@ -1701,7 +1696,7 @@ const PurchaseOrderPage = () => {
                         <div><strong>Project Ref:</strong> {selectedPO.poDetails.projectRef}</div>
                       )}
                       <div><strong>Payment Terms:</strong> {selectedPO.poDetails?.paymentTerms || '30 Days'}</div>
-                      <div><strong>Status:</strong> {getPOProgress(selectedPO.poDetails?.poNumber).status || selectedPO.poDetails?.poStatus || 'Issued'}</div>
+                      <div><strong>Status:</strong> {progressOf(history.find((h) => String(h.reference) === String(selectedPO.poDetails?.poNumber))).status || selectedPO.poDetails?.poStatus || 'Issued'}</div>
                       {selectedPO.poDetails?.indentRef && (
                         <div><strong>Purchase Indent:</strong> {selectedPO.poDetails.indentRef}</div>
                       )}
@@ -1709,7 +1704,7 @@ const PurchaseOrderPage = () => {
                         <div><strong>Sales Order:</strong> {selectedPO.poDetails.salesOrderRef}</div>
                       )}
                       {(() => {
-                        const prog = getPOProgress(selectedPO.poDetails?.poNumber);
+                        const prog = progressOf(history.find((h) => String(h.reference) === String(selectedPO.poDetails?.poNumber)));
                         if (!prog.ordered) return null;
                         return (
                           <>
@@ -1868,7 +1863,7 @@ const PurchaseOrderPage = () => {
                 {/* Vendor's own offer, carried from the quotation (not our legal terms) */}
                 {(() => {
                   const pd = selectedPO.poDetails || {};
-                  const src = findSourceQuotation(pd.quotationRef);
+                  const src = findSourceQuotation((serverQuotations || readStoredList('vendorQuotations')), pd.quotationRef);
                   const quoted = pd.quotationTerms || src?.otherTerms || '';
                   const lines = [
                     pd.paymentTerms ? `Payment terms: ${pd.paymentTerms}` : '',

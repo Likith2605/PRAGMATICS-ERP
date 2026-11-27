@@ -23,9 +23,11 @@ globalThis.localStorage = {
     return mem.size;
   }
 };
+const { storeAuditEntries } = await import('./helpers/availability-api-stub.mjs');
 
 const P = await import('../src/utils/productionRequirementService.js');
 const W = await import('../src/utils/workflowService.js');
+const S = await import('../src/utils/storeService.js');
 const { REQUIREMENT_STATUS } = P;
 
 /* --------------------------------- test runner --------------------------------- */
@@ -81,7 +83,7 @@ const loginAs = (department, roleKey, name) => {
 
 const ls = (key, fallback) => JSON.parse(localStorage.getItem(key) ?? JSON.stringify(fallback));
 const notifications = () => ls('notifications', []);
-const auditLog = () => ls('storeAuditLog', []);
+const auditLog = () => storeAuditEntries;
 const requirements = () => ls('productionRequirements', []);
 const indents = () => ls('purchaseIndents', []);
 
@@ -118,6 +120,8 @@ localStorage.setItem(
     soRow('SO-002', [{ itemCode: 'RAW-001', itemName: 'MS Plate 10mm', quantity: 30, unit: 'Nos' }])
   ])
 );
+
+await S.hydrateInventoryItemAuthority();
 
 const baseItems = () => [
   { itemName: 'MS Plate 10mm', itemCode: 'RAW-001', description: '10mm MS plate', specification: 'IS2062', quantity: 50, unit: 'Nos', requiredDate: '2026-10-20' },
@@ -263,7 +267,14 @@ expectThrows(
   /Only Draft/,
   'cannot edit after submission'
 );
-expectThrows(() => P.deleteRequirement('PR-000001'), /Only Draft/, 'cannot delete after submission');
+expectThrows(
+  () => P.deleteRequirement('PR-000001'),
+  /only an Admin/,
+  'non-Admin cannot delete a submitted requirement'
+);
+loginAs('Administration', 'admin', 'Ravi Admin');
+expectThrows(() => P.deleteRequirement('PR-000001'), /Only Draft/, 'Admin cannot delete after submission');
+loginAs('Production Department', 'production_manager', 'Kiran Production');
 expectThrows(() => P.submitRequirement('PR-000001'), /Only Draft/, 'double submit is rejected');
 
 /* ========================================================================== */
@@ -413,13 +424,20 @@ expectThrows(
   'fully-indented requirement rejects further indents'
 );
 
-/* Cancelled indent frees the shortage again */
+/* Only Admin can cancel an indent; cancellation frees the shortage again. */
 loginAs('Store Department', 'store_manager', 'Suresh Store');
+expectThrows(
+  () => W.cancelIndent('IND-000002', 'Vendor cannot deliver in time'),
+  /only an Admin/,
+  'Store cannot cancel a Purchase Indent'
+);
+loginAs('Administration', 'admin', 'Ravi Admin');
 W.cancelIndent('IND-000002', 'Vendor cannot deliver in time');
 lines = P.computeRequirementLines('PR-000001');
 const barCancelled = lines.find((l) => l.lineId === bar.lineId);
 check(barCancelled.indentedQty === 0, 'cancelled indent no longer counts as indented');
 check(barCancelled.remainingShortageQty === 5, 'pending shortage restored to 5 after cancellation');
+loginAs('Store Department', 'store_manager', 'Suresh Store');
 const indent2b = P.createIndentFromRequirement({ requirementNumber: 'PR-000001' });
 check(indent2b.indentNumber === 'IND-000003', `re-raise after cancellation → ${indent2b.indentNumber}`);
 
@@ -497,8 +515,14 @@ const pr4 = P.createRequirement({
 });
 expectThrows(
   () => P.deleteRequirement(pr3.requirementNumber),
+  /only an Admin/,
+  'Production cannot delete a completed requirement'
+);
+loginAs('Administration', 'admin', 'Ravi Admin');
+expectThrows(
+  () => P.deleteRequirement(pr3.requirementNumber),
   /Only Draft/,
-  'non-draft requirement cannot be deleted (data preserved)'
+  'Admin cannot delete a completed requirement (data preserved)'
 );
 const pr4b = P.cancelRequirement(pr4.requirementNumber, 'Not needed anymore');
 check(pr4b.status === REQUIREMENT_STATUS.CANCELLED, 'draft requirement can be cancelled');
@@ -530,8 +554,9 @@ check(
 section('8. Legacy Sales Order workflow untouched');
 /* ========================================================================== */
 
+await W.hydrateSalesOrderAuthority();
 loginAs('Store Department', 'store_manager', 'Suresh Store');
-const checkRec = W.saveMaterialAvailabilityCheck({ soNumber: 'SO-001', remarks: 'legacy path' });
+const checkRec = await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-001', remarks: 'legacy path' });
 check(checkRec.lines.length === 3, 'legacy SO availability check still works (3 lines)');
 const legacyPlate = checkRec.lines.find((l) => l.materialCode === 'RAW-001');
 check(

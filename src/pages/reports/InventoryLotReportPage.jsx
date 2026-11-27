@@ -1,5 +1,9 @@
 import React, { useMemo } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { listAllStockLedger, listInventoryItems, listInventoryLots } from '../../services/inventoryApi.js';
+import { normalizeInventoryBatch, normalizeInventoryItem, normalizeStockLedgerEntry } from '../../utils/reportApiData.js';
 import {
   getExpiredLotRows,
   getInventoryLotFilterOptions,
@@ -20,10 +24,24 @@ const REPORTS = {
 };
 
 const qty = (value) => value === '' || value === null || value === undefined ? '' : Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+const loadInventoryLotData = async () => {
+  const [items, batches, ledger] = await Promise.all([
+    listInventoryItems(),
+    listInventoryLots(),
+    listAllStockLedger()
+  ]);
+  return {
+    items: items.map(normalizeInventoryItem),
+    batches: batches.map(normalizeInventoryBatch),
+    transactions: ledger.map(normalizeStockLedgerEntry)
+  };
+};
 
 const InventoryLotReportPage = ({ reportType }) => {
   const config = REPORTS[reportType];
-  const rows = useMemo(() => config.rows(), [config]);
+  const { data, loading, error } = useAuthoritativeData(loadInventoryLotData, reportType, { items: [], batches: [], transactions: [] });
+  const rows = useMemo(() => config.rows(data), [config, data]);
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
   const filters = getInventoryLotFilterOptions(rows);
   const dimensionKeys = reportType === 'dimensions' ? getPresentLotDimensions(rows) : [];
   let columns;

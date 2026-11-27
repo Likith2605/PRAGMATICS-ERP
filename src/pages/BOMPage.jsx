@@ -1,5 +1,6 @@
 ﻿import React, { useState, useMemo, useEffect } from 'react';
-import { getBOMs, createBOM, updateBOM, deleteBOM, getInventoryItems } from '../utils/storeService.js';
+import { getInventoryItems } from '../utils/storeService.js';
+import { listBoms, getBom, createBom, updateBom, deleteBom } from '../services/bomApi.js';
 import { getAllProjectsSummary } from '../utils/projectTracker.js';
 import { getFinancialYearInfo } from '../utils/financialYear.js';
 import { hasPermission } from '../utils/permissions.js';
@@ -9,32 +10,21 @@ import { viewDrawingFile } from '../utils/fileViewer.js';
 import AddableSelect from '../components/AddableSelect.jsx';
 import { addCustomUnit, DEFAULT_UNITS, getCustomUnits } from '../utils/addableMasters.js';
 
-/** Opens the drawing PDF stored for a project + drawing number (IndexedDB, with project fallback). */
+/** Opens the authoritative PostgreSQL drawing for a project + drawing number. */
 const openDrawingPDF = async (projectId, drawingNumber) => {
   if (!drawingNumber) return false;
-  let dataUrl = '';
   try {
-    dataUrl = (await getDrawing(projectId, drawingNumber)) || '';
+    const dataUrl = await getDrawing(projectId, drawingNumber);
+    if (!dataUrl) throw new Error(`No PostgreSQL drawing exists for ${drawingNumber}.`);
+    viewDrawingFile(dataUrl, `${drawingNumber}.pdf`);
+    return true;
   } catch (err) {
-    console.error('Drawing lookup failed', err);
-  }
-  if (!dataUrl) {
-    try {
-      const projects = JSON.parse(localStorage.getItem('projectRequests') || '[]');
-      const project = projects.find((p) => String(p.projectId) === String(projectId));
-      const item = (project?.items || []).find((i) => String(i.drawingNo) === String(drawingNumber));
-      dataUrl = item?.drawingDataUrl || '';
-    } catch (err) {
-      console.error('Drawing fallback lookup failed', err);
-    }
-  }
-  if (!dataUrl) {
-    window.alert(`No drawing PDF found for ${drawingNumber}. Upload it from the Enquiry / Project Request screen.`);
+    window.alert(`Drawing could not be verified from PostgreSQL: ${err.message}`);
     return false;
   }
-  viewDrawingFile(dataUrl, `${drawingNumber}.pdf`);
-  return true;
 };
+
+const newCreateToken = () => globalThis.crypto?.randomUUID?.() || `bom-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
 
 const EMPTY_BOM_LINE = {
   materialId: '',
@@ -50,26 +40,38 @@ const EMPTY_BOM_LINE = {
 const BOMPage = () => {
   const canCreate = hasPermission('material_request.create') || hasPermission('production.view');
 
-  const [boms, setBOMs] = useState(() => getBOMs());
+  const [boms, setBOMs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [mode, setMode] = useState('list');
   const [selectedId, setSelectedId] = useState(null);
   const [search, setSearch] = useState('');
-  const [refreshTick, setRefreshTick] = useState(0);
 
-  const refresh = () => {
-    setBOMs(getBOMs());
-    setRefreshTick((t) => t + 1);
+  const load = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      setBOMs(await listBoms());
+    } catch (err) {
+      setError(err.message || 'Could not load BOMs from PostgreSQL.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  const refresh = async () => {
+    await load();
     setMode('list');
     setSelectedId(null);
   };
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
-    const list = getBOMs();
-    if (!q) return list;
-    return list.filter((b) => [b.customerName, b.companyName, b.drawingNumber, b.projectId, b.createdBy].join(' ').toLowerCase().includes(q));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [boms, search, refreshTick]);
+    if (!q) return boms;
+    return boms.filter((b) => [b.customerName, b.companyName, b.drawingNumber, b.projectId, b.createdBy].join(' ').toLowerCase().includes(q));
+  }, [boms, search]);
 
   const selected = selectedId ? boms.find((b) => b.id === selectedId) : null;
 
@@ -83,18 +85,27 @@ const BOMPage = () => {
     setMode('edit');
   };
 
-  const handleView = (bom) => {
-    setSelectedId(bom.id);
-    setMode('view');
+  const handleView = async (bom) => {
+    try {
+      const latest = await getBom(bom.bomNumber || bom.id);
+      setBOMs((prev) => prev.map((row) => (row.id === latest.id ? latest : row)));
+      setSelectedId(latest.id);
+      setMode('view');
+    } catch (err) {
+      setError(err.message || 'Could not open this BOM.');
+    }
   };
 
-  const handleDelete = (bom) => {
+  const handleDelete = async (bom) => {
     if (!window.confirm(`Delete this item list? This cannot be undone.`)) return;
+    const reason = window.prompt('Reason for deleting this BOM:');
+    if (reason === null || !reason.trim()) return;
     try {
-      deleteBOM(bom.id);
-      refresh();
+      setError('');
+      await deleteBom(bom.bomNumber || bom.id, Number(bom.version) || 1, reason.trim());
+      await refresh();
     } catch (err) {
-      alert(err.message);
+      setError(err.message || 'Could not delete this BOM.');
     }
   };
 
@@ -110,6 +121,9 @@ const BOMPage = () => {
           )}
         </div>
       </div>
+
+      {loading && <div className="form-error" style={{ marginBottom: '12px' }}>Loading BOMs from PostgreSQL…</div>}
+      {error && <div className="form-error" style={{ marginBottom: '12px' }}>{error}</div>}
 
       {mode === 'create' || mode === 'edit' ? (
         <BOMForm
@@ -265,7 +279,7 @@ const BOMForm = ({ bom, onSave, onCancel }) => {
     return created;
   };
 
-  const handleSave = (e) => {
+  const handleSave = async (e) => {
     e.preventDefault();
     setError('');
     if (!projectId) { setError('Please select an Enquiry (Project).'); return; }
@@ -273,18 +287,32 @@ const BOMForm = ({ bom, onSave, onCancel }) => {
     const ready = lines.filter((l) => l.materialId);
     if (ready.length === 0) { setError('Add at least one material.'); return; }
 
+    setBusy(true);
     try {
-      setBusy(true);
+      const payload = {
+        id: bom?.id || bom?.bomNumber || '',
+        bomNumber: bom?.bomNumber || bom?.id || '',
+        version: Number(bom?.version || 1) + (bom ? 1 : 0),
+        partName: ready[0]?.partName || drawingNumber,
+        partCode: drawingNumber,
+        projectId,
+        customerName,
+        companyName,
+        drawingNumber,
+        effectiveDate: new Date().toISOString().slice(0, 10),
+        remarks,
+        items: ready
+      };
       if (bom) {
-        updateBOM(bom.id, { projectId, customerName, companyName, drawingNumber, remarks, items: ready });
+        await updateBom(bom.bomNumber || bom.id, Number(bom.version) || 1, payload);
       } else {
-        createBOM({ projectId, customerName, companyName, drawingNumber, remarks, items: ready });
+        await createBom(payload, newCreateToken());
       }
-      setBusy(false);
-      onSave();
+      await onSave();
     } catch (err) {
+      setError(err.message || 'Could not save this BOM.');
+    } finally {
       setBusy(false);
-      setError(err.message);
     }
   };
 
@@ -446,6 +474,10 @@ const BOMDetailView = ({ bom, onBack, onEdit, onDelete, canCreate, onViewDrawing
     </div>
 
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '16px', padding: '12px', background: '#f8fafc', borderRadius: '8px' }}>
+      <div>
+        <div style={{ fontSize: '11px', fontWeight: '700', color: '#64748b', textTransform: 'uppercase', marginBottom: '2px' }}>BOM Version</div>
+        <div style={{ fontSize: '13px', fontWeight: '600' }}>{bom.bomNumber || bom.id} · v{bom.version || 1}</div>
+      </div>
       <div>
         <div style={{ fontSize: '11px', fontWeight: '700', color: '#64748b', textTransform: 'uppercase', marginBottom: '2px' }}>Customer</div>
         <div style={{ fontSize: '13px', fontWeight: '600' }}>{bom.customerName || '—'}</div>

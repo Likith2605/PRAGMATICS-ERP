@@ -24,7 +24,14 @@ import { hasPermissionForRole } from './departmentAccess.js';
 const router = express.Router();
 
 // Whitelist: only module-owned list keys live here (one authority per module).
-const RECORD_KEYS = new Set(['inventoryItems', 'stockTransactions', 'productionDispatchRequests']);
+const RECORD_KEYS = new Set([
+    'inventoryItems', 'stockTransactions', 'productionDispatchRequests',
+    // Workflow ledgers graduated from the whole-key erp_state mirror to
+    // versioned per-record storage. Their browser copies are working caches;
+    // only /api/records versions are authoritative.
+    'materialArrivals', 'qualityChecks', 'rejectionReports',
+    'soMaterialAvailabilityChecks'
+]);
 
 const SAFE_KEY = /^[A-Za-z][A-Za-z0-9_]{0,60}$/;
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,120}$/;
@@ -39,7 +46,15 @@ const requireRecordPermission = (req, res, key, mutation = false) => {
         ? (mutation ? ['inventory.adjust'] : ['inventory.view'])
         : key === 'stockTransactions'
             ? (mutation ? ['inventory.adjust','material_issue.create','material_return.create','receipt.create','production.entry.create'] : ['inventory.transaction.view','material_issue.view'])
-            : (mutation ? ['job_card.dispatch_request','delivery.create'] : ['job_card.view','delivery.view']);
+            : key === 'materialArrivals'
+                ? (mutation ? ['arrival.create','receipt.create','material_issue.confirm'] : ['receipt.view','material_issue.view'])
+                : key === 'qualityChecks'
+                    ? (mutation ? ['production.qc.manage'] : ['production.qc.view','receipt.view'])
+                    : key === 'soMaterialAvailabilityChecks'
+                        ? (mutation ? ['store.module'] : ['sales_order.view','store.module'])
+                    : key === 'rejectionReports'
+                        ? (mutation ? ['rejection.forward','receipt.create'] : ['rejection.view','receipt.view'])
+                        : (mutation ? ['job_card.dispatch_request','delivery.create'] : ['job_card.view','delivery.view']);
     if (!hasPermissionForRole(req.user?.roleKey, required, req.user?.rolePermissions)) {
         res.status(403).json({ error: 'Your selected department role does not allow this record operation.' });
         return false;
@@ -126,6 +141,9 @@ router.get('/:key', async(req, res) => {
 
 router.put('/:key', async(req, res) => {
     const key = validateKey(req.params.key);
+    if (key === 'soMaterialAvailabilityChecks') {
+        throw Object.assign(new Error('Availability checks must be saved through /api/availability-checks.'), { status: 409 });
+    }
     const body = req.body || {};
     const records = Array.isArray(body.records) ? body.records : [];
     const deletes = Array.isArray(body.deletes) ? body.deletes : [];
@@ -222,7 +240,9 @@ router.put('/:key', async(req, res) => {
         }
 
         for (const entry of deletes) {
-            if (key === 'stockTransactions' || key === 'productionDispatchRequests') {
+            if (key === 'stockTransactions' || key === 'productionDispatchRequests' ||
+                key === 'materialArrivals' || key === 'qualityChecks' || key === 'rejectionReports' ||
+                key === 'soMaterialAvailabilityChecks') {
                 throw Object.assign(new Error('This record type must be reversed or cancelled through its controlled workflow; permanent deletion is not allowed.'), { status: 409 });
             }
             if (req.user?.roleKey !== 'admin' && req.user?.role !== 'Administrator') {
@@ -254,8 +274,8 @@ router.put('/:key', async(req, res) => {
                 if (Number(item.currentQty || 0) !== 0 || Number(item.reservedQty || 0) !== 0) {
                     throw Object.assign(new Error('Inventory items with stock or reserved quantity cannot be deleted.'), { status: 409 });
                 }
-                const history = await client.query("SELECT data FROM erp_state WHERE storage_key = ANY($1::text[])", [['stockIssueHistory','stockReturnHistory','materialReceipts','purchaseOrders','salesOrders','productionJobCards','qualityChecks','inventoryBatches']]);
-                const tx = await client.query("SELECT data FROM module_records WHERE storage_key='stockTransactions'");
+                const history = await client.query("SELECT data FROM erp_state WHERE storage_key = ANY($1::text[])", [['stockIssueHistory','stockReturnHistory','materialReceipts','purchaseOrders','salesOrders','productionJobCards','inventoryBatches']]);
+                const tx = await client.query("SELECT data FROM module_records WHERE storage_key = ANY($1::text[])", [['stockTransactions','qualityChecks','materialArrivals','rejectionReports']]);
                 const needles = [id, item.itemCode, item.code, item.itemName, item.name].filter(Boolean).map(String);
                 const refers = (value, parentKey = '') => {
                     if (Array.isArray(value)) return value.some((v) => refers(v, parentKey));

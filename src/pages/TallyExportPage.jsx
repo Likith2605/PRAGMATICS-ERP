@@ -16,6 +16,11 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { Upload, Download, LoaderCircle, Trash2 } from 'lucide-react';
 import { authHeaders, isAdmin } from '../utils/auth.js';
+import { getCompanyProfile } from '../utils/companyBranding.js';
+import { listMasters } from '../services/masterApi.js';
+import { listDebitNotes } from '../services/debitNoteApi.js';
+import { listCustomerInvoices } from '../services/customerInvoiceApi.js';
+import { listSupplierInvoicesFromPostgres } from '../services/procurementIntakeApi.js';
 import {
   buildTransactionRows,
   mapSelectedToTally,
@@ -119,22 +124,45 @@ const TallyExportPage = () => {
   // ---------- Build transaction rows ----------
   const [transactions, setTransactions] = useState([]);
   const [loadingTransactions, setLoadingTransactions] = useState(false);
+  const [transactionError, setTransactionError] = useState('');
+  const [vendorMaster, setVendorMaster] = useState([]);
 
   const loadTransactions = useCallback(async () => {
     setLoadingTransactions(true);
     try {
       if (!dateFilterApplied) {
         setTransactions([]);
+        setTransactionError('');
         return;
       }
+      const needsCustomerInvoices = selectedTypes.some((type) =>
+        ['sale', 'creditNote', 'customerReceipt'].includes(type)
+      );
+      const needsSupplierInvoices = selectedTypes.some((type) =>
+        ['purchase', 'supplierPayment'].includes(type)
+      );
+      const [vendors, customerInvoices, supplierInvoices, debitNotes] = await Promise.all([
+        listMasters('vendors'),
+        needsCustomerInvoices ? listCustomerInvoices() : Promise.resolve([]),
+        needsSupplierInvoices ? listSupplierInvoicesFromPostgres() : Promise.resolve([]),
+        selectedTypes.includes('debitNote') ? listDebitNotes() : Promise.resolve([])
+      ]);
+      setVendorMaster(vendors);
       const rows = buildTransactionRows({
         dateFrom,
         dateTo,
-        selectedTypes
+        selectedTypes,
+        customerInvoices,
+        supplierInvoices,
+        debitNotes,
+        vendorMaster: vendors
       });
       setTransactions(rows);
+      setTransactionError('');
     } catch (err) {
-      console.error('Failed to load transactions:', err);
+      setTransactions([]);
+      setVendorMaster([]);
+      setTransactionError(`Tally transaction data could not be loaded from PostgreSQL: ${err.message}`);
     } finally {
       setLoadingTransactions(false);
     }
@@ -281,12 +309,12 @@ const TallyExportPage = () => {
     setLastExportId(null);
     let savedExportId = null;
     try {
-      const company = JSON.parse(localStorage.getItem('companySettings') || '{}');
+      const company = getCompanyProfile();
       const { rows: exportableRows, duplicates: duplicateRows } = excludePreviouslyExportedRows(selectedRows, exportHistory || []);
       const legacyHistoryCount = (exportHistory || []).filter((record) =>
         !['failed', 'import_failed', 'pending'].includes(record.export_status) && !record.validation_summary?.voucherKeys
       ).length;
-      const result = mapSelectedToTally({ selectedRows: exportableRows, company });
+      const result = mapSelectedToTally({ selectedRows: exportableRows, company, vendorMaster });
       duplicateRows.forEach((row) => result.invalidVouchers.push({ voucher: { uiRow: row, voucherType: row.transactionTypeLabel }, errors: ['Previously generated successfully; excluded to prevent duplicate vouchers.'] }));
       setExportResult(result);
       setShowValidation(result.invalidVouchers.length > 0 || duplicateRows.length > 0);
@@ -547,6 +575,7 @@ const TallyExportPage = () => {
           </span>
         </div>
         {dateError && <p role="alert" style={{ color: '#b91c1c', fontSize: '12px', margin: '10px 0 0' }}>{dateError}</p>}
+        {transactionError && <p role="alert" style={{ color: '#b91c1c', fontSize: '12px', margin: '10px 0 0' }}>{transactionError}</p>}
       </div>
 
       {/* ============ TRANSACTION TYPES ============ */}

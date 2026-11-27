@@ -1,11 +1,31 @@
 import 'dotenv/config';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import { getPool, closeDatabase } from '../server/database.js';
 
-const port = 3348;
+const testDatabaseUrl = process.env.ERP_TEST_DATABASE_URL;
+if (!testDatabaseUrl) throw new Error('ERP_TEST_DATABASE_URL is required; refusing DATABASE_URL.');
+if (decodeURIComponent(new URL(testDatabaseUrl).pathname.replace(/^\/+/, '')) !== 'vyavastha_test') {
+  throw new Error('Refusing role permission tests outside vyavastha_test.');
+}
+process.env.ERP_TEST_MODE = '1';
+process.env.ERP_TEST_DATABASE_URL = testDatabaseUrl;
+assert.equal((await getPool().query('SELECT current_database() AS name')).rows[0]?.name, 'vyavastha_test',
+  'role permission test writes are restricted to vyavastha_test');
+
+const port = await new Promise((resolve, reject) => {
+  const listener = net.createServer();
+  listener.once('error', reject);
+  listener.listen(0, '127.0.0.1', () => {
+    const { port: availablePort } = listener.address();
+    listener.close((error) => error ? reject(error) : resolve(availablePort));
+  });
+});
 const base = `http://127.0.0.1:${port}`;
-const startServer = () => spawn(process.execPath, ['server.js'], { env: { ...process.env, PORT: String(port), QC_PULL_ENABLED: '0' }, stdio: 'ignore' });
+const serverEnv = { ...process.env, ERP_TEST_MODE: '1', ERP_TEST_DATABASE_URL: testDatabaseUrl, PORT: String(port), QC_PULL_ENABLED: '0' };
+delete serverEnv.DATABASE_URL;
+const startServer = () => spawn(process.execPath, ['server.js'], { env: serverEnv, stdio: 'ignore' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const request = async (path, { token, ...options } = {}) => {
   const response = await fetch(`${base}${path}`, {
@@ -15,196 +35,160 @@ const request = async (path, { token, ...options } = {}) => {
   return { status: response.status, data: await response.json().catch(() => ({})) };
 };
 const json = (value) => JSON.stringify(value);
-const snapshot = async (keys) => {
-  const result = await getPool().query('SELECT storage_key,data FROM erp_state WHERE storage_key=ANY($1::text[])', [keys]);
-  return Object.fromEntries(result.rows.map((row) => [row.storage_key, row.data]));
-};
 const waitForServer = async () => {
   for (let i = 0; i < 80; i += 1) {
-    try { if ((await fetch(`${base}/api/health`)).ok) return true; } catch { /* server starting */ }
+    try {
+      const response = await fetch(`${base}/api/health`);
+      if (response.ok && (await response.json().catch(() => ({}))).ready === true) return true;
+    } catch { /* server starting */ }
     await sleep(250);
   }
   return false;
 };
 
 const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-const departmentOne = { id: `sync-test-dept-a-${suffix}`, name: `Sync Test A ${suffix}`, active: true };
-const departmentTwo = { id: `sync-test-dept-b-${suffix}`, name: `Sync Test B ${suffix}`, active: true };
-const sharedRoleKey = `custom_sync_test_${suffix.replace(/[^a-z0-9]+/gi, '_')}`;
-const roleOne = { id: `sync-test-role-a-${suffix}`, departmentId: departmentOne.id, department: departmentOne.name, name: `Sync Test Role A ${suffix}`, roleKey: sharedRoleKey };
-const roleTwo = { id: `sync-test-role-b-${suffix}`, departmentId: departmentTwo.id, department: departmentTwo.name, name: `Sync Test Role B ${suffix}`, roleKey: sharedRoleKey };
-const employee = {
-  id: `sync-test-employee-${suffix}`,
-  employeeId: `SYNC-${suffix}`.toUpperCase(),
-  name: `Sync Test Employee ${suffix}`,
-  email: `sync-test-${suffix}@example.invalid`,
-  password: `Sync-Test-${suffix}!2`,
-  active: true,
-  department: departmentOne.name,
-  role: roleOne.name,
-  roleKey: roleOne.roleKey,
-  departmentAssignments: [
-    { department: departmentOne.name, departmentId: departmentOne.id, role: roleOne.name, roleKey: roleOne.roleKey, roleId: roleOne.id },
-    { department: departmentTwo.name, departmentId: departmentTwo.id, role: roleTwo.name, roleKey: roleTwo.roleKey, roleId: roleTwo.id }
-  ]
+const department = { id: `permission-dept-${suffix}`, name: `Permission Test ${suffix}`, active: true };
+const role = {
+  id: `permission-role-${suffix}`, departmentId: department.id, department: department.name,
+  name: `Permission Operator ${suffix}`, roleKey: `permission_operator_${suffix.replace(/[^a-z0-9]+/gi, '_')}`, active: true
 };
-
+const employee = {
+  id: `permission-employee-${suffix}`, employeeId: `PERM-${suffix}`.toUpperCase(),
+  name: `Permission Employee ${suffix}`, email: `permission-${suffix}@example.invalid`,
+  password: `Permission-${suffix}!2`, active: true, department: department.name, role: role.name,
+  roleKey: role.roleKey,
+  departmentAssignments: [{ department: department.name, departmentId: department.id, role: role.name, roleKey: role.roleKey, roleId: role.id }]
+};
+const tokens = [];
 let server;
 let adminToken = '';
-let createdDepartmentIds = new Set();
-let createdRoleIds = new Set();
 let employeeCreated = false;
-let baseline = null;
-let testAuditCountBefore = 0;
-const permissionA = ['inventory.view'];
-const permissionB = ['job_card.view'];
-const errors = [];
+const failures = [];
 
 try {
   assert.ok(process.env.ERP_ADMIN_EMAIL && process.env.ERP_ADMIN_PASSWORD, 'Admin credentials must be configured');
-  const dbName = (await getPool().query('SELECT current_database() AS name')).rows[0].name;
-  assert.match(dbName, /test/i, `refusing to mutate non-test PostgreSQL database '${dbName}'`);
-  baseline = await snapshot(['employees', 'departmentCatalog', 'roleCatalog', 'rolePermissions']);
-  testAuditCountBefore = Number((await getPool().query("SELECT count(*) AS count FROM erp_audit_log WHERE record_id LIKE $1", [`%${suffix}%`])).rows[0].count);
-
   server = startServer();
   assert.ok(await waitForServer(), 'test Express server starts');
-  const adminLogin = await request('/api/auth/login', { method: 'POST', body: json({ email: process.env.ERP_ADMIN_EMAIL, password: process.env.ERP_ADMIN_PASSWORD, portal: 'admin' }) });
-  assert.equal(adminLogin.status, 200, 'Admin login works');
+  const adminLogin = await request('/api/auth/login', {
+    method: 'POST', body: json({ email: process.env.ERP_ADMIN_EMAIL, password: process.env.ERP_ADMIN_PASSWORD, portal: 'admin' })
+  });
+  assert.equal(adminLogin.status, 200, `Admin login works (${adminLogin.data.error || ''})`);
   adminToken = adminLogin.data.token;
 
-  const departments = (await request('/api/state/departmentCatalog', { token: adminToken })).data.data || [];
-  const roles = (await request('/api/state/roleCatalog', { token: adminToken })).data.data || [];
-  assert.equal((await request('/api/state/departmentCatalog', { method: 'PUT', token: adminToken, body: json({ data: [...departments, departmentOne, departmentTwo] }) })).status, 200, 'two temporary departments persist');
-  createdDepartmentIds.add(departmentOne.id); createdDepartmentIds.add(departmentTwo.id);
-  assert.equal((await request('/api/state/roleCatalog', { method: 'PUT', token: adminToken, body: json({ data: [...roles, roleOne, roleTwo] }) })).status, 200, 'same role key can be scoped independently by department');
-  createdRoleIds.add(roleOne.id); createdRoleIds.add(roleTwo.id);
+  const anonList = await request('/api/organization-catalogs/departments');
+  assert.equal(anonList.status, 401, 'catalog APIs require authentication');
+  assert.equal((await request('/api/organization-catalogs/departments', { token: adminToken })).status, 200);
 
-  // Employee GET intentionally redacts credentials; append from PostgreSQL's
-  // exact snapshot so the test never rewrites existing accounts without them.
-  const employeeSnapshot = await getPool().query("SELECT data FROM erp_state WHERE storage_key='employees'");
-  const employees = Array.isArray(employeeSnapshot.rows[0]?.data) ? employeeSnapshot.rows[0].data : [];
-  assert.equal((await request('/api/state/employees', { method: 'PUT', token: adminToken, body: json({ data: [...employees, employee] }) })).status, 200, 'temporary employee gets both scoped assignments');
+  const departmentToken = `permission-department-${suffix}`;
+  const roleToken = `permission-role-create-${suffix}`;
+  tokens.push(departmentToken, roleToken);
+  const createdDepartment = await request('/api/organization-catalogs/departments', {
+    method: 'POST', token: adminToken, body: json({ data: department, idempotencyToken: departmentToken })
+  });
+  assert.equal(createdDepartment.status, 201, `dedicated department API creates a scoped department (${createdDepartment.data.error || ''})`);
+  const createdRole = await request('/api/organization-catalogs/roles', {
+    method: 'POST', token: adminToken, body: json({ data: role, idempotencyToken: roleToken })
+  });
+  assert.equal(createdRole.status, 201, `dedicated role API creates a department-scoped role (${createdRole.data.error || ''})`);
+  assert.equal((await request('/api/organization-catalogs/roles', { token: adminToken })).data.records.some((item) => item.id === role.id), true);
+
+  const employeeCreateToken = `permission-employee-create-${suffix}`;
+  tokens.push(employeeCreateToken);
+  assert.equal((await request('/api/state/roleCatalog', {
+    method: 'PUT', token: adminToken, body: json({ data: [role] })
+  })).status, 409, 'generic synchronization rejects catalog whole-key writes');
+  assert.equal((await request('/api/state', {
+    method: 'PUT', token: adminToken, body: json({ records: { departmentCatalog: [department] } })
+  })).status, 400, 'bulk generic synchronization rejects catalog keys');
+  const createdEmployee = await request('/api/employees', {
+    method: 'POST', token: adminToken, body: json({ data: employee, createToken: employeeCreateToken })
+  });
+  assert.equal(createdEmployee.status, 201, `employee API preserves scoped assignments (${createdEmployee.data.error || ''})`);
   employeeCreated = true;
 
-  const putOne = await request(`/api/state/rolePermissions/${departmentOne.id}/${roleOne.id}`, { method: 'PUT', token: adminToken, body: json({ permissions: permissionA }) });
-  assert.equal(putOne.status, 200, 'Admin saves Department A permissions');
-  const putTwo = await request(`/api/state/rolePermissions/${departmentTwo.id}/${roleTwo.id}`, { method: 'PUT', token: adminToken, body: json({ permissions: permissionB }) });
-  assert.equal(putTwo.status, 200, 'Admin saves Department B permissions');
+  const permissionA = ['inventory.view'];
+  const permissionB = ['job_card.view'];
+  const permissionPath = `/api/organization-catalogs/role-permissions/${department.id}/${role.id}`;
+  const initialPermissions = await request(permissionPath, { token: adminToken });
+  assert.equal(initialPermissions.status, 200);
+  assert.equal(initialPermissions.data.version, 0);
+  const permissionToken = `permission-save-${suffix}`;
+  tokens.push(permissionToken);
+  const savedPermissions = await request(permissionPath, {
+    method: 'PUT', token: adminToken,
+    body: json({ permissions: permissionA, version: initialPermissions.data.version, idempotencyToken: permissionToken })
+  });
+  assert.equal(savedPermissions.status, 200, `Admin saves permissions (${savedPermissions.data.error || ''})`);
+  assert.deepEqual(savedPermissions.data.permissions, permissionA);
+  assert.equal((await getPool().query(
+    'SELECT permissions FROM role_permission_catalog WHERE department_id=$1 AND role_id=$2', [department.id, role.id]
+  )).rows[0]?.permissions instanceof Array, true, 'permissions persist in the normalized PostgreSQL table');
 
-  for (const [department, role, expected] of [[departmentOne, roleOne, permissionA], [departmentTwo, roleTwo, permissionB]]) {
-    const read = await request(`/api/state/rolePermissions/${department.id}/${role.id}`, { token: adminToken });
-    assert.equal(read.status, 200);
-    assert.deepEqual(read.data.permissions, expected, 'permission API GET returns the exact saved list');
-    const row = await getPool().query("SELECT data FROM erp_state WHERE storage_key='rolePermissions'");
-    const persisted = (row.rows[0]?.data || []).find((entry) => entry.departmentId === department.id && entry.roleId === role.id);
-    assert.deepEqual(persisted?.permissions, expected, 'exact permissions are present in PostgreSQL JSONB');
-  }
-
-  const employeeLoginA = await request('/api/auth/login', { method: 'POST', body: json({ email: employee.email, password: employee.password, portal: 'employee' }) });
-  assert.equal(employeeLoginA.status, 200, 'test employee login works');
-  const employeeTokenComputerTwo = employeeLoginA.data.token;
-  const employeeLoginComputerOne = await request('/api/auth/login', { method: 'POST', body: json({ email: employee.email, password: employee.password, portal: 'employee' }) });
-  assert.equal(employeeLoginComputerOne.status, 200, 'independent employee session works');
-  const employeeTokenComputerOne = employeeLoginComputerOne.data.token;
-
-  const allowedA = await request('/api/records/inventoryItems', { token: employeeTokenComputerTwo, headers: { 'x-erp-department': departmentOne.name } });
-  const deniedA = await request('/api/records/productionDispatchRequests', { token: employeeTokenComputerTwo, headers: { 'x-erp-department': departmentOne.name } });
-  assert.equal(allowedA.status, 200, 'Department A permission allows Inventory API');
-  assert.equal(deniedA.status, 403, 'Department A permission blocks Production API');
-  const allowedB = await request('/api/records/productionDispatchRequests', { token: employeeTokenComputerTwo, headers: { 'x-erp-department': departmentTwo.name } });
-  const deniedB = await request('/api/records/inventoryItems', { token: employeeTokenComputerTwo, headers: { 'x-erp-department': departmentTwo.name } });
-  assert.equal(allowedB.status, 200, 'Department B permission allows Production API');
-  assert.equal(deniedB.status, 403, 'Department A permission does not leak into Department B');
-
-  const unauthorizedWrite = await request(`/api/state/rolePermissions/${departmentOne.id}/${roleOne.id}`, { method: 'PUT', token: employeeTokenComputerTwo, body: json({ permissions: ['inventory.view'] }) });
+  const staleWrite = await request(permissionPath, {
+    method: 'PUT', token: adminToken,
+    body: json({ permissions: permissionB, version: 0, idempotencyToken: `permission-stale-${suffix}` })
+  });
+  assert.equal(staleWrite.status, 409, 'stale permission versions are rejected');
+  const employeeLoginA = await request('/api/auth/login', {
+    method: 'POST', body: json({ email: employee.email, password: employee.password, portal: 'employee' })
+  });
+  assert.equal(employeeLoginA.status, 200, `employee login still works (${employeeLoginA.data.error || ''})`);
+  const employeeToken = employeeLoginA.data.token;
+  const unauthorizedWrite = await request(permissionPath, {
+    method: 'PUT', token: employeeToken,
+    body: json({ permissions: permissionB, version: savedPermissions.data.version, idempotencyToken: `permission-employee-${suffix}` })
+  });
   assert.equal(unauthorizedWrite.status, 403, 'employee cannot invoke Admin-only permission mutation');
+  const legacyPermissionWrite = await request(`/api/state/rolePermissions/${department.id}/${role.id}`, {
+    method: 'PUT', token: adminToken,
+    body: json({ permissions: permissionB })
+  });
+  assert.equal(legacyPermissionWrite.status, 409, 'legacy scoped permission writes are disabled in favor of versioned catalog APIs');
+  assert.equal((await request('/api/organization-catalogs/departments', { token: employeeToken })).status, 403,
+    'catalog listing preserves Admin-only authorization');
 
-  const { hasPermission } = await import('../src/utils/permissions.js');
-  const storage = new Map();
-  globalThis.localStorage = { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
-  const setClientAuth = (activeDepartment, permissionSet) => localStorage.setItem('erp_auth', json({ isLoggedIn: true, roleKey: sharedRoleKey, role: roleOne.name, activeDepartment, department: activeDepartment, assignments: [
-    { department: departmentOne.name, role: roleOne.name, roleKey: sharedRoleKey, departmentId: departmentOne.id, roleId: roleOne.id, permissions: permissionSet[0] },
-    { department: departmentTwo.name, role: roleTwo.name, roleKey: sharedRoleKey, departmentId: departmentTwo.id, roleId: roleTwo.id, permissions: permissionSet[1] }
-  ] }));
-  setClientAuth(departmentOne.name, [permissionA, permissionB]);
-  assert.equal(hasPermission('inventory.view'), true, 'frontend exposes the allowed Department A module');
-  assert.equal(hasPermission('job_card.view'), false, 'frontend hides the unauthorized Department A module');
-  setClientAuth(departmentTwo.name, [permissionA, permissionB]);
-  assert.equal(hasPermission('job_card.view'), true, 'frontend exposes the allowed Department B module');
-  assert.equal(hasPermission('inventory.view'), false, 'frontend does not reuse Department A permissions in Department B');
+  const authMe = await request('/api/auth/me', { token: employeeToken, headers: { 'x-erp-department': department.name } });
+  const assignment = authMe.data.user.assignments.find((item) => item.departmentId === department.id);
+  assert.deepEqual(assignment.permissions, permissionA, 'authentication refresh resolves the saved PostgreSQL permissions');
+  assert.equal(assignment.roleId, role.id, 'employee role assignment identity remains stable');
+  assert.equal(assignment.departmentId, department.id, 'employee department assignment identity remains stable');
 
-  const updatedPermissions = ['sales.quotation'];
-  assert.equal((await request(`/api/state/rolePermissions/${departmentOne.id}/${roleOne.id}`, { method: 'PUT', token: adminToken, body: json({ permissions: updatedPermissions }) })).status, 200, 'Computer 1 equivalent updates role permissions');
-  const computerTwoMe = await request('/api/auth/me', { token: employeeTokenComputerTwo, headers: { 'x-erp-department': departmentOne.name } });
-  const assignmentA = computerTwoMe.data.user.assignments.find((item) => item.departmentId === departmentOne.id);
-  assert.deepEqual(assignmentA.permissions, updatedPermissions, 'independent Computer 2 session receives refreshed permission set');
-  setClientAuth(departmentOne.name, [updatedPermissions, permissionB]);
-  assert.equal(hasPermission('sales.quotation'), true, 'frontend adopts refreshed permissions during the active session');
-  assert.equal(hasPermission('inventory.view'), false, 'frontend drops stale permissions after session refresh');
-  assert.equal((await request('/api/records/inventoryItems', { token: employeeTokenComputerTwo, headers: { 'x-erp-department': departmentOne.name } })).status, 403, 'old module access is revoked on the active session');
-  assert.equal((await request('/api/records/inventoryItems', { token: employeeTokenComputerOne, headers: { 'x-erp-department': departmentOne.name } })).status, 403, 'second active session also observes latest permissions');
-  const relogin = await request('/api/auth/login', { method: 'POST', body: json({ email: employee.email, password: employee.password, portal: 'employee' }) });
-  assert.deepEqual(relogin.data.user.assignments.find((item) => item.departmentId === departmentOne.id).permissions, updatedPermissions, 'new login does not retain stale permissions');
+  const snapshot = await getPool().query(
+    "SELECT data FROM erp_state WHERE storage_key='roleCatalog'"
+  );
+  assert.equal((snapshot.rows[0]?.data || []).some((record) => record.id === role.id), false,
+    'dedicated catalog writes do not replace or append to the preserved legacy snapshot');
 
-  server.kill();
-  await new Promise((resolve) => server.once('exit', resolve));
-  server = startServer();
-  assert.ok(await waitForServer(), 'Express restarts without recreating PostgreSQL');
-  const adminAfterRestart = await request('/api/auth/login', { method: 'POST', body: json({ email: process.env.ERP_ADMIN_EMAIL, password: process.env.ERP_ADMIN_PASSWORD, portal: 'admin' }) });
-  assert.equal(adminAfterRestart.status, 200);
-  adminToken = adminAfterRestart.data.token;
-  assert.deepEqual((await request(`/api/state/rolePermissions/${departmentOne.id}/${roleOne.id}`, { token: adminToken })).data.permissions, updatedPermissions, 'permission API retains saved data after restart');
-  const postRestartState = await snapshot(['employees', 'departmentCatalog', 'roleCatalog', 'rolePermissions']);
-  assert.ok(postRestartState.departmentCatalog.some((item) => item.id === departmentOne.id));
-  assert.ok(postRestartState.roleCatalog.some((item) => item.id === roleOne.id));
-  assert.ok(postRestartState.employees.some((item) => item.employeeId === employee.employeeId && item.departmentAssignments.length === 2));
-  assert.ok(postRestartState.rolePermissions.some((item) => item.departmentId === departmentOne.id && item.roleId === roleOne.id));
+  const history = await request('/api/organization-catalogs/history?module=rolePermissions', { token: adminToken });
+  assert.equal(history.status, 200);
+  assert.ok(history.data.entries.some((entry) => entry.record_id === `${department.id}:${role.id}` && entry.action === 'UPDATE'),
+    'permission changes are audit logged');
+  assert.equal((await getPool().query(
+    'SELECT count(*)::int AS count FROM erp_audit_log WHERE module=$1 AND record_id=$2',
+    ['rolePermissions', `${department.id}:${role.id}`]
+  )).rows[0].count > 0, true);
 
-  console.log('Integration checks passed: PostgreSQL persistence, department-scoped API authorization, frontend permission lookup, active-session refresh, relogin, and Express restart persistence. Two independent sessions simulated two computers; separate physical LAN computers were not available.');
+  console.log('Department-scoped permission integration passed: authenticated catalog APIs, Admin authorization, generic-sync rejection, version conflicts, PostgreSQL persistence, assignment identity preservation, permission refresh and audit history.');
 } catch (error) {
-  errors.push(error);
+  failures.push(error);
 } finally {
   try {
-    if (!server || server.exitCode !== null) {
-      server = startServer();
-      if (!(await waitForServer())) throw new Error('Could not start cleanup server.');
+    if (server) { server.kill(); await new Promise((resolve) => server.once('exit', resolve)).catch(() => {}); }
+    if (employeeCreated) {
+      await getPool().query('DELETE FROM erp_sessions WHERE lower(email)=lower($1)', [employee.email]);
+      await getPool().query('DELETE FROM employees WHERE id=$1', [employee.id]);
     }
-    if (!adminToken) {
-      const adminLogin = await request('/api/auth/login', { method: 'POST', body: json({ email: process.env.ERP_ADMIN_EMAIL, password: process.env.ERP_ADMIN_PASSWORD, portal: 'admin' }) });
-      if (adminLogin.status === 200) adminToken = adminLogin.data.token;
-    }
-    if (adminToken) {
-      if (employeeCreated) {
-        const removed = await request(`/api/state/employees/${encodeURIComponent(employee.employeeId)}`, { method: 'DELETE', token: adminToken });
-        if (![200, 404].includes(removed.status)) throw new Error(`Temporary employee cleanup failed: ${removed.status} ${removed.data.error || ''}`);
-      }
-      for (const id of createdRoleIds) {
-        const removed = await request(`/api/state/roleCatalog/${encodeURIComponent(id)}`, { method: 'DELETE', token: adminToken });
-        if (![200, 404].includes(removed.status)) throw new Error(`Temporary role cleanup failed: ${removed.status} ${removed.data.error || ''}`);
-      }
-      for (const id of createdDepartmentIds) {
-        const removed = await request(`/api/state/departmentCatalog/${encodeURIComponent(id)}`, { method: 'DELETE', token: adminToken });
-        if (![200, 404].includes(removed.status)) throw new Error(`Temporary department cleanup failed: ${removed.status} ${removed.data.error || ''}`);
-      }
-      if (baseline) {
-        const after = await snapshot(['employees', 'departmentCatalog', 'roleCatalog', 'rolePermissions']);
-        for (const key of ['employees', 'departmentCatalog', 'roleCatalog']) assert.deepEqual(after[key] || [], baseline[key] || [], `cleanup restores original ${key} contents`);
-        const baselinePermissions = baseline.rolePermissions || [];
-        const afterPermissions = after.rolePermissions || [];
-        assert.deepEqual(afterPermissions, baselinePermissions, 'cleanup restores the original permission catalog contents');
-        const count = Number((await getPool().query("SELECT count(*) AS count FROM erp_audit_log WHERE record_id LIKE $1", [`%${suffix}%`])).rows[0].count);
-        assert.ok(count > testAuditCountBefore, 'test audit rows remain after cleanup; cleanup never deletes audit history');
-      }
-    }
+    await getPool().query('DELETE FROM role_permission_catalog WHERE department_id=$1 AND role_id=$2', [department.id, role.id]);
+    await getPool().query('DELETE FROM role_catalog WHERE id=$1', [role.id]);
+    await getPool().query('DELETE FROM department_catalog WHERE id=$1', [department.id]);
+    if (tokens.length) await getPool().query('DELETE FROM master_idempotency WHERE token=ANY($1::text[])', [tokens]);
   } catch (cleanupError) {
-    errors.push(cleanupError);
+    failures.push(cleanupError);
   }
-  if (server) { server.kill(); await new Promise((resolve) => server.once('exit', resolve)).catch(() => {}); }
   await closeDatabase().catch(() => {});
 }
 
-if (errors.length) {
-  for (const error of errors) console.error(error);
+if (failures.length) {
+  for (const error of failures) console.error(error);
   process.exitCode = 1;
 }

@@ -1,5 +1,4 @@
 import { getCurrentUser, isAdmin } from './auth.js';
-import { stableDepartmentId, stableRoleId, permissionAssignmentKey } from '../../shared/roleIdentity.js';
 
 export { isAdmin };
 
@@ -151,32 +150,15 @@ export const getCurrentUserInfo = () => {
     };
     return { auth, roleKey, employee };
   }
-  const email = (auth.email || '').toLowerCase();
-  let employee = null;
-
-  try {
-    const list = JSON.parse(localStorage.getItem('employees') || '[]');
-    if (Array.isArray(list)) {
-      employee =
-        list.find(
-          (e) => e.active !== false && e.email && e.email.toLowerCase() === email
-        ) || null;
-    }
-  } catch {
-    employee = null;
-  }
-
-  if (!employee) {
-    employee = {
-      employeeId: auth.employeeId || '-',
-      name: auth.username || auth.email || 'User',
-      department: isAdmin() ? 'Admin' : normalizeDepartment(auth.department || ''),
-      designation: '',
-      roleKey: isAdmin() ? 'administrator' : normalizeRoleKey(auth.roleKey || ''),
-      role: ''
-    };
-    if (!employee.department) employee.department = isAdmin() ? 'Admin' : 'Production Department';
-  }
+  const employee = {
+    employeeId: auth.employeeId || '-',
+    name: auth.username || auth.email || 'User',
+    department: isAdmin() ? 'Admin' : normalizeDepartment(auth.department || ''),
+    designation: auth.designation || '',
+    roleKey: isAdmin() ? 'administrator' : normalizeRoleKey(auth.roleKey || ''),
+    role: auth.role || ''
+  };
+  if (!employee.department) employee.department = isAdmin() ? 'Admin' : 'Production Department';
 
   const dept = normalizeDepartment(employee.department);
   const roleKey = normalizeRoleKey(employee.roleKey || auth.roleKey || '') || DEFAULT_EMPLOYEE_ROLE_BY_DEPT[dept];
@@ -409,16 +391,6 @@ export const getPermissionSet = () => {
   const selectedDepartment = normalizeDepartment(info.employee?.department || info.auth.activeDepartment || info.auth.department);
   const assignment = (Array.isArray(info.auth.assignments) ? info.auth.assignments : []).find((item) => normalizeDepartment(item.department) === selectedDepartment);
   if (Array.isArray(assignment?.permissions)) return assignment.permissions;
-  try {
-    const departmentCatalog = JSON.parse(localStorage.getItem('departmentCatalog') || '[]');
-    const roleCatalog = JSON.parse(localStorage.getItem('roleCatalog') || '[]');
-    const permissionCatalog = JSON.parse(localStorage.getItem('rolePermissions') || '[]');
-    const departmentId = assignment?.departmentId || stableDepartmentId(selectedDepartment, departmentCatalog);
-    const roleId = assignment?.roleId || stableRoleId(selectedDepartment, info.roleKey, roleCatalog, departmentCatalog);
-    const key = permissionAssignmentKey(departmentId, roleId);
-    const saved = (Array.isArray(permissionCatalog) ? permissionCatalog : []).find((entry) => permissionAssignmentKey(entry.departmentId, entry.roleId) === key);
-    if (Array.isArray(saved?.permissions)) return saved.permissions;
-  } catch { /* Keep the built-in permission defaults if the local cache is unavailable. */ }
   return ROLE_PERMISSIONS[info.roleKey] || ROLE_PERMISSIONS[DEFAULT_EMPLOYEE_ROLE_BY_DEPT[info.employee?.department]] || [];
 };
 

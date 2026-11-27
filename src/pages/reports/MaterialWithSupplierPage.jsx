@@ -1,6 +1,8 @@
 import React, { useMemo } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getHTOutsourceRequests } from '../../utils/storeService.js';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { listHtOutsource } from '../../services/productionApi.js';
 
 /**
  * Material with Supplier Report (Phase 2).
@@ -19,9 +21,12 @@ const vendorSummaryRows = (rows) => Object.values(rows.reduce((map, row) => {
   map[key].issued += row.issuedQty; map[key].received += row.receivedQty; map[key].atVendor += row.atVendor; return map;
 }, {})).filter((row) => row.atVendor > 0).sort((a, b) => b.atVendor - a.atVendor);
 
+const loadHtOutsource = () => listHtOutsource();
+
 const MaterialWithSupplierPage = () => {
+  const { data: outsourceRecords, loading, error } = useAuthoritativeData(loadHtOutsource);
   const { rows, vendors } = useMemo(() => {
-    const list = getHTOutsourceRequests().map((r) => ({
+    const list = outsourceRecords.map((r) => ({
       reference: r.htrNumber || '',
       outwardChallan: r.outwardChallan || '',
       inwardChallan: r.inwardChallan || '',
@@ -39,7 +44,8 @@ const MaterialWithSupplierPage = () => {
     }));
     const ven = [...new Set(list.map((r) => r.vendorName))].sort();
     return { rows: list, vendors: ven };
-  }, []);
+  }, [outsourceRecords]);
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>

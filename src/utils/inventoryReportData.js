@@ -1,10 +1,18 @@
-import { getExpiryStatus, getInventoryBatches, getInventoryItems, getStockTransactions } from './storeService.js';
-
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const dateOf = (tx) => String(tx.date || tx.dateTime || '').slice(0, 10);
 const labelOf = (batch) => batch.internalBatchId || batch.supplierBatchNumber || batch.batchNumber || batch.lotNumber || 'Unidentified legacy batch';
 
-const itemLookup = () => new Map(getInventoryItems().map((item) => [String(item.itemCode || '').toLowerCase(), item]));
+const expiryStatus = (expiryDate, nearDays = 30) => {
+  if (!expiryDate) return { status: 'UNKNOWN', daysLeft: null };
+  const expiry = new Date(`${String(expiryDate).slice(0, 10)}T23:59:59`);
+  if (Number.isNaN(expiry.getTime())) return { status: 'UNKNOWN', daysLeft: null };
+  const daysLeft = Math.ceil((expiry.getTime() - Date.now()) / 86400000);
+  if (daysLeft < 0) return { status: 'EXPIRED', daysLeft };
+  if (daysLeft <= nearDays) return { status: 'NEAR', daysLeft };
+  return { status: 'VALID', daysLeft };
+};
+
+const itemLookup = (items) => new Map(items.map((item) => [String(item.itemCode || '').toLowerCase(), item]));
 
 const attachTransactions = (batches, transactions) => {
   const result = new Map(batches.map((batch) => [batch.id, []]));
@@ -30,13 +38,11 @@ const attachTransactions = (batches, transactions) => {
   return { result, uncertain };
 };
 
-const batchRows = () => {
-  const items = itemLookup();
-  const batches = getInventoryBatches();
-  const transactions = getStockTransactions();
+const batchRows = ({ items = [], batches = [], transactions = [] } = {}) => {
+  const itemIndex = itemLookup(items);
   const { result: txByBatch } = attachTransactions(batches, transactions);
   return batches.map((batch) => {
-    const item = items.get(String(batch.itemCode || '').toLowerCase()) || {};
+    const item = itemIndex.get(String(batch.itemCode || '').toLowerCase()) || {};
     const tx = txByBatch.get(batch.id) || [];
     const issued = tx.filter((entry) => entry.type === 'OUT' && !String(entry.reason || '').toLowerCase().includes('stock transfer'))
       .reduce((sum, entry) => sum + number(entry.quantity), 0);
@@ -50,7 +56,7 @@ const batchRows = () => {
       dimensions[key] ??= batch[key] ?? item[key] ?? '';
     }
     if (batch.sizeDimensions || item.sizeDimensions) dimensions.size ||= batch.sizeDimensions || item.sizeDimensions;
-    const expiry = getExpiryStatus(batch.expiryDate);
+    const expiry = expiryStatus(batch.expiryDate);
     return {
       id: batch.id,
       material: batch.itemName || item.itemName || batch.itemCode || '-',
@@ -82,31 +88,29 @@ const batchRows = () => {
   });
 };
 
-export const getLotWiseStockRows = () => batchRows().map((batch) => ({
+export const getLotWiseStockRows = (data) => batchRows(data).map((batch) => ({
   ...batch,
   openingQty: 0,
   adjustments: batch.adjustmentQty,
   closingQty: batch.physicalQty
 }));
 
-export const getExpiredLotRows = (today = new Date().toISOString().slice(0, 10)) =>
-  batchRows().filter((batch) => batch.expiryDate && batch.expiryDate < today && batch.expiryStatus === 'EXPIRED')
+export const getExpiredLotRows = (data, today = new Date().toISOString().slice(0, 10)) =>
+  batchRows(data).filter((batch) => batch.expiryDate && batch.expiryDate < today && batch.expiryStatus === 'EXPIRED')
     .map((batch) => ({ ...batch, date: batch.expiryDate, status: batch.status || 'Expired' }));
 
-export const getLotAvailabilityRows = () => batchRows().map((batch) => ({
+export const getLotAvailabilityRows = (data) => batchRows(data).map((batch) => ({
   ...batch,
   reservedDisplay: batch.reservedQty === null ? 'Not allocated by lot' : batch.reservedQty,
   usableDisplay: batch.reservedQty === null ? 'Not available by lot' : batch.usableQty
 }));
 
-export const getLotDimensionRows = () => batchRows().filter((batch) =>
+export const getLotDimensionRows = (data) => batchRows(data).filter((batch) =>
   Object.values(batch.dimensions).some((value) => value !== '' && value !== null && value !== undefined)
 );
 
-export const getLocationLotLedgerRows = () => {
-  const batches = getInventoryBatches();
-  const items = itemLookup();
-  const transactions = getStockTransactions();
+export const getLocationLotLedgerRows = ({ items = [], batches = [], transactions = [] } = {}) => {
+  const itemIndex = itemLookup(items);
   const { result: txByBatch, uncertain } = attachTransactions(batches, transactions);
   const rows = [];
   batches.forEach((batch) => {
@@ -129,7 +133,7 @@ export const getLocationLotLedgerRows = () => {
         transferInQty: transfer && tx.type === 'IN' ? qty : 0,
         transferOutQty: transfer && tx.type === 'OUT' ? qty : 0,
         adjustmentQty: adjustment ? (tx.type === 'IN' ? qty : -qty) : 0,
-        openingQty, closingQty: Math.max(0, balance), unit: tx.unit || batch.unit || items.get(String(batch.itemCode || '').toLowerCase())?.unit || ''
+        openingQty, closingQty: Math.max(0, balance), unit: tx.unit || batch.unit || itemIndex.get(String(batch.itemCode || '').toLowerCase())?.unit || ''
       });
     });
   });

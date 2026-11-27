@@ -14,18 +14,35 @@ const VendorQuotationPreview = ({ vendorQuotation = {} }) => {
   const activeCompany = brandCompany;
 
   const vqNumber = vendorQuotation.quotationNumber || '-';
-  const vqDate = vendorQuotation.createdAt?.slice(0, 10) || '-';
+  const vqDate = vendorQuotation.quotationDate || vendorQuotation.createdAt?.slice(0, 10) || '-';
   const vendorName = vendorQuotation.vendorName || '-';
   const vendorContact = vendorQuotation.vendorContact || '-';
   const vendorEmail = vendorQuotation.vendorEmail || '-';
   const enquiryNumber = vendorQuotation.enquiryNumber || '-';
-  const deliveryDays = vendorQuotation.deliveryDays || '-';
+  const indentNumber = vendorQuotation.indentNumber || '-';
+  const soNumber = vendorQuotation.soNumber || '-';
+  const deliveryDays = vendorQuotation.deliveryDays ?? '-';
+  const deliveryDate = vendorQuotation.deliveryDate || '-';
   const paymentTerms = vendorQuotation.paymentTerms || '-';
   const validity = vendorQuotation.validity || '-';
+  const otherTerms = vendorQuotation.otherTerms || '';
   const remarks = vendorQuotation.remarks || '-';
-  const totalAmount = vendorQuotation.totalAmount || 0;
-
   const items = (vendorQuotation.items || []).filter((it) => it.materialName || it.unitPrice);
+  const lineAmounts = items.map((item) => {
+    const quantity = Number(item.quotedQty ?? item.requiredQty) || 0;
+    const gross = quantity * (Number(item.unitPrice) || 0);
+    const discount = Number(item.discount) || 0;
+    const discountAmount = Number(item.discountAmount ?? (gross * discount / 100)) || 0;
+    const net = Number(item.totalPrice ?? (gross - discountAmount)) || 0;
+    const taxPct = Number(item.taxPct ?? item.tax) || 0;
+    const tax = Number(item.taxAmount ?? (net * taxPct / 100)) || 0;
+    return { gross, discountAmount, net, tax, taxPct };
+  });
+  const subtotal = Number(vendorQuotation.subtotal ?? lineAmounts.reduce((sum, line) => sum + line.gross, 0));
+  const discountAmount = Number(vendorQuotation.discountAmount ?? lineAmounts.reduce((sum, line) => sum + line.discountAmount, 0));
+  const taxableAmount = Number(vendorQuotation.totalAmount ?? (subtotal - discountAmount));
+  const taxAmount = Number(vendorQuotation.taxAmount ?? lineAmounts.reduce((sum, line) => sum + line.tax, 0));
+  const grandTotal = Number(vendorQuotation.totalWithTax ?? (taxableAmount + taxAmount));
 
   return (
     <div className="doc-page-container">
@@ -71,7 +88,10 @@ const VendorQuotationPreview = ({ vendorQuotation = {} }) => {
               <div>VQ No.: <strong>{vqNumber}</strong></div>
               <div>Date: {vqDate}</div>
               <div>Enquiry Ref: {enquiryNumber}</div>
+              <div>Purchase Indent: {indentNumber}</div>
+              <div>Sales Order: {soNumber}</div>
               <div>Delivery: {deliveryDays} days</div>
+              <div>Delivery Date: {deliveryDate}</div>
               <div>Payment Terms: {paymentTerms}</div>
               <div>Validity: {validity}</div>
             </div>
@@ -88,7 +108,10 @@ const VendorQuotationPreview = ({ vendorQuotation = {} }) => {
               <th className="text-right">Required Qty</th>
               <th className="text-right">Quoted Qty</th>
               <th className="text-right">Unit Price (₹)</th>
-              <th className="text-right">Total (₹)</th>
+              <th className="text-right">Discount %</th>
+              <th className="text-right">Tax %</th>
+              <th className="text-right">Tax (₹)</th>
+              <th className="text-right">Net (₹)</th>
             </tr>
           </thead>
           <tbody>
@@ -108,24 +131,19 @@ const VendorQuotationPreview = ({ vendorQuotation = {} }) => {
                   <td className="text-right">{item.requiredQty || '-'}</td>
                   <td className="text-right">{item.quotedQty || item.requiredQty || '-'}</td>
                   <td className="text-right">{money(item.unitPrice)}</td>
-                  <td className="text-right">{money(item.totalPrice)}</td>
+                  <td className="text-right">{Number(item.discount) || 0}%</td>
+                  <td className="text-right">{lineAmounts[index].taxPct}%</td>
+                  <td className="text-right">{money(lineAmounts[index].tax)}</td>
+                  <td className="text-right">{money(lineAmounts[index].net)}</td>
                 </tr>
               ))
             ) : (
               <tr>
-                <td colSpan={7} className="text-center" style={{ padding: '16px' }}>
+                <td colSpan={10} className="text-center" style={{ padding: '16px' }}>
                   No items.
                 </td>
               </tr>
             )}
-
-            {/* Total Row */}
-            <tr className="doc-total-row">
-              <td colSpan={6} className="text-left font-bold" style={{ paddingLeft: '16px' }}>
-                Grand Total
-              </td>
-              <td className="text-right font-bold">{money(totalAmount)}</td>
-            </tr>
           </tbody>
         </table>
 
@@ -159,17 +177,25 @@ const VendorQuotationPreview = ({ vendorQuotation = {} }) => {
                 <td style={{ padding: '5px 10px', fontWeight: '500', borderRight: '1px solid #cbd5e1' }}>Delivery Days</td>
                 <td style={{ padding: '5px 10px', textAlign: 'right' }}>{deliveryDays}</td>
               </tr>
-              <tr style={{ borderBottom: '1px solid #cbd5e1', background: '#f8fafc' }}>
-                <td style={{ padding: '5px 10px', fontWeight: '500', borderRight: '1px solid #cbd5e1' }}>Payment Terms</td>
-                <td style={{ padding: '5px 10px', textAlign: 'right' }}>{paymentTerms || '-'}</td>
+              <tr style={{ borderBottom: '1px solid #cbd5e1' }}>
+                <td style={{ padding: '5px 10px', fontWeight: '500', borderRight: '1px solid #cbd5e1' }}>Subtotal</td>
+                <td style={{ padding: '5px 10px', textAlign: 'right' }}>{money(subtotal)}</td>
               </tr>
               <tr style={{ borderBottom: '1px solid #cbd5e1' }}>
-                <td style={{ padding: '5px 10px', fontWeight: '500', borderRight: '1px solid #cbd5e1' }}>Validity</td>
-                <td style={{ padding: '5px 10px', textAlign: 'right' }}>{validity || '-'}</td>
+                <td style={{ padding: '5px 10px', fontWeight: '500', borderRight: '1px solid #cbd5e1' }}>Discount</td>
+                <td style={{ padding: '5px 10px', textAlign: 'right' }}>-{money(discountAmount)}</td>
+              </tr>
+              <tr style={{ borderBottom: '1px solid #cbd5e1' }}>
+                <td style={{ padding: '5px 10px', fontWeight: '500', borderRight: '1px solid #cbd5e1' }}>Taxable Amount</td>
+                <td style={{ padding: '5px 10px', textAlign: 'right' }}>{money(taxableAmount)}</td>
+              </tr>
+              <tr style={{ borderBottom: '1px solid #cbd5e1' }}>
+                <td style={{ padding: '5px 10px', fontWeight: '500', borderRight: '1px solid #cbd5e1' }}>Tax</td>
+                <td style={{ padding: '5px 10px', textAlign: 'right' }}>{money(taxAmount)}</td>
               </tr>
               <tr style={{ background: '#e2e8f0', fontWeight: 'bold' }}>
                 <td style={{ padding: '6px 10px', borderRight: '1.5px solid #0f172a', fontSize: '12.5px', color: '#0f172a' }}>TOTAL</td>
-                <td style={{ padding: '6px 10px', textAlign: 'right', fontSize: '13px', color: '#0f172a' }}>{money(totalAmount)}</td>
+                <td style={{ padding: '6px 10px', textAlign: 'right', fontSize: '13px', color: '#0f172a' }}>{money(grandTotal)}</td>
               </tr>
             </tbody>
           </table>
@@ -180,11 +206,9 @@ const VendorQuotationPreview = ({ vendorQuotation = {} }) => {
           <div className="doc-terms-box">
             <div className="doc-box-title">Terms &amp; Conditions</div>
             <div className="doc-terms-list">
-              <div className="doc-term-item">This is a vendor quotation received for material procurement.</div>
-              <div className="doc-term-item">Prices are exclusive of applicable taxes unless mentioned otherwise.</div>
-              <div className="doc-term-item">Delivery timeline starts from the date of purchase order.</div>
-              <div className="doc-term-item">Payment terms as mentioned above.</div>
-              <div className="doc-term-item">Quotation valid until: {validity || 'Not specified'}</div>
+              <div className="doc-term-item">Payment terms: {paymentTerms}</div>
+              <div className="doc-term-item">Quotation validity: {validity}</div>
+              {otherTerms && <div className="doc-term-item" style={{ whiteSpace: 'pre-wrap' }}>{otherTerms}</div>}
             </div>
           </div>
 

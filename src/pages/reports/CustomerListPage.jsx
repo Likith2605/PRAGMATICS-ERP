@@ -1,7 +1,8 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getMasterCustomerList } from '../../utils/customerMaster.js';
-import { readLocalStorageList } from '../../utils/reportData.js';
+import { listMasters } from '../../services/masterApi.js';
+import { listSalesOrders } from '../../services/salesOrderApi.js';
+import { listCustomerInvoices } from '../../services/customerInvoiceApi.js';
 import { invTotalINR } from '../../utils/invoiceValues.js';
 
 /**
@@ -9,7 +10,7 @@ import { invTotalINR } from '../../utils/invoiceValues.js';
  *
  * Safeguard rules (approved with this phase):
  *  - Customer masters come from the central customerDirectory record;
- *    transaction-derived customers (salesOrderHistory / customerInvoiceHistory)
+ *    transaction-derived customers (PostgreSQL sales orders / customer invoices)
  *    are listed separately; source remains available as a filter.
  *  - Customers are linked across sources ONLY on exact normalized-name equality
  *    (trimmed, whitespace-collapsed, case-insensitive). Names that merely look
@@ -21,11 +22,47 @@ import { invTotalINR } from '../../utils/invoiceValues.js';
 // Exact-match normalization only. No partial/substring logic.
 const norm = (s) => String(s || '').trim().replace(/\s+/g, ' ').toUpperCase();
 
-const readHistory = (key) => readLocalStorageList(key);
-
 const CustomerListPage = () => {
+  const [salesOrders, setSalesOrders] = useState([]);
+  const [customerInvoices, setCustomerInvoices] = useState([]);
+  const [masterCustomers, setMasterCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    Promise.all([
+      listSalesOrders().catch((err) => {
+        console.warn('Failed to load sales orders for customer list:', err);
+        throw err;
+      }),
+      listCustomerInvoices().catch((err) => {
+        console.warn('Failed to load customer invoices for customer list:', err);
+        throw err;
+      }),
+      listMasters('customers').catch((err) => {
+        console.warn('Failed to load customer masters from PostgreSQL:', err);
+        throw err;
+      })
+    ]).then(([soList, invList, customerList]) => {
+      if (!active) return;
+      setSalesOrders(Array.isArray(soList) ? soList : []);
+      setCustomerInvoices(Array.isArray(invList) ? invList : []);
+      setMasterCustomers(Array.isArray(customerList) ? customerList : []);
+      setError('');
+    }).catch((err) => {
+      if (active) setError(err.message || 'Unable to load customer data from PostgreSQL.');
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const rows = useMemo(() => {
-    const master = getMasterCustomerList();
+    const master = masterCustomers;
 
     // Transaction-derived customers, grouped by EXACT normalized company name.
     const txMap = {};
@@ -39,8 +76,8 @@ const CustomerListPage = () => {
         txMap[k].invoiced += invTotalINR(invoice);
       }
     };
-    readHistory('salesOrderHistory').forEach((so) => addTx(so.company || so.customerName || so.customer || so.payload?.customerDetails?.companyName || so.payload?.customerDetails?.customerName, { order: true }));
-    readHistory('customerInvoiceHistory').forEach((inv) => addTx(inv.company || inv.customerName || inv.customer || inv.payload?.customerDetails?.companyName || inv.payload?.customerDetails?.customerName, { invoice: inv }));
+    salesOrders.forEach((so) => addTx(so.company || so.customerName || so.customer || so.payload?.customerDetails?.companyName || so.payload?.customerDetails?.customerName, { order: true }));
+    customerInvoices.forEach((inv) => addTx(inv.company || inv.customerName || inv.customer || inv.payload?.customerDetails?.companyName || inv.payload?.customerDetails?.customerName, { invoice: inv }));
 
     const out = [];
     const matchedTxKeys = new Set();
@@ -85,7 +122,7 @@ const CustomerListPage = () => {
       });
 
     return out;
-  }, []);
+  }, [salesOrders, customerInvoices, masterCustomers]);
 
   const inr = (n) => Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
   const masterCount = rows.filter((r) => r.source !== 'Transactions').length;
@@ -93,10 +130,11 @@ const CustomerListPage = () => {
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
+      {error && <div role="alert" className="form-error">{error}</div>}
 
       <ReportRegister
         title="List of Customers"
-        subTitle={`${rows.length} customer record(s) · ${masterCount} in master directory`}
+        subTitle={loading ? 'Loading customer orders and invoices from PostgreSQL...' : `${rows.length} customer record(s) · ${masterCount} in master directory`}
         filename={`Customer-List-${new Date().toISOString().slice(0, 10)}`}
         dateFilters={false}
         landscape

@@ -1,0 +1,11 @@
+import { authHeaders } from '../utils/auth.js';
+const base=()=>typeof window!=='undefined'&&window.location?(window.location.port==='5173'?`http://${window.location.hostname||'localhost'}:3001/api`:'/api'):String(import.meta.env?.VITE_API_BASE_URL||'http://localhost:3001/api');
+const request=async(path,options={})=>{const r=await fetch(`${base()}${path}`,{...options,headers:{'Content-Type':'application/json',...authHeaders(),...(options.headers||{})}});const body=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(body.error||`Export Invoice request failed (${r.status})`);e.status=r.status;e.current=body.current;throw e;}return body;};
+export const listExportInvoicesApi=async()=>(await request('/export-invoices')).records||[];
+export const getExportInvoiceApi=async(number)=>(await request(`/export-invoices/${encodeURIComponent(number)}`)).record;
+export const reserveExportInvoiceNumber=async(date)=>(await request('/export-invoices/next-number',{method:'POST',body:JSON.stringify({date})})).invoiceNumber;
+export const createExportInvoiceApi=(data,createToken)=>request('/export-invoices',{method:'POST',body:JSON.stringify({data,createToken})});
+export const updateExportInvoiceApi=(number,data,version)=>request(`/export-invoices/${encodeURIComponent(number)}`,{method:'PUT',body:JSON.stringify({data,version})});
+export const cancelExportInvoiceApi=(number,version,reason)=>request(`/export-invoices/${encodeURIComponent(number)}/cancel`,{method:'POST',body:JSON.stringify({version,reason})});
+export const getExportInvoiceMigrationPreview=()=>request('/export-invoices/migration-preview');
+export const importMissingExportInvoices=(records)=>request('/export-invoices/migration-preview/import-missing',{method:'POST',body:JSON.stringify({records})});

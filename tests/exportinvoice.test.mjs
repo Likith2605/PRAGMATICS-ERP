@@ -130,15 +130,16 @@ const updated = E.updateExportInvoice('GST/26-27/001', {
 check(updated.payload.totals.amountUSD === 200, 'update recomputes the total (200)', `got ${updated.payload.totals.amountUSD}`);
 check(updated.status === 'Issued', 'update stores the status');
 
-const remaining = E.deleteExportInvoice('GST/26-27/001');
-check(remaining.length === 0, 'delete removes the invoice');
-check(E.getExportInvoice('GST/26-27/001') === null, 'the deleted invoice is gone');
+let deleteMessage = '';
+try { E.deleteExportInvoice('GST/26-27/001'); } catch (error) { deleteMessage = error.message; }
+check(deleteMessage.includes('cancelled through the controlled workflow'), 'permanent deletion is rejected; invoices must use controlled cancellation');
+check(E.getExportInvoice('GST/26-27/001') !== null, 'the invoice remains available after rejected permanent deletion');
 
 console.log('\n== export profile');
 const prof = E.saveExportProfile({ iecNumber: 'TEST-IEC-1' });
 check(prof.iecNumber === 'TEST-IEC-1', 'profile saves');
 check(E.getExportProfile().iecNumber === 'TEST-IEC-1', 'profile reads back');
-check(E.getExportProfile().lutNumber.length > 0, 'profile keeps the LUT default');
+check(E.getExportProfile().lutNumber === E.DEFAULT_EXPORT_PROFILE.lutNumber, 'profile preserves the configured default LUT value');
 
 console.log('\n== static text');
 check(E.lutDeclarationText('LUT-1').includes('Rule 96A'), 'the Rule 96A declaration mentions Rule 96A');

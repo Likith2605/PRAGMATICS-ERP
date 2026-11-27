@@ -1,13 +1,3 @@
-import {
-  getGRNs, getInventoryItems, getJobCards, getMaterialRequests,
-  getMaterialReturns, getPurchaseRequests, getStockTransactions, getStoreIssues
-} from './storeService.js';
-import {
-  getArrivals, getPOProgress, getPurchaseOrders, getQualityChecks, getReceipts,
-  getSalesOrders
-} from './workflowService.js';
-import { readLocalStorageList } from './reportData.js';
-
 const list = (value) => Array.isArray(value) ? value : [];
 const num = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const clean = (value) => String(value || '').trim();
@@ -25,8 +15,14 @@ const groupQty = (rows, field) => {
 };
 const unique = (rows, key) => [...new Set(rows.map((row) => clean(row[key])).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 
-export const getSupplierDirectoryRows = () => {
-  const masterRows = readLocalStorageList('vendorMaster').map((vendor) => ({
+export const getSupplierDirectoryRows = ({
+  vendors = [],
+  receipts = [],
+  purchaseOrders = [],
+  supplierInvoices = [],
+  htOutsource = []
+} = {}) => {
+  const masterRows = list(vendors).map((vendor) => ({
     supplierCode: vendor.seq ? `V-${vendor.seq}` : '', supplierName: vendor.name || '', category: vendor.product || '',
     contact: vendor.contactPerson || '', phone: vendor.phone || vendor.contactNumber || '', email: vendor.email || '',
     address: String(vendor.address || '').replace(/\s+/g, ' ').trim(), gstin: vendor.gstin || vendor.gstNumber || '',
@@ -35,10 +31,10 @@ export const getSupplierDirectoryRows = () => {
     completeness: [vendor.name, vendor.phone || vendor.contactNumber, vendor.email, vendor.gstin || vendor.gstNumber].filter(Boolean).length
   }));
   const transactionSources = [
-    ['Supplier POs', readLocalStorageList('supplierPOHistory'), (row) => row.vendor || row.payload?.vendorDetails?.companyName || row.payload?.vendorDetails?.vendorName],
-    ['Material Receipts', getReceipts(), (row) => row.supplier || row.vendor],
-    ['Supplier Invoices', readLocalStorageList('supplierInvoiceHistory'), (row) => row.vendor || row.payload?.vendorDetails?.companyName || row.payload?.vendorDetails?.vendorName],
-    ['HTR Outsourcing', readLocalStorageList('htOutsourceRequests'), (row) => row.vendorName]
+    ['Supplier POs', list(purchaseOrders), (row) => row.vendor || row.payload?.vendorDetails?.companyName || row.payload?.vendorDetails?.vendorName],
+    ['Material Receipts', list(receipts), (row) => row.supplier || row.vendor],
+    ['Supplier Invoices', list(supplierInvoices), (row) => row.vendor || row.payload?.vendorDetails?.companyName || row.payload?.vendorDetails?.vendorName],
+    ['HTR Outsourcing', list(htOutsource), (row) => row.vendorName]
   ];
   const transactionRows = transactionSources.flatMap(([source, entries, supplierOf]) => {
     const grouped = new Map();
@@ -58,10 +54,10 @@ export const getSupplierDirectoryRows = () => {
   return [...masterRows, ...transactionRows];
 };
 
-export const getAvailableIssuedStockRows = () => {
+export const getAvailableIssuedStockRows = ({ inventoryItems = [], stockLedger = [] } = {}) => {
   const byItem = new Map();
   const unmatchedByUnit = new Map();
-  getStockTransactions().forEach((tx) => {
+  list(stockLedger).forEach((tx) => {
     const code = clean(tx.itemCode);
     const unit = clean(tx.unit) || 'Unit not recorded';
     if (!code || code === '-') {
@@ -93,7 +89,7 @@ export const getAvailableIssuedStockRows = () => {
   });
   const txRows = [...byItem.values()];
   const txLookup = new Map(txRows.map((row) => [`${norm(row.itemCode)}::${norm(row.unit)}`, row]));
-  const rows = getInventoryItems().map((item) => {
+  const rows = list(inventoryItems).map((item) => {
     const itemCode = clean(item.itemCode) || clean(item.id) || 'Uncoded item';
     const unit = clean(item.unit) || 'Unit not recorded';
     const tx = txLookup.get(`${norm(itemCode)}::${norm(unit)}`) || {};
@@ -120,10 +116,10 @@ export const getAvailableIssuedStockRows = () => {
   return rows;
 };
 
-export const getInwardRows = () => {
-  const qcs = getQualityChecks();
+export const getInwardRows = ({ arrivals = [], receipts = [], qualityChecks = [], grns = [] } = {}) => {
+  const qcs = list(qualityChecks);
   const rows = [];
-  getArrivals().forEach((arrival) => {
+  list(arrivals).forEach((arrival) => {
     const qc = qcs.find((entry) => String(entry.arrivalNumber || '') === String(arrival.arrivalNumber || ''));
     docItems(arrival).forEach((line) => {
       const qcLines = list(qc?.items).filter((candidate) =>
@@ -140,7 +136,7 @@ export const getInwardRows = () => {
     });
     });
   });
-  getReceipts().forEach((receipt) => {
+  list(receipts).forEach((receipt) => {
     const qc = qcs.find((entry) => String(entry.receiptNumber || '') === String(receipt.receiptNumber || ''));
     docItems(receipt).forEach((line) => {
       const qcLines = list(qc?.items).filter((candidate) =>
@@ -157,7 +153,7 @@ export const getInwardRows = () => {
     });
     });
   });
-  getGRNs().forEach((grn) => docItems(grn).forEach((line) => rows.push({
+  list(grns).forEach((grn) => docItems(grn).forEach((line) => rows.push({
     eventType: 'Inventory posting (GRN)', date: grn.grnDate || grn.date || '', reference: grn.grnNumber || '',
     poNumber: grn.poRef || grn.poNumber || '', supplier: grn.supplier || '', itemCode: line.itemCode || line.materialCode || '',
     itemName: line.itemName || line.materialName || '', unit: line.unit || '', eventQty: num(line.acceptedQty ?? line.receivedQty),
@@ -167,24 +163,34 @@ export const getInwardRows = () => {
   return rows.sort((a, b) => String(b.date).localeCompare(String(a.date)));
 };
 
-export const getGRNPOPRRows = () => {
-  const pos = getPurchaseOrders();
-  const prs = getPurchaseRequests();
-  const indents = readLocalStorageList('purchaseIndents');
-  const receipts = getReceipts();
-  const grns = getGRNs();
-  const qcs = getQualityChecks();
+export const getGRNPOPRRows = ({
+  receipts = [],
+  purchaseOrders = [],
+  purchaseRequests = [],
+  purchaseIndents = [],
+  qualityChecks = [],
+  grns = []
+} = {}) => {
+  const pos = list(purchaseOrders);
+  const prs = list(purchaseRequests);
+  const indents = list(purchaseIndents);
+  const receiptRows = list(receipts);
+  const grnRows = list(grns);
+  const qcs = list(qualityChecks);
   return pos.flatMap((po) => {
     const poNumber = po.reference || po.payload?.poDetails?.poNumber || '';
     const details = po.payload?.poDetails || {};
     const supplier = po.vendor || po.payload?.vendorDetails?.companyName || po.payload?.vendorDetails?.vendorName || '';
-    const progress = getPOProgress(poNumber);
+    const progress = po.progress || {};
     const items = list(po.payload?.items);
-    const linkedPR = prs.find((pr) => [pr.poNumber, pr.purchaseOrderNumber, pr.linkedPONumber].some((n) => n && String(n) === String(poNumber)));
+    const linkedPR = prs.find((pr) =>
+      [pr.poNumber, pr.purchaseOrderNumber, pr.linkedPONumber].some((reference) => reference && String(reference) === String(poNumber)) ||
+      [po.pr_number, po.prNumber, po.payload?.prNumber, details.prRef].some((reference) => reference && String(reference) === String(pr.prNumber))
+    );
     const linkedIndent = indents.find((ind) => String(ind.poNumber || '') === String(poNumber)) ||
       indents.find((ind) => String(ind.indentNumber || '') === String(details.indentNumber || details.indentRef || ''));
-    const poReceipts = receipts.filter((r) => String(r.poNumber || '') === String(poNumber));
-    const poGrns = grns.filter((r) => String(r.poRef || r.poNumber || '') === String(poNumber));
+    const poReceipts = receiptRows.filter((r) => String(r.poNumber || '') === String(poNumber));
+    const poGrns = grnRows.filter((r) => String(r.poRef || r.poNumber || '') === String(poNumber));
     const poQCs = qcs.filter((qc) => String(qc.poNumber || '') === String(poNumber));
     return items.map((line, index) => {
       const state = progress.lines?.[index] || {};
@@ -193,17 +199,17 @@ export const getGRNPOPRRows = () => {
         indentNumber: linkedIndent?.indentNumber || details.indentNumber || details.indentRef || '',
         poNumber, supplier, status: progress.status || po.status || details.poStatus || 'Not recorded',
         orderedQuantity: progress.ordered,
-        originalReceived: progress.originalArrived,
-        originalAccepted: progress.originalAccepted,
+        originalReceived: progress.originalReceived ?? progress.originalArrived,
+        originalAccepted: progress.originalAccepted ?? progress.accepted,
         rejected: progress.rejected,
-        replacementReceived: progress.replacementArrived,
+        replacementReceived: progress.replacementReceived ?? progress.replacementArrived,
         replacementAccepted: progress.replacementAccepted,
-        totalAccepted: progress.totalAccepted,
+        totalAccepted: progress.accepted ?? progress.totalAccepted,
         physicalReceiptBalance: progress.physicalReceiptBalance,
         acceptedQuantityShortage: progress.acceptedQuantityShortage,
         qcPending: progress.qcPending,
         itemCode: line.itemCode || '', itemName: line.itemName || line.materialName || '', unit: line.unit || state.unit || '',
-        orderedQty: num(line.quantity), receivedQty: num(state.receivedQty), pendingQty: num(state.pendingQty),
+        orderedQty: num(line.quantity), receivedQty: num(state.receivedQty ?? state.originalReceivedQty), pendingQty: num(state.pendingQty),
         rate: num(line.unitPrice ?? line.rate ?? line.price),
         receiptRefs: poReceipts.map((r) => r.receiptNumber).filter(Boolean).join(', '),
         grnRefs: poGrns.map((r) => r.grnNumber).filter(Boolean).join(', '),
@@ -220,11 +226,9 @@ export const getAdvanceShipmentRows = () => {
   return [];
 };
 
-export const getCustomerMaterialStatusRows = () => {
-  const salesOrders = getSalesOrders();
-  const jobCards = getJobCards();
-  const challans = readLocalStorageList('deliveryChallanHistory');
-  return salesOrders.flatMap((order) => {
+export const getCustomerMaterialStatusRows = ({ salesOrders = [], jobCards = [], deliveryChallans = [] } = {}) => {
+  const challans = list(deliveryChallans);
+  return list(salesOrders).flatMap((order) => {
     const orderRef = order.reference || order.payload?.soDetails?.soNumber || '';
     const so = order.payload || {};
     const soDetails = so.soDetails || {};
@@ -253,13 +257,9 @@ export const getCustomerMaterialStatusRows = () => {
   });
 };
 
-export const getMRNDetailRows = () => {
-  const requests = getMaterialRequests();
-  const issues = getStoreIssues();
-  const returns = getMaterialReturns();
-  const purchaseRequests = getPurchaseRequests();
-  const indents = readLocalStorageList('purchaseIndents');
-  return requests.flatMap((mr) => list(mr.items).map((line, index) => {
+export const getMRNDetailRows = ({ requests = [], issues = [], returns = [], purchaseRequests = [], purchaseIndents = [] } = {}) => {
+  const indents = list(purchaseIndents);
+  return list(requests).flatMap((mr) => list(mr.items).map((line, index) => {
     const itemCode = clean(line.materialId || line.itemCode);
     const sameLines = list(mr.items).filter((candidate) => norm(candidate.materialId || candidate.itemCode) === norm(itemCode));
     const linkedIssues = issues.filter((issue) => String(issue.mrNumber || '') === String(mr.mrNumber || ''))
@@ -288,9 +288,8 @@ export const getMRNDetailRows = () => {
   }));
 };
 
-export const getOutsourcingReportRows = () => {
-  const htr = readLocalStorageList('htOutsourceRequests');
-  return htr.map((record) => ({
+export const getOutsourcingReportRows = ({ htOutsource = [] } = {}) => {
+  return list(htOutsource).map((record) => ({
     date: record.issuedDate || '', process: 'Heat Treatment', deliveryNote: record.outwardChallan || record.deliveryNote || '',
     reference: record.htrNumber || '', supplier: record.vendorName || 'Not assigned', jobCardNumber: record.jobCardNumber || '',
     projectId: record.projectId || '', itemName: record.partName || record.itemName || '', itemCode: record.inventoryItemCode || '',

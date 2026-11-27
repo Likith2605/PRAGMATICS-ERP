@@ -4,12 +4,6 @@ import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBrandin
 import { useCompanyBranding } from '../utils/companyBranding.js';
 import { hasPermission, isAdmin, getCurrentUserInfo } from '../utils/permissions.js';
 import {
-  getAllVendorEnquiries,
-  getAllVendorQuotations,
-  createVendorQuotation,
-  updateVendorQuotation,
-  updateVendorEnquiry,
-  deleteVendorQuotation,
   QUOTATION_STATUS,
   QUOTATION_ACCEPTED_STATUSES,
   QUOTATION_PO_CREATED_STATUSES,
@@ -19,9 +13,11 @@ import {
   canCreatePOFromQuotation,
   quotationAlreadyConverted,
   getPOForQuotation,
-  acceptQuotation,
   getSalesOrderByRef
 } from '../utils/workflowService.js';
+import { createProcurementRecord, deleteProcurementRecord, listProcurementRecords, reserveProcurementNumber, updateProcurementRecord } from '../services/procurementIntakeApi.js';
+import { listMasters } from '../services/masterApi.js';
+import ProcurementMigrationReview from '../components/ProcurementMigrationReview.jsx';
 import VendorMasterAutocomplete from '../components/VendorMasterAutocomplete.jsx';
 import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterMaterialRecords } from '../utils/historySearch.js';
@@ -88,10 +84,17 @@ const VendorQuotationPage = () => {
   const [busy, setBusy] = useState(false);
   const [compareList, setCompareList] = useState([]);
   const [viewDetail, setViewDetail] = useState(null);
+  const [vendorMasterError, setVendorMasterError] = useState('');
 
   useEffect(() => {
-    setEnquiries(getAllVendorEnquiries());
-    setQuotations(getAllVendorQuotations());
+    let active = true;
+    listMasters('vendors')
+      .then(() => { if (active) setVendorMasterError(''); })
+      .catch((error) => { if (active) setVendorMasterError(`Vendor Master could not be loaded from PostgreSQL: ${error.message}`); });
+    Promise.all([listProcurementRecords('vendorEnquiry'), listProcurementRecords('vendorQuotation')])
+      .then(([enquiryRows, quotationRows]) => { if (active) { setEnquiries(enquiryRows); setQuotations(quotationRows); } })
+      .catch((error) => { if (active) alert(`Vendor procurement records could not be loaded from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
   }, []);
   const filteredQuotations = useMemo(() => filterMaterialRecords(quotations, quotationSearch, ['quotationNumber','enquiryNumber','vendorName','indentNumber','prNumber','poNumber','quotationDate','createdAt','totalAmount','status']), [quotations, quotationSearch]);
 
@@ -100,28 +103,28 @@ const VendorQuotationPage = () => {
       const enq = location.state.vendorEnquiry;
       handleSelectEnquiry(enq);
     } else if (location.state?.enquiryNumber) {
-      const enq = getAllVendorEnquiries().find((e) => e.enquiryNumber === location.state.enquiryNumber);
+      const enq = enquiries.find((e) => e.enquiryNumber === location.state.enquiryNumber);
       if (enq) handleSelectEnquiry(enq);
     }
-  }, [location.state]);
+  }, [location.state, enquiries]);
 
   /* Notification deep link: clicking the Admin's "awaiting approval" notification
      opens /vendor-quotations?quotation=VQ-xxxx — open that quotation's detail card. */
   useEffect(() => {
     const wanted = searchParams.get('quotation');
     if (!wanted) return;
-    if (getAllVendorQuotations().some((q) => q.quotationNumber === wanted)) {
+    if (quotations.some((q) => q.quotationNumber === wanted)) {
       setViewDetail(wanted);
       setSearchParams({}, { replace: true });
     }
-  }, [searchParams]);
+  }, [searchParams, quotations, setSearchParams]);
 
   const handleSelectEnquiry = (enq) => {
     setEditingQuotation(null);
     setSelectedEnquiry(enq);
     // A stale preview link or legacy route can still open a completed enquiry.
     // Keep its vendor details visible instead of rendering blank fields.
-    const choices = getQuotationFormVendorChoices(enq, getAllVendorQuotations());
+    const choices = getQuotationFormVendorChoices(enq, quotations);
     const selectedId = enq.selectedVendorId || enq.selectedVendor?.vendorId || enq.selectedVendor?.vendorMasterId || enq.selectedVendor?.seq || '';
     const selectedName = vendorEntryName(enq.selectedVendor);
     const enquiryVendor = choices.find((v) => selectedId && String(v.vendorId) === String(selectedId))
@@ -176,7 +179,7 @@ const VendorQuotationPage = () => {
   };
 
   const handleEditQuotation = (quotation) => {
-    const enquiry = getAllVendorEnquiries().find((entry) => entry.enquiryNumber === quotation.enquiryNumber);
+    const enquiry = enquiries.find((entry) => entry.enquiryNumber === quotation.enquiryNumber);
     if (!enquiry) {
       alert(`Vendor Enquiry ${quotation.enquiryNumber} could not be found.`);
       return;
@@ -243,10 +246,10 @@ const VendorQuotationPage = () => {
   const totalTax = vqItems.reduce((sum, it) => sum + (Number(it.taxAmount) || 0), 0);
   const grandTotal = totalAmount + totalTax;
 
-  const handleCreateVQ = () => {
+  const handleCreateVQ = async () => {
     if (!selectedEnquiry) return;
     if (!vendorName.trim()) return alert('Enter vendor name.');
-    if (!editingQuotation && hasQuotationForEnquiryVendor(selectedEnquiry, { vendorId, name: vendorName }, getAllVendorQuotations())) {
+    if (!editingQuotation && hasQuotationForEnquiryVendor(selectedEnquiry, { vendorId, name: vendorName }, quotations)) {
       return alert(`A vendor quotation from ${vendorName.trim()} is already recorded for this enquiry.`);
     }
     const validItems = vqItems.filter((it) => Number(it.unitPrice) > 0);
@@ -257,7 +260,7 @@ const VendorQuotationPage = () => {
         const subtotal = validItems.reduce((sum, item) => sum + (Number(item.quotedQty) || 0) * (Number(item.unitPrice) || 0), 0);
         const discountAmount = validItems.reduce((sum, item) => sum + (Number(item.discountAmount) || 0), 0);
         const taxAmount = validItems.reduce((sum, item) => sum + (Number(item.taxAmount) || 0), 0);
-        const updated = updateVendorQuotation(editingQuotation.quotationNumber, {
+        const update = {
           vendorId,
           vendorName: vendorName.trim(),
           vendorContact: vendorContact.trim(),
@@ -275,29 +278,38 @@ const VendorQuotationPage = () => {
           quotationDate,
           otherTerms: otherTerms.trim(),
           remarks: vqRemarks.trim()
-        });
+        };
+        const updated = (await updateProcurementRecord('vendorQuotation', editingQuotation.quotationNumber, update, editingQuotation.version)).record;
         setBusy(false);
-        setQuotations(getAllVendorQuotations());
+        setQuotations(await listProcurementRecords('vendorQuotation'));
         setEditingQuotation(null);
         handleBackToList();
         return updated;
       }
-      const record = createVendorQuotation({
-        enquiryNumber: selectedEnquiry.enquiryNumber,
-        vendorId,
-        vendorName: vendorName.trim(),
-        vendorContact: vendorContact.trim(),
-        vendorEmail: vendorEmail.trim(),
-        items: validItems,
-        totalAmount,
-        deliveryDays: Number(deliveryDays) || 0,
-        paymentTerms: paymentTerms.trim(),
-        validity: validity.trim(),
-        quotationDate,
-        deliveryDate: validItems[0]?.deliveryDate || '',
-        otherTerms: otherTerms.trim(),
-        remarks: vqRemarks.trim()
+      const quotationNumber = await reserveProcurementNumber('vendorQuotation');
+      const lines = validItems.map((it) => {
+        const quotedQty = Number(it.quotedQty) || Number(it.requiredQty) || 0;
+        const unitPrice = Number(it.unitPrice) || 0;
+        const taxPct = Number(it.taxPct ?? it.tax) || 0;
+        const discount = Number(it.discount) || 0;
+        const lineTotal = Number(it.totalPrice) || quotedQty * unitPrice;
+        return { ...it, quotedQty, unitPrice, taxPct, taxAmount: Number(it.taxAmount) || lineTotal * taxPct / 100, discount, discountAmount: Number(it.discountAmount) || 0, totalPrice: lineTotal, deliveryDays: Number(it.deliveryDays) || Number(deliveryDays) || 0, deliveryDate: it.deliveryDate || validItems[0]?.deliveryDate || '', paymentTerms: it.paymentTerms || paymentTerms.trim() };
       });
+      const subtotal = lines.reduce((sum, item) => sum + item.quotedQty * item.unitPrice, 0);
+      const discountAmount = lines.reduce((sum, item) => sum + item.quotedQty * item.unitPrice * item.discount / 100, 0);
+      const taxAmount = lines.reduce((sum, item) => sum + item.taxAmount, 0);
+      const record = {
+        quotationNumber, enquiryNumber: selectedEnquiry.enquiryNumber, indentNumber: selectedEnquiry.indentNumber || '',
+        soNumber: selectedEnquiry.soNumber || '', projectId: selectedEnquiry.projectId || '', customer: selectedEnquiry.customer || '',
+        requiredDate: selectedEnquiry.requiredDate || '', vendorId: vendorId || '', vendorName: vendorName.trim(),
+        vendorContact: vendorContact.trim(), vendorEmail: vendorEmail.trim(), items: lines, subtotal,
+        totalAmount, discountAmount, taxPct: lines[0]?.taxPct || 0, discountPct: lines[0]?.discount || 0,
+        taxAmount, totalWithTax: totalAmount + taxAmount, deliveryDays: Number(deliveryDays) || 0,
+        deliveryDate: validItems[0]?.deliveryDate || '', quotationDate: quotationDate || new Date().toISOString().slice(0, 10),
+        paymentTerms: paymentTerms.trim(), validity: validity.trim(), otherTerms: otherTerms.trim(), remarks: vqRemarks.trim(),
+        status: QUOTATION_STATUS.RECEIVED, poNumber: '', acceptedBy: '', acceptedDate: '', acceptedTime: '', createdAt: new Date().toISOString()
+      };
+      await createProcurementRecord('vendorQuotation', record, `vendor-quotation:${crypto.randomUUID()}`);
       const enqVendors = (selectedEnquiry.vendors || []).map((v) => {
         const name = vendorEntryName(v);
         const id = typeof v === 'object' && v
@@ -310,13 +322,15 @@ const VendorQuotationPage = () => {
           : v;
       });
       const allReceived = enqVendors.every((v) => v.status === 'Quotation Received');
-      updateVendorEnquiry(selectedEnquiry.enquiryNumber, {
+      const refreshedEnquiries = await listProcurementRecords('vendorEnquiry');
+      const currentEnquiry = refreshedEnquiries.find((entry) => entry.enquiryNumber === selectedEnquiry.enquiryNumber);
+      if (currentEnquiry) await updateProcurementRecord('vendorEnquiry', selectedEnquiry.enquiryNumber, {
         vendors: enqVendors,
         status: allReceived ? 'Quotations Received' : selectedEnquiry.status
-      });
+      }, currentEnquiry.version);
       setBusy(false);
-      setQuotations(getAllVendorQuotations());
-      setEnquiries(getAllVendorEnquiries());
+      setQuotations(await listProcurementRecords('vendorQuotation'));
+      setEnquiries(await listProcurementRecords('vendorEnquiry'));
       handleBackToList();
     } catch (err) {
       setBusy(false);
@@ -325,7 +339,7 @@ const VendorQuotationPage = () => {
   };
 
   /** Accept Quotation — Admin-only approval; validation + Accepted By/Date/Time happen in the service. */
-  const handleAccept = (quotationNumber) => {
+  const handleAccept = async (quotationNumber) => {
     if (!canApprove) {
       alert('Only the Admin can approve a vendor quotation. Your approval request has been notified to the Admin.');
       return;
@@ -333,15 +347,17 @@ const VendorQuotationPage = () => {
     if (!window.confirm(`Approve vendor quotation ${quotationNumber}? This will reject other quotations for the same enquiry.`)) return;
     try {
       const info = getCurrentUserInfo();
-      acceptQuotation(quotationNumber, info.employee?.name || info.auth?.username || 'Administrator');
+      const selected = quotations.find((q) => q.quotationNumber === quotationNumber);
+      const now = new Date();
+      await updateProcurementRecord('vendorQuotation', quotationNumber, {
+        status: QUOTATION_STATUS.ACCEPTED,
+        acceptedBy: info.employee?.name || info.auth?.username || 'Administrator',
+        acceptedDate: now.toISOString().slice(0, 10),
+        acceptedTime: now.toTimeString().slice(0, 8)
+      }, selected.version);
       const vq = quotations.find((q) => q.quotationNumber === quotationNumber);
-      if (vq) {
-        quotations.filter((q) => q.enquiryNumber === vq.enquiryNumber && q.quotationNumber !== quotationNumber).forEach((q) => {
-          if (isConvertedQuotation(q)) return;
-          updateVendorQuotation(q.quotationNumber, { status: QUOTATION_STATUS.REJECTED });
-        });
-      }
-      setQuotations(getAllVendorQuotations());
+      if (!vq) return;
+      setQuotations(await listProcurementRecords('vendorQuotation'));
     } catch (err) {
       alert(err.message);
     }
@@ -420,7 +436,7 @@ const VendorQuotationPage = () => {
     });
   };
 
-  const handleReject = (quotationNumber) => {
+  const handleReject = async (quotationNumber) => {
     /* Rejecting decides the quotation's fate just like approving, so it is part
        of the same Admin-only approval step. */
     if (!canApprove) {
@@ -429,18 +445,22 @@ const VendorQuotationPage = () => {
     }
     if (!window.confirm(`Reject vendor quotation ${quotationNumber}?`)) return;
     try {
-      updateVendorQuotation(quotationNumber, { status: QUOTATION_STATUS.REJECTED });
-      setQuotations(getAllVendorQuotations());
+      const selected = quotations.find((q) => q.quotationNumber === quotationNumber);
+      await updateProcurementRecord('vendorQuotation', quotationNumber, { status: QUOTATION_STATUS.REJECTED }, selected.version);
+      setQuotations(await listProcurementRecords('vendorQuotation'));
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleDelete = (quotationNumber) => {
+  const handleDelete = async (quotationNumber) => {
     if (!isAdmin() || !window.confirm(`Delete draft vendor quotation ${quotationNumber}? Submitted quotations use the controlled workflow.`)) return;
     try {
-      deleteVendorQuotation(quotationNumber);
-      setQuotations(getAllVendorQuotations());
+      const reason = window.prompt(`Reason for deleting draft quotation ${quotationNumber}?`);
+      if (!reason?.trim()) return;
+      const selected = quotations.find((q) => q.quotationNumber === quotationNumber);
+      await deleteProcurementRecord('vendorQuotation', quotationNumber, selected.version, reason);
+      setQuotations(await listProcurementRecords('vendorQuotation'));
     } catch (err) {
       alert(err.message);
     }
@@ -455,7 +475,7 @@ const VendorQuotationPage = () => {
   };
 
   const handleViewPreview = (vq) => {
-    navigate('/vendor-quotations/preview', { state: { vendorQuotation: vq } });
+    navigate(`/vendor-quotations/preview/${encodeURIComponent(vq.quotationNumber)}`);
   };
 
   const handleActionChange = (vq, action) => {
@@ -477,7 +497,7 @@ const VendorQuotationPage = () => {
     }
   };
 
-  const currentQuotations = getAllVendorQuotations();
+  const currentQuotations = quotations;
   const sentEnquiries = enquiries.filter((e) =>
     ['Sent', 'Quotations Received'].includes(e.status) && hasPendingEnquiryVendor(e, currentQuotations)
   );
@@ -500,6 +520,7 @@ const VendorQuotationPage = () => {
           </div>
         </div>
 
+        {vendorMasterError && <div role="alert" className="form-error">{vendorMasterError}</div>}
         <div className="content-block">
           <div className="form-section">
             <div className="section-heading">
@@ -687,6 +708,12 @@ const VendorQuotationPage = () => {
           )}
         </div>
       </div>
+      {vendorMasterError && <div role="alert" className="form-error">{vendorMasterError}</div>}
+      <ProcurementMigrationReview kinds={['purchaseIndent', 'vendorEnquiry', 'vendorQuotation']} onImported={async (kind) => {
+        if (kind === 'vendorEnquiry') setEnquiries(await listProcurementRecords(kind));
+        if (kind === 'vendorQuotation') setQuotations(await listProcurementRecords(kind));
+        if (kind === 'purchaseIndent') await listProcurementRecords(kind);
+      }} />
 
       {/* Enquiries Ready for VQ */}
       {sentEnquiries.length > 0 && (

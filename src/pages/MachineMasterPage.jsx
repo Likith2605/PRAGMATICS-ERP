@@ -1,6 +1,6 @@
-import { useState } from 'react';
-import { isAdmin } from '../utils/permissions.js';
-import { getMachines, saveMachines, generateMachineId } from '../utils/storeService.js';
+import React, { useEffect, useMemo, useState } from 'react';
+import { isAdmin } from '../utils/auth.js';
+import { createMaster, deleteMaster, listMasters, newMasterToken, updateMaster } from '../services/masterApi.js';
 
 const EMPTY_FORM = {
   machineId: '',
@@ -15,114 +15,126 @@ const EMPTY_FORM = {
 };
 
 const MachineMasterPage = () => {
-  const [machines, setMachines] = useState(getMachines);
+  const [machines, setMachines] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [busy, setBusy] = useState(false);
   const [showModal, setShowModal] = useState(false);
-  const [editId, setEditId] = useState(null);
+  const [editId, setEditId] = useState('');
+  const [editVersion, setEditVersion] = useState(0);
   const [form, setForm] = useState(EMPTY_FORM);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
-
   const admin = isAdmin();
-  const refresh = () => setMachines(getMachines());
+
+  const refresh = async () => {
+    const records = await listMasters('machines');
+    setMachines(records);
+    setLoadError('');
+    return records;
+  };
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    refresh()
+      .catch((err) => { if (active) setLoadError(err.message || 'Machines could not be loaded from PostgreSQL.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
 
   const openAdd = () => {
-    setEditId(null);
-    setForm({ ...EMPTY_FORM, machineId: generateMachineId().machineId, status: 'Active' });
+    setEditId('');
+    setEditVersion(0);
+    setForm({ ...EMPTY_FORM, machineId: newMasterToken('MC').slice(0, 28).toUpperCase(), status: 'Active' });
     setError('');
     setShowModal(true);
   };
 
   const openEdit = (m) => {
     setEditId(m.id || m.machineId);
-    setForm({ ...EMPTY_FORM, ...m, status: m.status || 'Active' });
+    setEditVersion(Number(m.version) || 1);
+    setForm({ ...EMPTY_FORM, ...m, machineId: m.machineId || m.id, status: m.status || 'Active' });
     setError('');
     setShowModal(true);
   };
 
-  const handleSave = (e) => {
+  const handleSave = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
     setError('');
-
-    const machineId = (form.machineId || '').trim();
-    const name = (form.name || '').trim();
-
+    const machineId = String(form.machineId || '').trim().toUpperCase();
+    const name = String(form.name || '').trim();
     if (!name) return setError('Machine name is required.');
     if (!machineId) return setError('Machine ID is required.');
-
+    const payload = {
+      machineId,
+      name,
+      type: form.type || '',
+      workCenter: form.workCenter || '',
+      department: form.department || '',
+      location: form.location || '',
+      capacity: form.capacity || '',
+      status: form.status || 'Active',
+      remarks: form.remarks || ''
+    };
+    setBusy(true);
     try {
-      const list = getMachines();
-      const dup = list.find(
-        (m) =>
-          m &&
-          m.machineId &&
-          String(m.machineId).trim().toLowerCase() === machineId.toLowerCase() &&
-          String(m.id || m.machineId) !== String(editId)
-      );
-      if (dup) return setError(`Machine ID "${machineId}" is already in use.`);
-
-      const status = form.status || 'Active';
-      const payload = {
-        ...form,
-        machineId: machineId.toUpperCase(),
-        name,
-        status,
-        active: status === 'Active'
-      };
-
-      let next;
-      if (editId) {
-        next = list.map((m) =>
-          String(m.id || m.machineId) === String(editId)
-            ? { ...m, ...payload, id: m.id || editId }
-            : m
-        );
-      } else {
-        next = [
-          {
-            id: `mc-${Date.now()}`,
-            ...payload,
-            active: status === 'Active',
-            createdAt: new Date().toISOString()
-          },
-          ...list
-        ];
-      }
-
-      saveMachines(next);
-      refresh();
+      if (editId) await updateMaster('machines', editId, payload, editVersion);
+      else await createMaster('machines', payload);
+      await refresh();
       setShowModal(false);
     } catch (err) {
-      console.error('Error saving machine:', err);
-      setError(err?.message || 'Failed to save machine. Please try again.');
-    }
+      setError(err.message || 'Machine could not be saved. Please try again.');
+      if (err.status === 409) refresh().catch(() => {});
+    } finally { setBusy(false); }
   };
 
-  const toggleStatus = (m) => {
-    const isNowActive = m.status === 'Inactive';
-    const nextStatus = isNowActive ? 'Active' : 'Inactive';
-    const next = getMachines().map((x) =>
-      String(x.id || x.machineId) === String(m.id || m.machineId)
-        ? { ...x, status: nextStatus, active: isNowActive }
-        : x
-    );
-    saveMachines(next);
-    refresh();
+  const toggleStatus = async (m) => {
+    setBusy(true);
+    try {
+      const active = m.status === 'Active';
+      await updateMaster('machines', m.id, { ...m, status: active ? 'Inactive' : 'Active', active: !active }, Number(m.version) || 1);
+      await refresh();
+    } catch (err) {
+      setLoadError(err.message || 'Machine status could not be updated.');
+      if (err.status === 409) refresh().catch(() => {});
+    } finally { setBusy(false); }
   };
 
-  const filtered = machines.filter((m) => {
-    const q = search.toLowerCase().trim();
-    if (!q) return true;
-    return [m.machineId, m.name, m.type, m.workCenter, m.department, m.location, m.status].join(' ').toLowerCase().includes(q);
-  });
+  const handleDelete = async (m) => {
+    if (!window.confirm(`Delete machine ${m.machineId}? This keeps its PostgreSQL delete history.`)) return;
+    const reason = window.prompt('Reason for deleting this machine:')?.trim();
+    if (!reason) return;
+    setBusy(true);
+    try {
+      await deleteMaster('machines', m.id, Number(m.version) || 1, reason);
+      await refresh();
+    } catch (err) {
+      setLoadError(err.message || 'Machine could not be deleted.');
+      if (err.status === 409) refresh().catch(() => {});
+    } finally { setBusy(false); }
+  };
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return machines;
+    return machines.filter((m) => [m.machineId, m.name, m.type, m.workCenter, m.department, m.location, m.status].join(' ').toLowerCase().includes(q));
+  }, [machines, search]);
 
   return (
     <section className="page-section">
+      {loadError && (
+        <div role="alert" className="form-error" style={{ marginBottom: 12 }}>
+          {loadError}{' '}
+          <button type="button" className="button-secondary button-small" onClick={() => refresh().catch((err) => setLoadError(err.message))}>Retry</button>
+        </div>
+      )}
       <div className="page-header">
         <div>
           <h1 className="page-title">Machine Master</h1>
         </div>
         <div className="header-actions">
-          {admin && <button type="button" className="button-primary" onClick={openAdd}>+ Add Machine</button>}
+          {admin && <button type="button" className="button-primary" onClick={openAdd} disabled={loading || busy}>+ Add Machine</button>}
         </div>
       </div>
 
@@ -156,8 +168,10 @@ const MachineMasterPage = () => {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0 ? (
-                <tr><td colSpan={admin ? 9 : 8} className="no-history-row">No machines found.</td></tr>
+              {loading ? (
+                <tr><td colSpan={admin ? 9 : 8} className="no-history-row">Loading machines from PostgreSQL…</td></tr>
+              ) : filtered.length === 0 ? (
+                <tr><td colSpan={admin ? 9 : 8} className="no-history-row">{machines.length === 0 ? 'No machines on record. Add the first machine.' : 'No machines match the search.'}</td></tr>
               ) : (
                 filtered.map((m) => (
                   <tr key={m.id}>
@@ -174,10 +188,11 @@ const MachineMasterPage = () => {
                     {admin && (
                       <td>
                         <div className="table-actions">
-                          <button type="button" className="button-secondary button-small" onClick={() => openEdit(m)}>Edit</button>
-                          <button type="button" className="button-secondary button-small" onClick={() => toggleStatus(m)}>
+                          <button type="button" className="button-secondary button-small" onClick={() => openEdit(m)} disabled={busy}>Edit</button>
+                          <button type="button" className="button-secondary button-small" onClick={() => toggleStatus(m)} disabled={busy}>
                             {m.status === 'Inactive' ? 'Activate' : 'Deactivate'}
                           </button>
+                          <button type="button" className="button-secondary button-small danger" onClick={() => handleDelete(m)} disabled={busy}>Delete</button>
                         </div>
                       </td>
                     )}
@@ -200,7 +215,7 @@ const MachineMasterPage = () => {
             <div className="form-grid">
               <div className="form-field">
                 <label>Machine ID</label>
-                <input type="text" className="action-select form-input" value={form.machineId} onChange={(e) => setForm({ ...form, machineId: e.target.value })} />
+                <input type="text" className="action-select form-input" value={form.machineId} readOnly={Boolean(editId)} onChange={(e) => setForm({ ...form, machineId: e.target.value })} />
               </div>
               <div className="form-field">
                 <label>Machine Name *</label>
@@ -239,11 +254,11 @@ const MachineMasterPage = () => {
               </div>
             </div>
 
-            {error && <div className="form-error">{error}</div>}
+            {error && <div className="form-error" role="alert">{error}</div>}
 
             <div className="template-modal-actions">
-              <button type="button" className="button-secondary" onClick={() => setShowModal(false)}>Cancel</button>
-              <button type="submit" className="button-primary">Save Machine</button>
+              <button type="button" className="button-secondary" onClick={() => setShowModal(false)} disabled={busy}>Cancel</button>
+              <button type="submit" className="button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save Machine'}</button>
             </div>
           </form>
         </div>

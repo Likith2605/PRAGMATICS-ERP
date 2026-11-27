@@ -1,19 +1,43 @@
 import 'dotenv/config';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import { getPool, closeDatabase } from '../server/database.js';
 import { hasPermissionForRole, normalizeEmployeeAssignments, permissionsForRole } from '../server/departmentAccess.js';
 import { homePathFor } from '../src/utils/roleNavigation.js';
 import { ROLE_PERMISSIONS } from '../src/utils/permissions.js';
 
-const port = 3326;
-const base = `http://127.0.0.1:${port}`;
-const processRef = spawn(process.execPath, ['server.js'], {
-  env: { ...process.env, PORT: String(port), QC_PULL_ENABLED: '0' },
-  stdio: 'ignore'
+const testDatabaseUrl = process.env.ERP_TEST_DATABASE_URL;
+if (!testDatabaseUrl) throw new Error('ERP_TEST_DATABASE_URL is required; refusing DATABASE_URL.');
+if (decodeURIComponent(new URL(testDatabaseUrl).pathname.replace(/^\/+/, '')) !== 'vyavastha_test') {
+  throw new Error('Refusing authentication tests outside vyavastha_test.');
+}
+process.env.ERP_TEST_MODE = '1';
+process.env.ERP_TEST_DATABASE_URL = testDatabaseUrl;
+const databaseIdentity = await getPool().query('SELECT current_database() AS name');
+assert.equal(databaseIdentity.rows[0]?.name, 'vyavastha_test', 'authentication test writes are restricted to vyavastha_test');
+
+const port = await new Promise((resolve, reject) => {
+  const listener = net.createServer();
+  listener.once('error', reject);
+  listener.listen(0, '127.0.0.1', () => {
+    const { port: availablePort } = listener.address();
+    listener.close((error) => error ? reject(error) : resolve(availablePort));
+  });
 });
-let employeesBeforeMulti = null;
-let multiEmployeeWriteStarted = false;
+const base = `http://127.0.0.1:${port}`;
+const serverEnv = { ...process.env, ERP_TEST_MODE: '1', ERP_TEST_DATABASE_URL: testDatabaseUrl, PORT: String(port), QC_PULL_ENABLED: '0' };
+delete serverEnv.DATABASE_URL;
+const processRef = spawn(process.execPath, ['server.js'], {
+  env: serverEnv,
+  stdio: ['ignore', 'pipe', 'pipe']
+});
+let serverOutput = '';
+processRef.stdout.on('data', (chunk) => { serverOutput += chunk.toString(); });
+processRef.stderr.on('data', (chunk) => { serverOutput += chunk.toString(); });
+const createdEmployees = [];
+const employeeEmails = [];
+const idempotencyTokens = [];
 let adminLoginTokenForCleanup = '';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const request = async (path, { token, ...options } = {}) => {
@@ -30,25 +54,39 @@ try {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
       const response = await fetch(`${base}/api/health`);
-      if (response.ok) { ready = true; break; }
+      if (response.ok && (await response.json().catch(() => ({}))).ready === true) { ready = true; break; }
     } catch { /* server is starting */ }
     await sleep(250);
   }
-  assert.ok(ready, 'fresh production server starts on localhost');
+  assert.ok(ready, 'isolated authentication test server starts on localhost');
 
   const admin = await request('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: process.env.ERP_ADMIN_EMAIL, password: process.env.ERP_ADMIN_PASSWORD, portal: 'admin' }) });
-  assert.equal(admin.status, 200, 'existing Admin Portal credentials are accepted');
+  assert.equal(admin.status, 200, `existing Admin Portal credentials are accepted\n${serverOutput}`);
   assert.equal(admin.data.user?.roleKey, 'admin');
   assert.ok(admin.data.token);
-  adminLoginTokenForCleanup = admin.data.token;
   const adminMe = await request('/api/auth/me', { token: admin.data.token });
   assert.equal(adminMe.status, 200);
   assert.equal(adminMe.data.user?.roleKey, 'admin', 'Admin identity is retained for dashboard selection');
+  assert.equal((await request('/api/auth/employee-count', { token: admin.data.token })).status, 200, 'Admin can load the employee-count dashboard aggregate');
   assert.equal((await request('/api/auth/audit', { token: admin.data.token })).status, 200);
 
-  const employeeState = await getPool().query("SELECT data FROM erp_state WHERE storage_key='employees'");
-  const employee = (employeeState.rows[0]?.data || []).find((record) => record?.active !== false && record?.email && record?.password && !['admin', 'administrator'].includes(String(record.roleKey || '').toLowerCase()) && String(record.role || '').toLowerCase() !== 'administrator');
-  assert.ok(employee, 'an existing active employee credential is available for login verification');
+  const employee = {
+    id: `auth-regression-${Date.now()}`, employeeId: `AUTH-${Date.now()}`,
+    name: 'Authentication Regression Employee', email: `auth-regression-${Date.now()}@example.com`,
+    password: 'Auth@Test123!', active: true, department: 'Sales Department',
+    role: 'Sales Executive', roleKey: 'sales_executive',
+    departmentAssignments: [{ department: 'Sales Department', role: 'Sales Executive', roleKey: 'sales_executive' }]
+  };
+  employee.email = `${employee.id}@example.com`;
+  const employeeCreateToken = `auth-regression-create-${Date.now()}`;
+  idempotencyTokens.push(employeeCreateToken);
+  const createdEmployee = await request('/api/employees', {
+    method: 'POST', token: admin.data.token,
+    body: JSON.stringify({ data: employee, createToken: employeeCreateToken })
+  });
+  assert.equal(createdEmployee.status, 201, `dedicated API creates authentication regression employee (${createdEmployee.data.error || ''})`);
+  createdEmployees.push({ id: employee.id, employeeId: employee.employeeId });
+  employeeEmails.push(employee.email);
   const employeeLogin = await request('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: employee.email, password: employee.password, portal: 'employee' }) });
   assert.equal(employeeLogin.status, 200, 'existing Employee Portal credentials are accepted');
   assert.notEqual(employeeLogin.data.user?.roleKey, 'admin');
@@ -61,7 +99,7 @@ try {
   assert.equal(employeeMeForDepartment.status, 200, 'an assigned department is accepted by the server');
   const unassignedDepartment = ['Sales Department','Purchase Department','Production Department','Store Department'].find((department) => !employeeLogin.data.user.assignments.some((assignment) => assignment.department === department));
   assert.equal((await fetch(`${base}/api/auth/me`, { headers: { authorization: `Bearer ${employeeLogin.data.token}`, 'x-erp-department': unassignedDepartment } })).status, 403, 'an unassigned department is rejected by the server');
-  assert.equal((await request('/api/state/employees', { token: employeeLogin.data.token })).status, 403, 'employees cannot retrieve role records through the generic state API');
+  assert.equal((await request('/api/state/employees', { token: employeeLogin.data.token })).status, 400, 'generic employee reads are rejected after migration');
   assert.equal((await request('/api/state/departmentCatalog', { token: employeeLogin.data.token })).status, 403, 'non-admin users cannot read the department catalog');
   assert.equal((await request('/api/state/departmentCatalog', { method: 'PUT', token: employeeLogin.data.token, body: JSON.stringify({ data: [{ name: 'Unauthorized Department' }] }) })).status, 403, 'non-admin users cannot create departments through direct API requests');
   assert.equal((await request('/api/state/roleCatalog', { method: 'PUT', token: employeeLogin.data.token, body: JSON.stringify({ data: [{ department: 'Sales Department', name: 'Unauthorized Role', roleKey: 'custom_unauthorized' }] }) })).status, 403, 'non-admin users cannot create roles through direct API requests');
@@ -91,19 +129,20 @@ try {
   assert.ok(hasPermissionForRole(normalizedAssignments[2].roleKey, 'inventory.adjust'));
   assert.ok(!hasPermissionForRole(normalizedAssignments[2].roleKey, 'sales.quotation'));
 
-  const databaseName = (await getPool().query('SELECT current_database() AS name')).rows[0]?.name || '';
-  if (/test/i.test(databaseName)) {
-    employeesBeforeMulti = structuredClone(employeeState.rows[0]?.data || []);
-    const multiEmployee = {
-      id: `auth-multi-${Date.now()}`, employeeId: `TEST-${Date.now()}`, name: 'Department Access Test',
-      email: `auth-multi-${Date.now()}@example.com`, password: 'Multi@Test123!', active: true,
-      department: 'Sales Department', role: 'Sales Executive', roleKey: 'sales_executive',
-      departmentAssignments: multi.departmentAssignments
-    };
-    multiEmployee.email = `${multiEmployee.id}@example.com`;
-    multiEmployeeWriteStarted = true;
-    const addMulti = await request('/api/state/employees', { method: 'PUT', token: admin.data.token, body: JSON.stringify({ data: [...employeesBeforeMulti, multiEmployee] }) });
-    assert.equal(addMulti.status, 200, `Admin can persist a multi-department employee without making duplicate accounts (${addMulti.data.error || ''})`);
+  const multiEmployee = {
+    id: `auth-multi-${Date.now()}`, employeeId: `TEST-${Date.now()}`, name: 'Department Access Test',
+    email: `auth-multi-${Date.now()}@example.com`, password: 'Multi@Test123!', active: true,
+    department: 'Sales Department', role: 'Sales Executive', roleKey: 'sales_executive',
+    departmentAssignments: multi.departmentAssignments
+  };
+  multiEmployee.email = `${multiEmployee.id}@example.com`;
+  const multiCreateToken = `auth-multi-create-${Date.now()}`;
+  idempotencyTokens.push(multiCreateToken);
+  const addMulti = await request('/api/employees', { method: 'POST', token: admin.data.token, body: JSON.stringify({ data: multiEmployee, createToken: multiCreateToken }) });
+  assert.equal(addMulti.status, 201, `Admin can persist a multi-department employee through the dedicated API (${addMulti.data.error || ''})`);
+  createdEmployees.push({ id: multiEmployee.id, employeeId: multiEmployee.employeeId });
+  employeeEmails.push(multiEmployee.email);
+  {
     const multiLogin = await request('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: multiEmployee.email, password: multiEmployee.password, portal: 'employee' }) });
     assert.equal(multiLogin.status, 200);
     assert.equal(multiLogin.data.user.assignments.length, 3);
@@ -117,16 +156,22 @@ try {
     }
     const deniedDept = await fetch(`${base}/api/auth/me`, { headers: { authorization: `Bearer ${token}`, 'x-erp-department': 'Production Department' } });
     assert.equal(deniedDept.status, 403, 'unassigned department cannot be selected');
-    const removeSales = employeesBeforeMulti.concat([{ ...multiEmployee, departmentAssignments: multi.departmentAssignments.filter((item) => item.department !== 'Sales Department') }]);
-    assert.equal((await request('/api/state/employees', { method: 'PUT', token: admin.data.token, body: JSON.stringify({ data: removeSales }) })).status, 200);
+    const updateToken = `auth-multi-update-${Date.now()}`;
+    idempotencyTokens.push(updateToken);
+    const removeSales = await request(`/api/employees/${encodeURIComponent(multiEmployee.id)}`, {
+      method: 'PUT',
+      token: admin.data.token,
+      body: JSON.stringify({
+        data: { departmentAssignments: multi.departmentAssignments.filter((item) => item.department !== 'Sales Department') },
+        version: addMulti.data.record.version,
+        idempotencyToken: updateToken
+      })
+    });
+    assert.equal(removeSales.status, 200, `department assignment removal uses optimistic versioning (${removeSales.data.error || ''})`);
     assert.equal((await fetch(`${base}/api/auth/me`, { headers: { authorization: `Bearer ${token}`, 'x-erp-department': 'Sales Department' } })).status, 403, 'removed assignment takes effect on the existing session');
     assert.equal((await fetch(`${base}/api/auth/me`, { headers: { authorization: `Bearer ${token}`, 'x-erp-department': 'Purchase Department' } })).status, 200, 'remaining assignments keep working on the same session');
     await request('/api/auth/logout', { method: 'POST', token });
-    await request('/api/state/employees', { method: 'PUT', token: admin.data.token, body: JSON.stringify({ data: employeesBeforeMulti }) });
-    multiEmployeeWriteStarted = false;
     console.log('Multi-department API checks passed: initial department, role switching, restricted department, assignment revocation, and single-session behavior.');
-  } else {
-    console.log('Multi-department database integration checks skipped outside a test database.');
   }
 
   assert.equal((await request('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: process.env.ERP_ADMIN_EMAIL, password: 'invalid-password', portal: 'admin' }) })).status, 401, 'invalid Admin password is rejected');
@@ -140,12 +185,15 @@ try {
 
   console.log('Authentication API checks passed: Admin, Employee, invalid credentials, role authorization, localhost startup, and logout revocation.');
 } finally {
-  if (multiEmployeeWriteStarted && employeesBeforeMulti) {
-    try {
-      const token = adminLoginTokenForCleanup;
-      if (token) await fetch(`${base}/api/state/employees`, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ data: employeesBeforeMulti }) });
-    } catch { /* keep the original failure visible; test database only */ }
+  if (processRef.exitCode === null && processRef.signalCode === null) {
+    processRef.kill();
+    await new Promise((resolve) => processRef.once('exit', resolve)).catch(() => {});
   }
-  processRef.kill();
+  if (employeeEmails.length) await getPool().query('DELETE FROM erp_sessions WHERE lower(email)=ANY($1::text[])', [employeeEmails.map((email) => email.toLowerCase())]).catch(() => {});
+  if (createdEmployees.length) {
+    await getPool().query("DELETE FROM erp_audit_log WHERE module='employees' AND record_id=ANY($1::text[])", [createdEmployees.map((employee) => employee.employeeId)]).catch(() => {});
+    await getPool().query('DELETE FROM employees WHERE id=ANY($1::text[])', [createdEmployees.map((employee) => employee.id)]).catch(() => {});
+  }
+  if (idempotencyTokens.length) await getPool().query('DELETE FROM master_idempotency WHERE token=ANY($1::text[])', [idempotencyTokens]).catch(() => {});
   await closeDatabase().catch(() => {});
 }

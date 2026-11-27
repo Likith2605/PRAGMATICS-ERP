@@ -1,5 +1,6 @@
-import { useMemo, useState } from 'react';
-import { getStockTransactions, getInventoryItems, transactionTypeLabel } from '../utils/storeService.js';
+import { useEffect, useMemo, useState } from 'react';
+import { listAllStockLedger, listInventoryItems, normalizeStockLedgerRecord } from '../services/inventoryApi.js';
+import { transactionTypeLabel } from '../utils/storeService.js';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import StoreAuditLogView from '../components/StoreAuditLogView.jsx';
 
@@ -7,9 +8,32 @@ const InventoryTransactionsPage = () => {
   const [tab, setTab] = useState('transactions'); // transactions | audit
   const [typeFilter, setTypeFilter] = useState('All');
   const [search, setSearch] = useState('');
+  const [tx, setTx] = useState([]);
+  const [inventory, setInventory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
-  const tx = getStockTransactions();
-  const inventory = getInventoryItems();
+  const refresh = async () => {
+    setLoading(true);
+    setLoadError('');
+    try {
+      const [ledger, items] = await Promise.all([listAllStockLedger(), listInventoryItems()]);
+      const itemNames = new Map(items.map((item) => [
+        String(item.item_code || item.itemCode || ''),
+        item.material_name || item.materialName || ''
+      ]));
+      setTx(ledger.map((entry) => normalizeStockLedgerRecord(entry, itemNames)));
+      setInventory(items);
+    } catch (error) {
+      setTx([]);
+      setInventory([]);
+      setLoadError(`Inventory transactions could not be loaded from PostgreSQL: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void refresh(); }, []);
 
   const types = useMemo(() => {
     const set = new Set(tx.map((t) => transactionTypeLabel(t)));
@@ -37,9 +61,14 @@ const InventoryTransactionsPage = () => {
           <h1 className="page-title">Inventory Transactions</h1>
         </div>
         <div className="header-actions">
+          <button type="button" className="button-secondary" onClick={() => void refresh()} disabled={loading}>
+            {loading ? 'Loading…' : 'Refresh'}
+          </button>
           <NotificationsPanel />
         </div>
       </div>
+
+      {loadError && <p className="form-error" role="alert">{loadError}</p>}
 
       <div className="tab-nav">
         <button type="button" className={`tab-link ${tab === 'transactions' ? 'active' : ''}`} onClick={() => setTab('transactions')}>Transaction History</button>
@@ -88,7 +117,9 @@ const InventoryTransactionsPage = () => {
                 </tr>
               </thead>
               <tbody>
-                {filtered.length === 0 ? (
+                {loading ? (
+                  <tr><td colSpan="11" className="no-history-row">Loading inventory transactions from PostgreSQL…</td></tr>
+                ) : filtered.length === 0 ? (
                   <tr>
                     <td colSpan="11" className="no-history-row">No inventory transactions found.</td>
                   </tr>

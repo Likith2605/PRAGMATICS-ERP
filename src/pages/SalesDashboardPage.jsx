@@ -7,16 +7,12 @@ import {
 import { hasAnyPermission } from '../utils/permissions.js';
 import { convertToINR } from '../utils/currency.js';
 import { invReceivableINR } from '../utils/invoiceValues.js';
+import { listQuotations } from '../services/quotationApi.js';
+import { getCustomerPurchaseOrders } from '../services/customerPurchaseOrderApi.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { listCustomerInvoices } from '../services/customerInvoiceApi.js';
+import { listDeliveryChallans } from '../services/deliveryChallanApi.js';
 import './sales-dashboard.css';
-
-const readList = (key) => {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(key) || '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-};
 
 const payloadINR = (payload) => {
   const grandTotal = Number(payload?.totals?.grandTotal) || 0;
@@ -56,13 +52,40 @@ const SalesDashboardPage = () => {
   const [salesOrders, setSalesOrders] = useState([]);
   const [customerInvoices, setCustomerInvoices] = useState([]);
   const [deliveryChallans, setDeliveryChallans] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
-    setQuotations(readList('quotationHistory'));
-    setCustomerPOs(readList('customerPOHistory'));
-    setSalesOrders(readList('salesOrderHistory'));
-    setCustomerInvoices(readList('customerInvoiceHistory'));
-    setDeliveryChallans(readList('deliveryChallanHistory'));
+    let active = true;
+    setLoading(true);
+    setLoadError('');
+    Promise.all([
+      listQuotations(),
+      getCustomerPurchaseOrders(),
+      listSalesOrders(),
+      listCustomerInvoices(),
+      listDeliveryChallans()
+    ]).then(([qList, poList, soList, invList, dcList]) => {
+      if (!active) return;
+      setQuotations(Array.isArray(qList) ? qList : []);
+      setCustomerPOs(Array.isArray(poList) ? poList : []);
+      setSalesOrders(Array.isArray(soList) ? soList : []);
+      setCustomerInvoices(Array.isArray(invList) ? invList : []);
+      setDeliveryChallans(Array.isArray(dcList) ? dcList : []);
+    }).catch((error) => {
+      if (!active) return;
+      setQuotations([]);
+      setCustomerPOs([]);
+      setSalesOrders([]);
+      setCustomerInvoices([]);
+      setDeliveryChallans([]);
+      setLoadError(`Sales dashboard data could not be loaded from PostgreSQL: ${error.message}`);
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
   }, [refreshKey]);
 
   const kpis = useMemo(() => {
@@ -107,6 +130,9 @@ const SalesDashboardPage = () => {
         <button type="button" className="button-secondary sales-refresh" onClick={() => setRefreshKey((key) => key + 1)}><RefreshCw size={15} strokeWidth={1.75} aria-hidden="true" />Refresh</button>
       </div>
 
+      {loading ? <div role="status" className="content-block">Loading dashboard data from PostgreSQL...</div>
+        : loadError ? <div role="alert" className="form-error">{loadError}</div>
+          : <>
       <section className="sales-kpi-section" aria-labelledby="sales-position-title">
         <div className="sales-section-heading"><div><h2 id="sales-position-title">Sales position</h2><p>Current totals from recorded transactions</p></div></div>
         <div className="sales-kpi-grid">
@@ -145,6 +171,7 @@ const SalesDashboardPage = () => {
         <div className="block-header sales-section-header"><div className="sales-section-title"><FilePlus2 size={18} strokeWidth={1.75} aria-hidden="true" /><div><h2 id="sales-actions-title">Sales actions</h2><p>Open a sales workflow</p></div></div></div>
         <div className="sales-action-grid">{actions.map(({ label, icon: Icon, path, primary }) => <button key={label} type="button" className={`${primary ? 'button-primary' : 'button-secondary'} sales-action`} onClick={() => navigate(path)}><Icon size={16} strokeWidth={1.75} aria-hidden="true" />{label}</button>)}</div>
       </section>}
+      </>}
     </div>
   );
 };

@@ -3,6 +3,9 @@ import express from 'express';
 import { getPool } from './database.js';
 import { assignmentForDepartment, normalizeDepartment, normalizeEmployeeAssignments, hasPermissionForRole } from './departmentAccess.js';
 import { stableDepartmentId, stableRoleId, permissionAssignmentKey } from '../shared/roleIdentity.js';
+import { findEmployeeForAuthentication, employeeDirectoryReferences } from './employeeStore.js';
+import { verifyEmployeePassword } from './employeeCredentials.js';
+import { readDepartmentRoleCatalogs, resolveRolePermission } from './departmentRoleCatalogStore.js';
 
 const TOKEN_TTL_HOURS = Number(process.env.ERP_SESSION_TTL_HOURS || 12);
 const hashToken = (token) => createHash('sha256').update(token).digest('hex');
@@ -31,16 +34,11 @@ export const safeAuditValues = (value) => {
 export const authRouter = express.Router();
 
 const roleStateFor = async (employee, department = '') => {
-  const result = await getPool().query("SELECT storage_key,data FROM erp_state WHERE storage_key IN ('departmentCatalog','roleCatalog','rolePermissions')");
-  const state = Object.fromEntries(result.rows.map((row) => [row.storage_key, row.data]));
-  const departmentCatalog = Array.isArray(state.departmentCatalog) ? state.departmentCatalog : [];
-  const roleCatalog = Array.isArray(state.roleCatalog) ? state.roleCatalog : [];
-  const permissionCatalog = Array.isArray(state.rolePermissions) ? state.rolePermissions : [];
+  const { departments: departmentCatalog, roles: roleCatalog, permissions: permissionCatalog } = await readDepartmentRoleCatalogs();
   const assignments = normalizeEmployeeAssignments(employee).map((assignment) => {
     const departmentId = stableDepartmentId(assignment.department, departmentCatalog);
     const roleId = stableRoleId(assignment.department, assignment.roleKey, roleCatalog, departmentCatalog);
-    const key = permissionAssignmentKey(departmentId, roleId);
-    const scoped = permissionCatalog.find((entry) => permissionAssignmentKey(entry.departmentId, entry.roleId) === key);
+    const scoped = resolveRolePermission({ permissions: permissionCatalog }, departmentId, roleId);
     return { ...assignment, departmentId, roleId, ...(scoped ? { permissions: scoped.permissions } : {}) };
   });
   return { assignments, assignment: assignmentForDepartment(assignments, department || assignments[0]?.department) };
@@ -71,13 +69,13 @@ authRouter.post('/login', async (req, res) => {
   if (isAdmin && process.env.ERP_ADMIN_EMAIL && process.env.ERP_ADMIN_PASSWORD) {
     user = { id: 'admin', email, username: process.env.ERP_ADMIN_NAME || 'Administrator', role: 'Administrator', roleKey: 'admin', department: 'Admin', activeDepartment: 'Admin', assignments: [{ department: 'Admin', role: 'Administrator', roleKey: 'admin' }], employeeId: '-' };
   } else if (portal !== 'admin') {
-    const result = await getPool().query("SELECT data FROM erp_state WHERE storage_key = 'employees'");
-    const employees = Array.isArray(result.rows[0]?.data) ? result.rows[0].data : [];
-    const employee = employees.find((item) => item?.active !== false &&
-      !['admin','administrator'].includes(String(item?.roleKey || '').toLowerCase()) &&
-      String(item?.role || '').toLowerCase() !== 'administrator' &&
-      String(item?.email || '').trim().toLowerCase() === email && constantTimeEqual(password, item?.password));
-    if (employee) {
+    const account = await findEmployeeForAuthentication({ email });
+    const employee = account?.employee;
+    if (employee && !account.deleted && employee.active !== false &&
+      !['admin','administrator'].includes(String(employee.roleKey || '').toLowerCase()) &&
+      String(employee.role || '').toLowerCase() !== 'administrator' &&
+      String(employee.email || '').trim().toLowerCase() === email &&
+      await verifyEmployeePassword(password, account.passwordHash ?? account.password)) {
       const access = await loginUser(employee);
       if (!access.assignments.length) return res.status(403).json({ error: 'No active department assignment is configured for this employee.' });
       user = { id: String(employee.id || employee.employeeId || email), email, username: employee.name || employee.employeeId || email, ...access };
@@ -108,10 +106,12 @@ export const authenticateRequest = async (req, res, next) => {
     const session = result.rows[0];
     req.user = publicUser(session);
     if (String(session.user_id) !== 'admin') {
-      const employeesResult = await getPool().query("SELECT data FROM erp_state WHERE storage_key='employees'");
-      const employees = Array.isArray(employeesResult.rows[0]?.data) ? employeesResult.rows[0].data : [];
-      const employee = employees.find((item) => String(item?.id || item?.employeeId || '').toLowerCase() === String(session.user_id).toLowerCase() && String(item?.email || '').toLowerCase() === String(session.email).toLowerCase());
-      if (!employee || employee.active === false) return res.status(401).json({ error: 'Employee account is inactive or no longer available. Sign in again or contact an administrator.' });
+      const account = await findEmployeeForAuthentication({ userId: session.user_id, email: session.email });
+      const employee = account?.employee;
+      if (!employee || account.deleted || employee.active === false ||
+          String(employee.email || '').toLowerCase() !== String(session.email).toLowerCase()) {
+        return res.status(401).json({ error: 'Employee account is inactive or no longer available. Sign in again or contact an administrator.' });
+      }
       const { assignments } = await roleStateFor(employee, session.department);
       const requestedDepartment = normalizeDepartment(req.get('x-erp-department') || session.department || assignments[0]?.department);
       const assignment = assignmentForDepartment(assignments, requestedDepartment);
@@ -161,6 +161,21 @@ export const auditSensitiveAction = async (req, { module, recordId, recordLabel 
 };
 
 authRouter.get('/me', authenticateRequest, (req, res) => res.json({ user: req.user }));
+
+/**
+ * Non-sensitive aggregate for dashboard display. It reads the authoritative
+ * PostgreSQL employee catalog without exposing employee records to roles that
+ * are not permitted to view the directory.
+ */
+authRouter.get('/employee-count', authenticateRequest, async (req, res) => {
+    if (req.user?.roleKey !== 'admin' && req.user?.role !== 'Administrator' &&
+        !hasPermissionForRole(req.user?.roleKey, ['employee.view', '*'], req.user?.rolePermissions)) {
+        return res.status(403).json({ error: 'Your selected department role does not allow employee data.' });
+    }
+    const employees = await employeeDirectoryReferences();
+    res.json({ count: employees.length });
+});
+
 authRouter.get('/audit', authenticateRequest, requireAdmin, async (req, res) => {
   const limit = Math.max(1, Math.min(Number(req.query.limit) || 200, 1000));
   const result = await getPool().query(

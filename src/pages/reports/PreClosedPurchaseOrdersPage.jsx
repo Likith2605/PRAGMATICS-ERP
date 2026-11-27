@@ -1,15 +1,26 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
 import { getPreClosedPurchaseOrderRows } from '../../utils/purchaseReportData.js';
+import { listPurchaseOrders } from '../../services/procurementIntakeApi.js';
 import { formatQuantityByUnit } from '../../utils/reportFilters.js';
 
 const qty = (value) => Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
 
 const PreClosedPurchaseOrdersPage = () => {
-  const rows = useMemo(() => getPreClosedPurchaseOrderRows(), []);
+  const [serverOrders, setServerOrders] = useState([]);
+  const [loadError, setLoadError] = useState('');
+  useEffect(() => {
+    let active = true;
+    listPurchaseOrders()
+      .then((orders) => { if (active) { setServerOrders(orders); setLoadError(''); } })
+      .catch((error) => { if (active) setLoadError(`Purchase Orders could not be loaded from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
+  }, []);
+  const rows = useMemo(() => getPreClosedPurchaseOrderRows(serverOrders), [serverOrders]);
   const suppliers = [...new Set(rows.map((row) => row.supplier).filter(Boolean))].sort();
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
+      {loadError && <div role="alert" className="form-error" style={{ marginBottom: 12 }}>{loadError}</div>}
       <ReportRegister
         title="Pre-Closed Purchase Order Report"
         subTitle="Closed POs with remaining quantity. Short-close quantity is shown only when recorded; historic closure is not inferred."

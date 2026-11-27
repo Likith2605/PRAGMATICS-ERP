@@ -21,7 +21,7 @@ globalThis.window = {
   clearTimeout: globalThis.clearTimeout.bind(globalThis),
   dispatchEvent: () => true
 };
-globalThis.fetch = async () => ({ ok: true, json: async () => ({ success: true }) });
+await import('./helpers/availability-api-stub.mjs');
 
 const W = await import('../src/utils/workflowService.js');
 const { hasPermission } = await import('../src/utils/permissions.js');
@@ -107,7 +107,7 @@ localStorage.setItem(
 
 /* --------------------------------- the flow --------------------------------- */
 section('1. Store shares the Purchase Indent');
-const indent = W.createPurchaseIndent({ soNumber: 'SO-001' });
+const indent = await W.createPurchaseIndent({ soNumber: 'SO-001' });
 check(Boolean(indent.indentNumber), `indent created (${indent.indentNumber})`);
 check(indent.status === W.INDENT_STATUS.DRAFT, 'a fresh indent is a Draft');
 
@@ -159,8 +159,8 @@ check(
   'approval written to the indent history'
 );
 check(
-  ls('storeAuditLog', []).some((a) => a.action === 'PURCHASE INDENT APPROVED BY ADMIN'),
-  'approval written to the audit log'
+  !ls('storeAuditLog', []).some((a) => a.action === 'PURCHASE INDENT APPROVED BY ADMIN'),
+  'approval audit is not treated as a browser-local authoritative record'
 );
 
 const approvedNote = notifications().find(

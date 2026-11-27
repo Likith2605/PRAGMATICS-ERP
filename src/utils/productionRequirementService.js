@@ -23,6 +23,7 @@ import { generateSequentialNumber, saveSequenceCounter } from './storeSequencer.
 import { deleteWorkflowDocument } from './workflowFiles.js';
 import { hasPermission, getCurrentUserInfo, getCurrentDepartment, isAdmin } from './permissions.js';
 import { getIndents, createPurchaseIndent, INDENT_STATUS } from './workflowService.js';
+import { getCachedRequirements, cacheRequirements } from '../services/productionAuthorityCache.js';
 
 const REQ_KEY = 'productionRequirements';
 const REQ_SEQ_KEY = 'productionRequirementSequence';
@@ -44,8 +45,14 @@ const STORE_REVIEW_LINK = (no) => `/store/item-requirements?req=${encodeURICompo
 
 /* ------------------------------ low level helpers ------------------------------ */
 
-const getList = (key) => readLS(key, []);
-const saveList = (key, list) => writeLS(key, list);
+const getList = (key) => key === REQ_KEY ? getCachedRequirements() : readLS(key, []);
+const saveList = (key, list) => {
+  if (key === REQ_KEY) {
+    cacheRequirements(list);
+    return;
+  }
+  writeLS(key, list);
+};
 
 const currentUser = () => {
   const info = getCurrentUserInfo();
@@ -103,7 +110,8 @@ const requireStore = (perm, message) => {
 };
 
 export const ensureRequirementsSeeded = () => {
-  if (!localStorage.getItem(REQ_KEY)) localStorage.setItem(REQ_KEY, '[]');
+  // PostgreSQL hydration is authoritative. This legacy helper intentionally
+  // creates no browser business snapshot.
 };
 
 /* ------------------------------ line normalisation ------------------------------ */
@@ -268,8 +276,8 @@ export const getRequirementsForSO = (soNumber) =>
 export const getRequirementsForJobCard = (jobCardNumber) =>
   getRequirements().filter((r) => String(r.jobCardNumber || '') === String(jobCardNumber));
 
-export const getRequirementsAwaitingStoreReview = () =>
-  getRequirements().filter((r) => r.status === REQUIREMENT_STATUS.PENDING_REVIEW);
+export const getRequirementsAwaitingStoreReview = (records = getRequirements()) =>
+  records.filter((r) => r.status === REQUIREMENT_STATUS.PENDING_REVIEW);
 
 export const createRequirement = ({
   projectId = '',
@@ -561,7 +569,7 @@ export const createIndentFromRequirement = ({
   });
   if (!built.length) deny('No lines with quantity to indent.');
 
-  const indent = createPurchaseIndent({
+  const indentResult = createPurchaseIndent({
     soNumber: rec.soNumber || '',
     reason: reason || `Shortage from Production Requirement ${requirementNumber}`,
     remarks,
@@ -574,9 +582,10 @@ export const createIndentFromRequirement = ({
       projectId: rec.projectId,
       customer: rec.customer,
       source: 'Production Requirement Shortage'
-    }
+    },
+    persistToPostgres: typeof window !== 'undefined' && Boolean(window.document)
   });
-
+  const finish = (indent) => {
   const updated = {
     ...rec,
     indentNumbers: Array.from(new Set([...(rec.indentNumbers || []), indent.indentNumber])),
@@ -600,6 +609,8 @@ export const createIndentFromRequirement = ({
   });
 
   return indent;
+  };
+  return indentResult?.then ? indentResult.then(finish) : finish(indentResult);
 };
 
 /* ------------------------------ status transitions ------------------------------ */
@@ -683,8 +694,7 @@ export const getRequirementIndents = (requirementNumber) =>
     }));
 
 /** Compact counts used by dashboards. */
-export const getRequirementSummary = () => {
-  const all = getRequirements();
+export const getRequirementSummary = (all = getRequirements()) => {
   return {
     total: all.length,
     drafts: all.filter((r) => r.status === REQUIREMENT_STATUS.DRAFT).length,

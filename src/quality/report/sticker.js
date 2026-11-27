@@ -1,4 +1,5 @@
 ﻿import { COMPANY_NAME } from "../config.js";
+import { getCompanyLegalName } from "../../utils/companyBranding.js";
 import QRCode from "qrcode";
 import { QUALITY_REPORT_FOOTER } from "./footer.js";
 function esc(value) {
@@ -36,7 +37,7 @@ async function buildDispatchQrSvg(d) {
   });
 }
 function buildStickerHtml(d, qrSvg = "", company = {}, logoUri = "") {
-  const companyName = company.companyName || COMPANY_NAME;
+  const companyName = company.companyName || getCompanyLegalName() || COMPANY_NAME;
   const rows = [
     ["Purchase Order No", d.po_no],
     ["Serial No", d.dispatch_no],

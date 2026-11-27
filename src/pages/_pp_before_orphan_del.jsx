@@ -6,6 +6,7 @@ import { getFullProjectData, getProjectNameForId } from '../utils/projectTracker
 import { hasPermission, getMyEmployeeId, isRole } from '../utils/permissions.js';
 
 import { normalizeRouteCard, routeCardBlank, emptyProcess, formatDateDMY } from '../utils/routeCard.js';
+import { listJobCards } from '../services/productionApi.js';
 import WorkflowNavigator from '../components/WorkflowNavigator.jsx';
 import MaterialStatusPanel from '../components/MaterialStatusPanel.jsx';
 import ProjectIdAutocomplete from '../components/ProjectIdAutocomplete.jsx';
@@ -113,14 +114,13 @@ const ProductionPage = () => {
     return jobCards.filter((j) => j.assignedToEmpId === myEmpId);
   }, [jobCards, isProdEmployee, myEmpId]);
 
-  // Load from localStorage
+  // Load PostgreSQL-authoritative Job Cards.
   useEffect(() => {
-    try {
-      const storedJC = localStorage.getItem('productionJobCards');
-      setJobCards(storedJC ? JSON.parse(storedJC) : []);
-    } catch {
-      setJobCards([]);
-    }
+    let active = true;
+    listJobCards()
+      .then((rows) => { if (active) setJobCards(rows); })
+      .catch(() => { if (active) setJobCards([]); });
+    return () => { active = false; };
 
     try {
       const storedSO = localStorage.getItem('salesOrderHistory');
@@ -264,7 +264,6 @@ const ProductionPage = () => {
 
   const saveJobCardsToStorage = (updated) => {
     setJobCards(updated);
-    localStorage.setItem('productionJobCards', JSON.stringify(updated));
   };
 
   const handleSelectSalesOrder = (soRef) => {

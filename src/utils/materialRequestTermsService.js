@@ -36,10 +36,19 @@ export const TERMS_SOURCE = {
   SALES_ORDER: 'Sales Order'
 };
 
-const buildInventoryIndex = () => {
+const normalizeInventoryItem = (item = {}) => ({
+  ...(item.payload || {}),
+  ...item,
+  itemCode: norm(item.itemCode || item.item_code || item.payload?.itemCode),
+  itemName: norm(item.itemName || item.material_name || item.payload?.itemName),
+  unit: norm(item.unit || item.payload?.unit || 'Nos'),
+  currentQty: num(item.currentQty ?? item.current_qty ?? item.payload?.currentQty)
+});
+
+const buildInventoryIndex = (inventory = getInventoryItems()) => {
   const byCode = new Map();
   const byName = new Map();
-  (getInventoryItems() || []).forEach((it) => {
+  (inventory || []).map(normalizeInventoryItem).forEach((it) => {
     if (!it) return;
     const code = norm(it.itemCode).toLowerCase();
     const name = norm(it.itemName).toLowerCase();
@@ -64,8 +73,8 @@ const matchInventory = (idx, { itemCode, itemName }) => {
  *   with no job card) — never another Job Card's lists.
  * - Cancelled lists are ignored.
  */
-const requirementsFor = (so, jc) =>
-  getRequirements().filter((r) => {
+const requirementsFor = (so, jc, requirements = getRequirements()) =>
+  requirements.filter((r) => {
     if (!r) return false;
     if (norm(r.status) === REQUIREMENT_STATUS.CANCELLED) return false;
     const rSO = norm(r.soNumber);
@@ -83,15 +92,19 @@ const requirementsFor = (so, jc) =>
  *   description, specification, size, purpose, unit, termsRequiredQty, sourceType,
  *   sourceRef, source, inMaster}>}
  */
-export const getTermsRequirementLines = ({ salesOrderId = '', jobCardNumber = '' } = {}) => {
+export const getTermsRequirementLines = ({
+  salesOrderId = '',
+  jobCardNumber = '',
+  sourceData
+} = {}) => {
   const so = norm(salesOrderId);
   const jc = norm(jobCardNumber);
   if (!so && !jc) return [];
 
-  const idx = buildInventoryIndex();
+  const idx = buildInventoryIndex(sourceData?.inventory);
   const rows = [];
 
-  requirementsFor(so, jc).forEach((rec) => {
+  requirementsFor(so, jc, sourceData?.requirements).forEach((rec) => {
     (rec.items || []).forEach((line) => {
       const inv = matchInventory(idx, { itemCode: line.itemCode, itemName: line.itemName });
       rows.push({
@@ -117,7 +130,9 @@ export const getTermsRequirementLines = ({ salesOrderId = '', jobCardNumber = ''
   /* Fallback: nothing on the requirement lists → use the Sales Order's own
      Ordered Items (only the ones that exist in the Item Master). */
   if (rows.length === 0 && so) {
-    const soRec = getSalesOrderByRef(so);
+    const soRec = Array.isArray(sourceData?.salesOrders)
+      ? sourceData.salesOrders.find((row) => String(row.reference || row.salesOrderRef || '') === so)
+      : getSalesOrderByRef(so);
     (soRec?.payload?.items || []).forEach((line, i) => {
       const inv = matchInventory(idx, { itemCode: line.itemCode, itemName: line.itemName });
       if (!inv) return; /* not in the Item Master → cannot be requested (spec §10) */
@@ -165,8 +180,19 @@ export const getTermsRequirementLines = ({ salesOrderId = '', jobCardNumber = ''
  *
  * @returns {{requested: Object.<string, number>, issued: Object.<string, number>}}
  */
-export const getScopeQtyMaps = ({ salesOrderRef = '', jobCardNumber = '', excludeMrNumber = '' } = {}) =>
-  getMRScopeQtyMaps({ salesOrderRef, jobCardNumber, excludeMrNumber });
+export const getScopeQtyMaps = ({
+  salesOrderRef = '',
+  jobCardNumber = '',
+  excludeMrNumber = '',
+  sourceData
+} = {}) =>
+  getMRScopeQtyMaps({
+    salesOrderRef,
+    jobCardNumber,
+    excludeMrNumber,
+    requests: sourceData?.requests,
+    issues: sourceData?.issues
+  });
 
 /**
  * Terms & Requirement lines + live quantity projection used by the
@@ -178,8 +204,13 @@ export const getScopeQtyMaps = ({ salesOrderRef = '', jobCardNumber = '', exclud
  *   `excludeMrNumber` must be set while EDITING an existing Material Request
  *   so its own quantities are not counted against itself.
  */
-export const getMaterialRequestLines = ({ salesOrderId = '', jobCardNumber = '', excludeMrNumber = '' } = {}) => {
-  const lines = getTermsRequirementLines({ salesOrderId, jobCardNumber });
+export const getMaterialRequestLines = ({
+  salesOrderId = '',
+  jobCardNumber = '',
+  excludeMrNumber = '',
+  sourceData
+} = {}) => {
+  const lines = getTermsRequirementLines({ salesOrderId, jobCardNumber, sourceData });
   if (lines.length === 0) return [];
 
   const scope = {
@@ -187,8 +218,8 @@ export const getMaterialRequestLines = ({ salesOrderId = '', jobCardNumber = '',
     jobCardNumber: norm(jobCardNumber),
     excludeMrNumber: norm(excludeMrNumber)
   };
-  const { requested, issued } = getScopeQtyMaps(scope);
-  const invIdx = buildInventoryIndex();
+  const { requested, issued } = getScopeQtyMaps({ ...scope, sourceData });
+  const invIdx = buildInventoryIndex(sourceData?.inventory);
 
   return lines.map((ln) => {
     const key = (ln.materialId || ln.itemCode || ln.itemName).toLowerCase();

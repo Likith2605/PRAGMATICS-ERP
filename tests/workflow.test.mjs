@@ -30,6 +30,7 @@ globalThis.window = {
   fetch: async () => ({ ok: true, json: async () => ({ success: true }) }),
   dispatchEvent: () => true
 };
+await import('./helpers/availability-api-stub.mjs');
 
 const W = await import('../src/utils/workflowService.js');
 const V = await import('../src/utils/vendorMaster.js');
@@ -197,7 +198,7 @@ check(preview.lines.length === 3, 'availability preview returns 3 lines');
 check(preview.lines[0].status === 'Available' && preview.lines[0].availableQty === 50, 'RAW-001 fully available (50 of 100)');
 check(preview.lines[1].status === 'Purchase Required' && preview.lines[1].shortageQty === 20, 'RAW-002 shortage 20 (absent from stock)');
 check(preview.lines[2].shortageQty === 5, 'RAW-003 shortage 5 (15 required vs 10 stock)');
-const check1 = W.saveMaterialAvailabilityCheck({ soNumber: 'SO-001', remarks: 'Shortage confirmed' });
+const check1 = await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-001', remarks: 'Shortage confirmed' });
 check(check1.status === 'Checked' && check1.lines.length === 3, 'availability check saved');
 check(W.getSalesOrdersAwaitingCheck().length === 2, 'SO-002 and SO-003 still awaiting check');
 
@@ -500,13 +501,13 @@ check(so1.indents.length === 1 && so1.indents[0].poNumber === 'PO-001', 'SO-001 
 
 section('12. Fully available order (no indent possible)');
 loginAs('Store Department', 'store_manager', 'Suresh Store');
-const check2 = W.saveMaterialAvailabilityCheck({ soNumber: 'SO-002' });
+const check2 = await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-002' });
 check(check2.lines.every((l) => l.status === 'Available'), 'SO-002 fully available');
 expectThrows(() => W.createPurchaseIndent({ soNumber: 'SO-002' }), /No materials with shortage/, 'indent blocked when nothing is short');
 check(W.getSalesOrderMaterialStatus('SO-002').overallStatus === 'COMPLETED', 'SO-002 → COMPLETED');
 const readyNotifsSo2 = notifications().filter((n) => n.title === 'Materials ready for production' && n.reference === 'SO-002');
 check(readyNotifsSo2.length === 1, 'Production notified once that SO-002 materials are ready');
-W.saveMaterialAvailabilityCheck({ soNumber: 'SO-002' });
+await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-002' });
 check(
   notifications().filter((n) => n.title === 'Materials ready for production' && n.reference === 'SO-002').length === 1,
   'ready notification not duplicated on re-check'
@@ -515,7 +516,7 @@ check(
 section('13. Purchased order completing end-to-end (SO-003)');
 loginAs('Store Department', 'store_manager', 'Suresh Store');
 check(W.getSalesOrderMaterialStatus('SO-003').overallStatus === 'MATERIALS PENDING', 'SO-003 pending before purchase');
-W.saveMaterialAvailabilityCheck({ soNumber: 'SO-003' });
+await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-003' });
 const indent3 = W.createPurchaseIndent({ soNumber: 'SO-003' });
 W.submitPurchaseIndent(indent3.indentNumber);
 loginAs('Purchase Department', 'purchase_manager', 'Meena Purchase');
@@ -636,7 +637,7 @@ localStorage.setItem(
 );
 
 loginAs('Store Department', 'store_manager', 'Suresh Store');
-W.saveMaterialAvailabilityCheck({ soNumber: 'SO-004' });
+await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-004' });
 const indent4 = W.createPurchaseIndent({ soNumber: 'SO-004' });
 W.submitPurchaseIndent(indent4.indentNumber);
 loginAs('Purchase Department', 'purchase_manager', 'Meena Purchase');
@@ -909,10 +910,10 @@ try {
 }
 check(/not found|does not exist|not found/i.test(enqErr), `vendor enquiry rejects an unknown indent → "${enqErr}"`);
 
-const enquiryVendorMaster = V.addVendorToMaster({
+const enquiryVendorMaster = await V.addVendorToMaster({
   name: 'Precision Bearings Ltd', product: 'Test', contactPerson: 'Precision Contact', email: 'precision@example.test'
 });
-const alternateVendorMaster = V.addVendorToMaster({
+const alternateVendorMaster = await V.addVendorToMaster({
   name: 'Alternate Bearings Ltd', product: 'Test', email: 'alternate@example.test'
 });
 const enquiry = S.createVendorEnquiry({
@@ -1250,7 +1251,7 @@ localStorage.setItem(
   ])
 );
 loginAs('Store Department', 'store_manager', 'Suresh Store');
-W.saveMaterialAvailabilityCheck({ soNumber: 'SO-Q900', remarks: 'Shortage confirmed for quotation flow test' });
+await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-Q900', remarks: 'Shortage confirmed for quotation flow test' });
 const qIndent = W.createPurchaseIndent({ soNumber: 'SO-Q900', reason: 'Vendor quotation flow test' });
 check(Boolean(qIndent?.indentNumber), `purchase indent raised for the quotation flow (${qIndent?.indentNumber})`);
 check(qIndent.projectId === 'PRJ-1001', 'the indent carries the Project ID used later by the PO');

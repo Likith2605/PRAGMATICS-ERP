@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import AddableSelect from '../components/AddableSelect.jsx';
 import { DEFAULT_UNITS } from '../utils/addableMasters.js';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -8,15 +8,16 @@ import { calculateLineAmount, calculateGSTAmount, calculateTotals } from '../uti
 import { numberToWords } from '../utils/numberToWords.js';
 import { amountInWords as wordsFor, convertToINR, CURRENCIES, getCurrency, isForeignCurrency, money, moneyPlain } from '../utils/currency.js';
 import { generateQuotationPDF } from '../services/pdfGenerator.js';
-import { getNextSequentialNumber, saveDocSequence } from '../utils/sequenceGenerator.js';
 import { getAllProjectsSummary, getFullProjectData } from '../utils/projectTracker.js';
-import { getMasterCustomerList } from '../utils/customerMaster.js';
+import { listMasters } from '../services/masterApi.js';
 import { getInvoiceBillTo, getInvoiceShipTo, makeInvoiceAddress } from '../utils/invoiceAddresses.js';
 import { pushNotification, appendAuditLog } from '../utils/storeService.js';
 import WorkflowNavigator from '../components/WorkflowNavigator.jsx';
 import ProjectIdAutocomplete from '../components/ProjectIdAutocomplete.jsx';
 import ReportRegister from '../components/ReportRegister.jsx';
 import AdvanceRegister from '../components/AdvanceRegister.jsx';
+import { isAdmin } from '../utils/auth.js';
+import { listCustomerInvoices, reserveNextCustomerInvoiceNumber, createCustomerInvoice, updateCustomerInvoice, deleteCustomerInvoice, getCustomerInvoiceMigrationPreview, importMissingCustomerInvoices } from '../services/customerInvoiceApi.js';
 
 const parseINR = (v) => Number(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
 
@@ -31,8 +32,14 @@ const invReceivedINR = (row) => {
   const stored = Number(row?.receivedINR);
   if (Number.isFinite(stored) && stored > 0) return stored;
   if (invCurrency(row) !== 'INR') return Number(row?.payload?.receivedINR) || 0;
-  return parseINR(row?.status === 'Paid' ? row?.total : row?.amountReceived);
+  return parseINR(row?.amountReceived);
 };
+const invAdvanceINR = (row) => Number(
+  row?.advanceAdjustedINR ??
+  row?.payload?.advanceAdjustedINR ??
+  row?.payload?.invoiceDetails?.advanceAdjustedINR ??
+  row?.payload?.invoiceDetails?.advanceAdjusted
+) || 0;
 const invBalanceINR = (row) => {
   const stored = Number(row?.balanceINR);
   if (Number.isFinite(stored) && stored > 0) return stored;
@@ -43,9 +50,7 @@ const invTotalCell = (row) =>
   isForeignCurrency(invCurrency(row)) ? row?.total || '' : invTotalINR(row).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 const invReceivedCell = (row) =>
   isForeignCurrency(invCurrency(row))
-    ? row?.status === 'Paid'
-      ? row?.total || ''
-      : row?.amountReceived || ''
+    ? row?.amountReceived || ''
     : invReceivedINR(row).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 const invBalanceCell = (row) =>
   isForeignCurrency(invCurrency(row))
@@ -53,10 +58,6 @@ const invBalanceCell = (row) =>
       ? '0.00'
       : row?.balanceDue || ''
     : invBalanceINR(row).toLocaleString('en-IN', { maximumFractionDigits: 2 });
-
-const generateInvoiceNumber = () => {
-  return getNextSequentialNumber('INV', 'customerInvoiceSequence', 'customerInvoiceHistory', 'reference');
-};
 
 const emptyItem = {
   itemCode: '',
@@ -70,11 +71,10 @@ const emptyItem = {
   gst: '18'
 };
 
-const masterCustomers = getMasterCustomerList();
 const normalizeCustomerName = (name) => String(name || '').trim().replace(/\s+/g, ' ').toLowerCase();
 const addressesMatch = (left, right) =>
   Object.keys(left).every((key) => left[key] === right[key]);
-const findExactMasterCustomer = (name) => {
+const findExactMasterCustomer = (name, masterCustomers) => {
   const normalized = normalizeCustomerName(name);
   if (!normalized) return null;
   return masterCustomers.find((customer) =>
@@ -122,12 +122,20 @@ const CustomerInvoicePage = () => {
 
   const [mode, setMode] = useState('list'); // 'list' | 'create' | 'view'
   const [history, setHistory] = useState([]);
+  const [masterCustomers, setMasterCustomers] = useState([]);
+  const [customerMasterError, setCustomerMasterError] = useState('');
+  const [historyError, setHistoryError] = useState('');
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [selectedInvoice, setSelectedInvoice] = useState(null);
+  const [editingInvoice, setEditingInvoice] = useState(null);
+  const [migrationPreview, setMigrationPreview] = useState(null);
+  const [migrationSelection, setMigrationSelection] = useState(new Set());
+  const [migrationBusy, setMigrationBusy] = useState(false);
   const [reportTab, setReportTab] = useState('invoices'); // 'invoices' | 'sales' | 'receivables' | 'advances'
 
   // Form states
   const [invoiceDetails, setInvoiceDetails] = useState({
-    invoiceNumber: generateInvoiceNumber(),
+    invoiceNumber: '',
     invoiceDate: new Date().toISOString().slice(0, 10),
     dueDate: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
     quotationRef: '',
@@ -140,6 +148,8 @@ const CustomerInvoicePage = () => {
     paymentTerms: 'Net 30 Days',
     paymentStatus: 'Pending', // 'Pending' | 'Partial' | 'Paid'
     amountReceived: '',
+    advanceAdjusted: 0,
+    advanceAdjustedINR: 0,
     discount: '',
     currency: 'INR',
     exchangeRate: '',
@@ -149,6 +159,7 @@ const CustomerInvoicePage = () => {
     notes: '',
     termsAndConditions: ''
   });
+  const numberReservationInFlight = useRef(false);
 
   const [customerDetails, setCustomerDetails] = useState({
     customerName: '',
@@ -171,7 +182,7 @@ const CustomerInvoicePage = () => {
   };
 
   const handleCustomerNameChange = (name) => {
-    const master = findExactMasterCustomer(name);
+    const master = findExactMasterCustomer(name, masterCustomers);
     if (master) {
       const details = customerDetailsFromMaster(master);
       applyCustomerDetails(details);
@@ -213,36 +224,37 @@ const CustomerInvoicePage = () => {
   const updateShipTo = (field, value) =>
     setShipTo((previous) => ({ ...previous, [field]: value }));
 
-  const [companyDetails, setCompanyDetails] = useState(() => {
-    try {
-      const stored = localStorage.getItem('companySettings');
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    const profile = getCompanyProfile();
-    return {
-      companyName: profile.companyName || '',
-      phone: profile.phone || '',
-      email: profile.email || '',
-      address: profile.address || '',
-      gstin: profile.gstin || '',
-      state: profile.state || ''
-    };
-  });
+  const [companyDetails, setCompanyDetails] = useState(() => getCompanyProfile());
 
   const [items, setItems] = useState([{ ...emptyItem }]);
 
-  // Load history from localStorage
+  // Invoice history and receivable source rows are loaded from PostgreSQL.
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem('customerInvoiceHistory');
-      setHistory(stored ? JSON.parse(stored) : []);
-    } catch {
-      setHistory([]);
-    }
+    let active = true;
+    listCustomerInvoices().then((records) => { if (active) { setHistory(records); setHistoryError(''); } })
+      .catch((error) => { if (active) setHistoryError(`Could not load Customer Invoices from PostgreSQL: ${error.message}`); })
+      .finally(() => { if (active) setHistoryLoading(false); });
+    return () => { active = false; };
   }, []);
+  useEffect(() => {
+    if (mode !== 'create' || invoiceDetails.invoiceNumber || numberReservationInFlight.current) return;
+    numberReservationInFlight.current = true;
+    reserveNextCustomerInvoiceNumber(new Date().toISOString().slice(0, 10))
+      .then(({ invoiceNumber }) => setInvoiceDetails((previous) => previous.invoiceNumber ? previous : { ...previous, invoiceNumber }))
+      .catch((error) => setHistoryError(`Could not reserve an invoice number from PostgreSQL: ${error.message}`))
+      .finally(() => { numberReservationInFlight.current = false; });
+  }, [mode, location.state]);
 
   const [projectSummaryList, setProjectSummaryList] = useState([]);
   const [projectAutoLinkMsg, setProjectAutoLinkMsg] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    listMasters('customers')
+      .then((records) => { if (active) { setMasterCustomers(records); setCustomerMasterError(''); } })
+      .catch((error) => { if (active) { setMasterCustomers([]); setCustomerMasterError(`Customer Master could not be loaded from PostgreSQL: ${error.message}`); } });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     setProjectSummaryList(getAllProjectsSummary());
@@ -257,8 +269,8 @@ const CustomerInvoicePage = () => {
 
     const data = directData || getFullProjectData(pid);
     if (data && (data.customerDetails?.customerName || data.customerDetails?.companyName || (data.items && data.items.length > 0))) {
-      const master = findExactMasterCustomer(data.customerDetails?.companyName) ||
-        findExactMasterCustomer(data.customerDetails?.customerName);
+      const master = findExactMasterCustomer(data.customerDetails?.companyName, masterCustomers) ||
+        findExactMasterCustomer(data.customerDetails?.customerName, masterCustomers);
       const resolvedCustomer = master
         ? customerDetailsFromMaster(master, data.customerDetails)
         : data.customerDetails;
@@ -289,7 +301,7 @@ const CustomerInvoicePage = () => {
   useEffect(() => {
     if (location.state?.fromQuotation && location.state?.quotation) {
       const q = location.state.quotation;
-      const invNum = location.state.invoiceNumber || generateInvoiceNumber();
+      const invNum = location.state.invoiceNumber || '';
 
       setInvoiceDetails({
         invoiceNumber: invNum,
@@ -319,7 +331,7 @@ const CustomerInvoicePage = () => {
     } else if (location.state?.fromSalesOrder && location.state?.salesOrder) {
       const so = location.state.salesOrder;
       setInvoiceDetails({
-        invoiceNumber: generateInvoiceNumber(),
+        invoiceNumber: '',
         invoiceDate: new Date().toISOString().slice(0, 10),
         dueDate: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
         quotationRef: so.soDetails?.quotationRef || '',
@@ -346,7 +358,7 @@ const CustomerInvoicePage = () => {
     } else if (location.state?.fromDeliveryChallan && location.state?.deliveryChallan) {
       const dc = location.state.deliveryChallan;
       setInvoiceDetails({
-        invoiceNumber: generateInvoiceNumber(),
+        invoiceNumber: '',
         invoiceDate: new Date().toISOString().slice(0, 10),
         dueDate: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
         quotationRef: dc.dcDetails?.customerPoRef || '',
@@ -380,7 +392,7 @@ const CustomerInvoicePage = () => {
     } else if (location.state?.fromJobCard && location.state?.jobCard) {
       const jc = location.state.jobCard;
       setInvoiceDetails({
-        invoiceNumber: generateInvoiceNumber(),
+        invoiceNumber: '',
         invoiceDate: new Date().toISOString().slice(0, 10),
         dueDate: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
         quotationRef: '',
@@ -470,8 +482,9 @@ const CustomerInvoicePage = () => {
   const balanceDue = useMemo(() => {
     const grandTotal = Number(totals.grandTotal) || 0;
     const received = Number(invoiceDetails.amountReceived) || 0;
-    return Math.max(0, grandTotal - received);
-  }, [totals.grandTotal, invoiceDetails.amountReceived]);
+    const advanceAdjusted = Number(invoiceDetails.advanceAdjusted) || 0;
+    return Math.max(0, grandTotal - received - advanceAdjusted);
+  }, [totals.grandTotal, invoiceDetails.amountReceived, invoiceDetails.advanceAdjusted]);
 
   const handleFieldChange = (index, field, value) => {
     setItems((prev) => {
@@ -481,7 +494,24 @@ const CustomerInvoicePage = () => {
     });
   };
 
-  const handleSaveInvoice = (e) => {
+  const previewLegacyInvoices = async () => {
+    setMigrationBusy(true);
+    try { setMigrationPreview(await getCustomerInvoiceMigrationPreview()); setMigrationSelection(new Set()); setHistoryError(''); }
+    catch (error) { setHistoryError(`Could not preview legacy invoices: ${error.message}`); }
+    finally { setMigrationBusy(false); }
+  };
+  const importSelectedInvoices = async () => {
+    setMigrationBusy(true);
+    try {
+      const selected = migrationPreview.eligible.filter((record) => migrationSelection.has(record.number));
+      const result = await importMissingCustomerInvoices(selected.map((record) => record.payload));
+      setHistory(await listCustomerInvoices()); setMigrationPreview(null);
+      setHistoryError(result.conflicts.length ? `${result.imported.length} imported; ${result.conflicts.length} conflicts remain unchanged.` : `${result.imported.length} legacy invoices imported.`);
+    } catch (error) { setHistoryError(`Invoice import was not confirmed: ${error.message}`); }
+    finally { setMigrationBusy(false); }
+  };
+
+  const handleSaveInvoice = async (e) => {
     e.preventDefault();
     if (!String(billTo.name || customerDetails.companyName || customerDetails.customerName || '').trim()) {
       alert('Please provide Customer Name.');
@@ -515,40 +545,21 @@ const CustomerInvoicePage = () => {
     };
 
     try {
-      const stored = localStorage.getItem('customerInvoiceHistory');
-      let current = stored ? JSON.parse(stored) : [];
-      const entry = {
-        date: invoiceDetails.invoiceDate,
-        reference: invoiceDetails.invoiceNumber,
-        quotationRef: invoiceDetails.quotationRef || '-',
-        company: billTo.name || customerDetails.companyName || customerDetails.customerName || '-',
-        total: money(totals.grandTotal, currencyCode),
-        amountReceived: money(Number(invoiceDetails.amountReceived) || 0, currencyCode),
-        balanceDue: money(balanceDue, currencyCode),
-        currency: currencyCode,
-        amountINR: totalINR,
-        receivedINR,
-        balanceINR,
-        status: invoiceDetails.paymentStatus || 'Pending',
-        payload
-      };
-
-      const existingIndex = current.findIndex((h) => h.reference === entry.reference);
-      if (existingIndex !== -1) {
-        current[existingIndex] = entry;
-      } else {
-        current.unshift(entry);
-      }
-      saveDocSequence('customerInvoiceSequence', invoiceDetails.invoiceNumber);
-      localStorage.setItem('customerInvoiceHistory', JSON.stringify(current));
+      const saved = editingInvoice
+        ? await updateCustomerInvoice(editingInvoice.reference, payload, editingInvoice.version)
+        : await createCustomerInvoice(payload, globalThis.crypto?.randomUUID?.() || `ci-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const record = saved.record;
+      const current = [record, ...history.filter((row) => row.reference !== record.reference)];
       setHistory(current);
-      setSelectedInvoice(payload);
+      setEditingInvoice(null);
+      setSelectedInvoice(record.payload);
       setMode('view');
 
       appendAuditLog({ action: 'INVOICE CREATED', reference: invoiceDetails.invoiceNumber, details: `Customer: ${customerDetails.customerName} | Amount: ${money(totals.grandTotal, currencyCode)}` });
       pushNotification({ title: 'New Customer Invoice', message: `Invoice ${invoiceDetails.invoiceNumber} created for ${customerDetails.customerName || customerDetails.companyName}. Amount: ${money(totals.grandTotal, currencyCode)}.`, type: 'info', reference: invoiceDetails.invoiceNumber, targetDept: 'Accounts Department' });
     } catch (err) {
-      console.error('Failed to save invoice', err);
+      setHistoryError(err.message || 'Invoice save was not confirmed by PostgreSQL.');
+      alert(err.message || 'Invoice save was not confirmed by PostgreSQL.');
     }
   };
 
@@ -608,11 +619,13 @@ const CustomerInvoicePage = () => {
               Back to Invoices
             </button>
           ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+            {isAdmin() && <button type="button" className="button-secondary" onClick={previewLegacyInvoices} disabled={migrationBusy}>Review Legacy Data</button>}
             <button
               className="button-primary"
               onClick={() => {
                 setInvoiceDetails({
-                  invoiceNumber: generateInvoiceNumber(),
+                  invoiceNumber: '',
                   invoiceDate: new Date().toISOString().slice(0, 10),
                   dueDate: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
                   quotationRef: '',
@@ -642,11 +655,12 @@ const CustomerInvoicePage = () => {
                 });
                 setBillTo(makeInvoiceAddress());
                 setShipTo(makeInvoiceAddress());
+                setEditingInvoice(null);
                 setMode('create');
               }}
             >
               + Create Invoice
-            </button>
+            </button></div>
           )}
         </div>
       </div>
@@ -660,6 +674,16 @@ const CustomerInvoicePage = () => {
       )}
 
       <div className="content-block">
+        {historyError && <div role="alert" className="alert alert-error">{historyError}</div>}
+        {customerMasterError && <div role="alert" className="alert alert-error">{customerMasterError}</div>}
+        {migrationPreview && isAdmin() && mode === 'list' && <section className="content-block" aria-label="Legacy invoice migration preview">
+          <h2>Legacy Customer Invoice Migration Preview</h2>
+          <p>Eligible: {migrationPreview.counts.eligible}; existing: {migrationPreview.counts.existing}; conflicts: {migrationPreview.counts.conflicts}; deleted IDs blocked: {migrationPreview.counts.deleted}.</p>
+          {migrationPreview.eligible.map((record) => <label key={record.number} style={{ display: 'block', padding: 4 }}><input type="checkbox" checked={migrationSelection.has(record.number)} onChange={(event) => setMigrationSelection((current) => { const next = new Set(current); if (event.target.checked) next.add(record.number); else next.delete(record.number); return next; })} /> {record.number} · {record.payload?.billTo?.name || record.payload?.customerDetails?.companyName || ''}</label>)}
+          {[...migrationPreview.conflicts, ...migrationPreview.deleted].map((record,index) => <p key={`${record.number}-${index}`}>{record.number}: {record.reason || 'Previously deleted; import blocked.'}</p>)}
+          <button type="button" className="button-primary" disabled={migrationBusy || !migrationSelection.size} onClick={importSelectedInvoices}>Import Selected</button>{' '}
+          <button type="button" className="button-secondary" onClick={() => setMigrationPreview(null)}>Close Preview</button>
+        </section>}
         {mode === 'list' && (
           <>
             <div className="tab-nav report-tabs">
@@ -705,7 +729,7 @@ const CustomerInvoicePage = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {history.length > 0 ? (
+                  {historyLoading ? <tr><td colSpan="7" className="no-history-row">Loading invoices from PostgreSQL…</td></tr> : history.length > 0 ? (
                     history.map((inv, idx) => {
                       const invoicePayload = inv.payload || {};
                       const invoiceProject = invoicePayload.invoiceDetails?.projectId;
@@ -742,11 +766,17 @@ const CustomerInvoicePage = () => {
                                 setShipTo(getInvoiceShipTo(p));
                                 setCompanyDetails(p.companyDetails);
                                 setItems(p.items);
+                                setEditingInvoice(inv);
                                 setMode('create');
                               }}
                             >
                               Edit
                             </button>
+                            {isAdmin() && <button type="button" className="button-small button-delete" onClick={async () => {
+                              if (!window.confirm(`Move invoice ${inv.reference} to the Recycle Bin?`)) return;
+                              try { await deleteCustomerInvoice(inv.reference, inv.version, 'Admin deletion'); setHistory(await listCustomerInvoices()); }
+                              catch (error) { setHistoryError(`Invoice delete was not confirmed: ${error.message}`); }
+                            }}>Delete</button>}
                           </div>
                         </td>
                       </tr>
@@ -778,6 +808,7 @@ const CustomerInvoicePage = () => {
                   { key: 'company', label: 'Customer / Company' },
                   { key: 'gt', label: 'Gross Total (INR)', align: 'right', render: invTotalCell },
                   { key: 'received', label: 'Received (INR)', align: 'right', render: invReceivedCell },
+                  { key: 'advance', label: 'Advance Applied (INR)', align: 'right', render: (r) => invAdvanceINR(r).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
                   { key: 'bal', label: 'Balance Due (INR)', align: 'right', render: invBalanceCell },
                 ]}
                 rows={history}
@@ -785,6 +816,7 @@ const CustomerInvoicePage = () => {
                 totals={[
                   { colKey: 'gt', render: (rs) => rs.reduce((a, r) => a + invTotalINR(r), 0) },
                   { colKey: 'received', render: (rs) => rs.reduce((a, r) => a + invReceivedINR(r), 0) },
+                  { colKey: 'advance', render: (rs) => rs.reduce((a, r) => a + invAdvanceINR(r), 0) },
                   { colKey: 'bal', render: (rs) => rs.reduce((a, r) => a + invBalanceINR(r), 0) }
                 ]}
               />
@@ -802,6 +834,7 @@ const CustomerInvoicePage = () => {
                   { key: 'company', label: 'Customer / Company' },
                   { key: 'gt', label: 'Invoice Total (INR)', align: 'right', render: invTotalCell },
                   { key: 'received', label: 'Received (INR)', align: 'right', render: invReceivedCell },
+                  { key: 'advance', label: 'Advance Applied (INR)', align: 'right', render: (r) => invAdvanceINR(r).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
                   { key: 'bal', label: 'Outstanding (INR)', align: 'right', render: invBalanceCell },
                 ]}
                 rows={history.filter((r) => r.status !== 'Paid')}
@@ -809,6 +842,7 @@ const CustomerInvoicePage = () => {
                 totals={[
                   { colKey: 'gt', render: (rs) => rs.reduce((a, r) => a + invTotalINR(r), 0) },
                   { colKey: 'received', render: (rs) => rs.reduce((a, r) => a + invReceivedINR(r), 0) },
+                  { colKey: 'advance', render: (rs) => rs.reduce((a, r) => a + invAdvanceINR(r), 0) },
                   { colKey: 'bal', render: (rs) => rs.reduce((a, r) => a + invBalanceINR(r), 0) }
                 ]}
               />
@@ -816,12 +850,14 @@ const CustomerInvoicePage = () => {
 
             {reportTab === 'advances' && (
               <AdvanceRegister
-                storageKey="customerAdvanceHistory"
+                kind="customer"
                 title="Advance Received from Customers"
                 filenamer={`Advance-Received-${new Date().toISOString().slice(0, 10)}`}
                 partyLabel="Customer"
                 prefix="CAR"
                 againstLabel="Against Invoice / SO / PO"
+                invoiceOptions={history}
+                onRefresh={async () => setHistory(await listCustomerInvoices())}
               />
             )}
           </>
@@ -876,7 +912,7 @@ const CustomerInvoicePage = () => {
                   />
                 </div>
                 <div className="field-group">
-                  <label>Amount Received / Advance ({getCurrency(currencyCode).symbol})</label>
+                  <label>Payments Received ({getCurrency(currencyCode).symbol})</label>
                   <input
                     type="number"
                     min="0"
@@ -887,9 +923,10 @@ const CustomerInvoicePage = () => {
                       const val = e.target.value;
                       const num = Number(val) || 0;
                       const grandTotal = Number(totals.grandTotal) || 0;
+                      const advanceAdjusted = Number(invoiceDetails.advanceAdjusted) || 0;
                       let st = 'Pending';
-                      if (num >= grandTotal && grandTotal > 0) st = 'Paid';
-                      else if (num > 0) st = 'Partial';
+                      if (num + advanceAdjusted >= grandTotal && grandTotal > 0) st = 'Paid';
+                      else if (num + advanceAdjusted > 0) st = 'Partial';
                       setInvoiceDetails({ ...invoiceDetails, amountReceived: val, paymentStatus: st });
                     }}
                   />
@@ -1456,25 +1493,30 @@ const CustomerInvoicePage = () => {
                         </td>
                       </tr>
                       {(Number(selectedInvoice.invoiceDetails?.amountReceived) > 0 ||
+                        Number(selectedInvoice.invoiceDetails?.advanceAdjusted) > 0 ||
                         selectedInvoice.invoiceDetails?.paymentStatus === 'Paid') && (
                         <>
                           <tr style={{ borderTop: '1px solid #cbd5e1', color: '#166534' }}>
                             <td style={{ padding: '5px 10px', borderRight: '1px solid #cbd5e1' }}>Amount Received</td>
                             <td style={{ padding: '5px 10px', textAlign: 'right', fontWeight: '600' }}>
-                              {selectedInvoice.invoiceDetails?.paymentStatus === 'Paid'
-                                ? viewMoney(selectedInvoice.totals?.grandTotal)
-                                : viewMoney(selectedInvoice.invoiceDetails?.amountReceived)}
+                              {viewMoney(selectedInvoice.invoiceDetails?.amountReceived)}
                             </td>
                           </tr>
+                          {Number(selectedInvoice.invoiceDetails?.advanceAdjusted) > 0 && (
+                            <tr style={{ borderTop: '1px solid #cbd5e1', color: '#1d4ed8' }}>
+                              <td style={{ padding: '5px 10px', borderRight: '1px solid #cbd5e1' }}>Advance Applied</td>
+                              <td style={{ padding: '5px 10px', textAlign: 'right', fontWeight: '600' }}>
+                                {viewMoney(selectedInvoice.invoiceDetails?.advanceAdjusted)}
+                              </td>
+                            </tr>
+                          )}
                           <tr style={{
                             fontWeight: 'bold',
                             color: Number(selectedInvoice.invoiceDetails?.balanceDue) > 0 && selectedInvoice.invoiceDetails?.paymentStatus !== 'Paid' ? '#b91c1c' : '#166534'
                           }}>
                             <td style={{ padding: '5px 10px', borderRight: '1px solid #cbd5e1' }}>Balance Payable</td>
                             <td style={{ padding: '5px 10px', textAlign: 'right' }}>
-                              {selectedInvoice.invoiceDetails?.paymentStatus === 'Paid'
-                                ? '0.00'
-                                : viewMoney(selectedInvoice.invoiceDetails?.balanceDue)}
+                              {viewMoney(selectedInvoice.invoiceDetails?.balanceDue)}
                             </td>
                           </tr>
                         </>

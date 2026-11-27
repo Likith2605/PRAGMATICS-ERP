@@ -2,14 +2,66 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBranding.js';
 import { useCompanyBranding } from '../utils/companyBranding.js';
-import { addInventoryItem, adjustInventoryStock, deleteInventoryItemIfUnused } from '../utils/storeService.js';
+import {
+  listInventoryItems,
+  saveInventoryItem,
+  postOpeningStock,
+  postInventoryAdjustment,
+  listStockLedger
+} from '../services/inventoryApi.js';
 import { getPOProgress } from '../utils/workflowService.js';
+import { listPurchaseOrders } from '../services/procurementIntakeApi.js';
 import AddableSelect from '../components/AddableSelect.jsx';
 import { addCustomUnit, addInventoryCategory, getAvailableUnits, getInventoryCategories, removeCustomUnit, removeInventoryCategory } from '../utils/addableMasters.js';
 import { hasPermission } from '../utils/permissions.js';
 import { isAdmin } from '../utils/auth.js';
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
+
+/* PostgreSQL returns snake_case inventory rows. The page works with the
+   established camelCase item shape, so every API row is mapped once on load. */
+const mapInventoryRow = (row = {}) => ({
+  ...(row.payload || {}),
+  id: row.item_code || row.id,
+  itemCode: row.item_code || row.payload?.itemCode || row.id,
+  itemName: row.material_name || row.payload?.itemName || row.item_code || '',
+  category: row.category || row.payload?.category || '',
+  hsnSac: row.hsn_code || row.payload?.hsnSac || '',
+  unit: row.unit || row.payload?.unit || 'Nos',
+  currentQty: Number(row.current_qty) || 0,
+  minReorderLevel: Number(row.reorder_level) || 0,
+  minOrderQty: Number(row.min_order_qty) || 0,
+  unitCost: Number(row.unit_price) || 0,
+  sellingPrice: Number(row.payload?.sellingPrice) || 0,
+  location: row.location || row.payload?.location || '',
+  reservedQty: Number(row.payload?.reservedQty) || 0,
+  shelfLifeManaged: Boolean(row.shelf_life_managed),
+  shelfLifeDays: Number(row.shelf_life_days) || 0,
+  recordVersion: Number(row.version) || 0
+});
+
+/* The stock ledger is the authoritative source for transactions. Legacy
+   consumers expect the old {type, itemCode, reason, reference} shape. */
+const mapLedgerRow = (row = {}, itemsByCode = {}) => {
+  const payload = row.payload || {};
+  const isOutbound = ['OUT', 'ISSUE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT'].includes(String(row.movement_type || '').toUpperCase());
+  return {
+    ...payload,
+    id: row.id || payload.id,
+    date: String(row.entry_date || '').slice(0, 10) || payload.date || '',
+    itemCode: row.item_code || payload.itemCode || '',
+    itemName: payload.itemName || itemsByCode[row.item_code]?.itemName || row.material_name || row.item_code || '',
+    unit: row.unit || payload.unit || 'Nos',
+    type: isOutbound ? 'OUT' : 'IN',
+    quantity: Number(row.quantity) || 0,
+    balanceAfter: Number(row.balance_after) || 0,
+    reason: row.reason || payload.reason || '',
+    reference: payload.reference || row.source_doc_ref || '-',
+    employeeIssue: Boolean(payload.employeeIssue),
+    employeeName: payload.employeeName || '',
+    notes: payload.notes || ''
+  };
+};
 
 const emptyIssueForm = {
   itemId: '',
@@ -46,7 +98,8 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
   const [items, setItems] = useState([]);
   const [transactions, setTransactions] = useState([]);
   const [purchaseOrders, setPurchaseOrders] = useState([]);
-  const [employeeIssues, setEmployeeIssues] = useState([]);
+  const [poLoadError, setPoLoadError] = useState('');
+  const [loadError, setLoadError] = useState('');
   const [itemToDeleteId, setItemToDeleteId] = useState(null);
   const [isDeletingItem, setIsDeletingItem] = useState(false);
   const [itemActionNotification, setItemActionNotification] = useState(null);
@@ -76,45 +129,39 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
   // Employee issue history filter
   const [employeeFilter, setEmployeeFilter] = useState('ALL');
 
+  /* Inventory items and stock transactions are owned by PostgreSQL. The
+     legacy localStorage keys may still hold a server-confirmed display cache,
+     but this page never reads or writes them for workflow decisions. */
+  const loadInventory = async () => {
+    try {
+      const [itemRows, ledgerRows] = await Promise.all([listInventoryItems(), listStockLedger()]);
+      const mappedItems = (Array.isArray(itemRows) ? itemRows : []).map(mapInventoryRow);
+      const itemsByCode = Object.fromEntries(mappedItems.map((item) => [item.itemCode, item]));
+      setItems(mappedItems);
+      setTransactions((Array.isArray(ledgerRows) ? ledgerRows : []).map((row) => mapLedgerRow(row, itemsByCode)));
+      setLoadError('');
+    } catch (error) {
+      setLoadError(`Store records could not be loaded from PostgreSQL: ${error.message}`);
+      throw error;
+    }
+  };
+
   useEffect(() => {
-    try {
-      const storedItems = localStorage.getItem('inventoryItems');
-      setItems(storedItems ? JSON.parse(storedItems) : []);
-    } catch {
-      setItems([]);
-    }
-    try {
-      const storedTx = localStorage.getItem('stockTransactions');
-      setTransactions(storedTx ? JSON.parse(storedTx) : []);
-    } catch {
-      setTransactions([]);
-    }
-    try {
-      const storedPOs = localStorage.getItem('supplierPOHistory');
-      setPurchaseOrders(storedPOs ? JSON.parse(storedPOs) : []);
-    } catch {
-      setPurchaseOrders([]);
-    }
-    try {
-      const storedIssues = localStorage.getItem('employeeIssueLog');
-      setEmployeeIssues(storedIssues ? JSON.parse(storedIssues) : []);
-    } catch {
-      setEmployeeIssues([]);
-    }
+    let active = true;
+    loadInventory().catch(() => { /* banner already set */ });
+    /* Purchase Orders are owned by PostgreSQL: the local copy is only a cache
+     * of the last confirmed response, so the list is refreshed from the API. */
+    listPurchaseOrders()
+      .then((orders) => { if (active) { setPurchaseOrders(orders); setPoLoadError(''); } })
+      .catch((error) => { if (active) { setPurchaseOrders([]); setPoLoadError(`Purchase Orders could not be loaded from PostgreSQL: ${error.message}`); } });
+    return () => { active = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const saveItemsToStorage = (updated) => {
-    setItems(updated);
-    localStorage.setItem('inventoryItems', JSON.stringify(updated));
-  };
+  // Re-sync state from PostgreSQL after a confirmed write.
+  const reloadInventory = () => loadInventory().catch(() => { /* banner already set */ });
 
-  const saveTransactionsToStorage = (updatedTx) => {
-    setTransactions(updatedTx);
-    localStorage.setItem('stockTransactions', JSON.stringify(updatedTx));
-  };
-
-  // Per-record conflict resolved by the sync engine (server copy applied to
-  // localStorage) — reload so this page shows the latest data.
+  // Other modules may have written through the API; refresh the display.
   useEffect(() => {
     const refresh = () => reloadInventory();
     window.addEventListener('erp-records-conflict', refresh);
@@ -126,25 +173,10 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-sync state from localStorage after a service-level stock write
-  const reloadInventory = () => {
-    try {
-      const storedItems = localStorage.getItem('inventoryItems');
-      setItems(storedItems ? JSON.parse(storedItems) : []);
-      const storedTx = localStorage.getItem('stockTransactions');
-      setTransactions(storedTx ? JSON.parse(storedTx) : []);
-    } catch {
-      /* keep current state */
-    }
-  };
-
   const reloadPOs = () => {
-    try {
-      const storedPOs = localStorage.getItem('supplierPOHistory');
-      setPurchaseOrders(storedPOs ? JSON.parse(storedPOs) : []);
-    } catch {
-      setPurchaseOrders([]);
-    }
+    listPurchaseOrders()
+      .then((orders) => { setPurchaseOrders(orders); setPoLoadError(''); })
+      .catch((error) => { setPurchaseOrders([]); setPoLoadError(`Purchase Orders could not be loaded from PostgreSQL: ${error.message}`); });
   };
 
   // Total OUT per itemCode (production consumption + employee issues + dispatches)
@@ -177,14 +209,33 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
       purchaseOrders.filter((po) => {
         if (po.status === 'Cancelled') return false;
         try {
-          const p = getPOProgress(po.reference);
-          if (p.ordered > 0) return p.pending > 0;
+          /* PostgreSQL carries the reconciled progress on the row; only legacy
+           * rows without it fall back to the local projection. */
+          const p = po.progress && typeof po.progress === 'object' ? po.progress : null;
+          if (p && p.ordered > 0) return p.pending > 0;
         } catch {
           // fall through to legacy status check
         }
         return !['Received', 'Fully Received', 'Closed', 'Cancelled'].includes(po.status);
       }),
     [purchaseOrders]
+  );
+
+  /* Employee issues are recorded as audited stock movements in PostgreSQL. */
+  const employeeIssues = useMemo(
+    () => transactions
+      .filter((tx) => tx.employeeIssue)
+      .map((tx) => ({
+        id: tx.id,
+        date: tx.date,
+        itemCode: tx.itemCode,
+        itemName: tx.itemName,
+        quantity: tx.quantity,
+        unit: tx.unit,
+        employeeName: tx.employeeName,
+        notes: tx.notes || ''
+      })),
+    [transactions]
   );
 
   const employeeNames = useMemo(
@@ -258,13 +309,39 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
     }
   };
 
-  const handleSaveNewItem = (e) => {
+  const handleSaveNewItem = async (e) => {
     e.preventDefault();
     try {
-      const created = addInventoryItem(newItemForm);
-      reloadInventory();
+      const itemCode = String(newItemForm.itemCode || '').trim();
+      const data = {
+        itemCode,
+        materialName: newItemForm.itemName,
+        category: newItemForm.category,
+        hsnCode: newItemForm.hsnSac,
+        unit: newItemForm.unit,
+        reorderLevel: Number(newItemForm.minReorderLevel) || 0,
+        unitPrice: Number(newItemForm.unitCost) || 0,
+        sellingPrice: newItemForm.sellingPrice,
+        location: newItemForm.location
+      };
+      /* version 0 makes an existing item code a conflict instead of an
+         accidental overwrite — the PostgreSQL master is authoritative. */
+      const created = await saveInventoryItem(data, 0);
+      const openingQty = Number(newItemForm.currentQty) || 0;
+      if (openingQty > 0) {
+        await postOpeningStock({
+          idempotencyKey: `opening-${itemCode}-${window.crypto?.randomUUID?.() || Date.now()}`,
+          itemCode,
+          materialName: data.materialName,
+          unit: data.unit,
+          quantity: openingQty,
+          entryDate: todayStr(),
+          reason: 'Opening stock'
+        });
+      }
+      await reloadInventory();
       setShowAddItemModal(false);
-      alert(`Item ${created.itemName} added to Store / inventory master.`);
+      alert(`Item ${created?.material_name || data.materialName} added to Store / inventory master.`);
     } catch (err) {
       alert(err.message);
     }
@@ -275,23 +352,14 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
     const target = items.find((item) => String(item.id) === String(itemToDeleteId));
     const reason = window.prompt(`Reason for deleting ${target?.itemCode || target?.itemName || itemToDeleteId}:`)?.trim();
     if (!reason) return;
-    const reasons = (() => { try { return JSON.parse(localStorage.getItem('erp_record_delete_reasons') || '{}'); } catch { return {}; } })();
-    reasons.inventoryItems = { ...(reasons.inventoryItems || {}), [String(itemToDeleteId)]: reason };
-    localStorage.setItem('erp_record_delete_reasons', JSON.stringify(reasons));
-    setIsDeletingItem(true);
-    try {
-      deleteInventoryItemIfUnused(itemToDeleteId);
-      reloadInventory();
-      setItemActionNotification({ type: 'success', message: 'Store item deleted successfully.' });
-    } catch (err) {
-      setItemActionNotification({
-        type: 'error',
-        message: err.message || 'The store item could not be deleted.'
-      });
-    } finally {
-      setItemToDeleteId(null);
-      setIsDeletingItem(false);
-    }
+    /* INCOMPLETE: server/inventoryRoutes.js has no delete route for inventory
+       items. Keep the confirmation but never fake a deletion or write a legacy
+       business cache. */
+    setItemActionNotification({
+      type: 'error',
+      message: 'INCOMPLETE: Inventory item deletion is not available through the PostgreSQL API. Nothing was deleted.'
+    });
+    setItemToDeleteId(null);
   };
 
   const handleOpenAdjust = (item = null) => {
@@ -302,7 +370,7 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
     setShowAdjustModal(true);
   };
 
-  const handleSaveAdjustment = (e) => {
+  const handleSaveAdjustment = async (e) => {
     e.preventDefault();
     const qtyChange = Number(adjustForm.quantity);
     if (!qtyChange || qtyChange <= 0) {
@@ -321,17 +389,21 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
       }
     }
     try {
-      const result = adjustInventoryStock({
-        itemId: targetItem.id,
-        adjustType: adjustForm.adjustType,
-        quantity: qtyChange,
+      const isIn = adjustForm.adjustType === 'IN';
+      const result = await postInventoryAdjustment({
+        idempotencyKey: `adjust-${targetItem.itemCode}-${adjustForm.adjustType}-${qtyChange}-${window.crypto?.randomUUID?.() || Date.now()}`,
+        itemCode: targetItem.itemCode,
+        materialName: targetItem.itemName,
+        unit: targetItem.unit || 'Nos',
+        quantity: isIn ? qtyChange : -qtyChange,
         reason: adjustForm.reason,
-        reference: adjustForm.reference
+        reference: adjustForm.reference,
+        entryDate: todayStr()
       });
-      reloadInventory();
+      await reloadInventory();
       setShowAdjustModal(false);
       alert(
-        `Stock for ${result.itemName} ${result.type === 'IN' ? 'increased' : 'reduced'} from ${result.previousQty} to ${result.newQty} ${targetItem.unit || 'Nos'}.`
+        `Stock for ${targetItem.itemName} ${isIn ? 'increased' : 'reduced'} from ${current} to ${Number(result?.balanceAfter)} ${targetItem.unit || 'Nos'}.`
       );
     } catch (err) {
       alert(err.message);
@@ -352,7 +424,7 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
     setShowIssueModal(true);
   };
 
-  const handleSaveIssue = (e) => {
+  const handleSaveIssue = async (e) => {
     e.preventDefault();
     const targetItem = items.find((it) => it.id === issueForm.itemId);
     if (!targetItem) {
@@ -377,43 +449,29 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
       return;
     }
 
-    const newQty = current - qty;
-    const updatedItems = items.map((it) => (it.id === targetItem.id ? { ...it, currentQty: newQty } : it));
-    saveItemsToStorage(updatedItems);
-
-    saveTransactionsToStorage([
-      {
-        id: `tx-${Date.now()}`,
-        date: issueForm.date,
+    try {
+      /* Employee hand-over is posted as an audited stock movement; the issues
+         tab is derived from the PostgreSQL ledger, not from a local log. */
+      await postInventoryAdjustment({
+        idempotencyKey: `employee-issue-${window.crypto?.randomUUID?.() || Date.now()}`,
         itemCode: targetItem.itemCode,
-        itemName: targetItem.itemName,
+        materialName: targetItem.itemName,
         unit: targetItem.unit || 'Nos',
-        type: 'OUT',
-        quantity: qty,
-        balanceAfter: newQty,
+        quantity: -qty,
         reason: `Issued to Employee: ${employeeName}`,
-        reference: '-'
-      },
-      ...transactions
-    ]);
-
-    const newIssue = {
-      id: `issue-${Date.now()}`,
-      date: issueForm.date,
-      itemCode: targetItem.itemCode,
-      itemName: targetItem.itemName,
-      quantity: qty,
-      unit: targetItem.unit || 'Nos',
-      employeeName,
-      notes: issueForm.notes.trim() || ''
-    };
-    const updatedIssues = [newIssue, ...employeeIssues];
-    setEmployeeIssues(updatedIssues);
-    localStorage.setItem('employeeIssueLog', JSON.stringify(updatedIssues));
-
-    setIssueError('');
-    setShowIssueModal(false);
-    alert(`${qty} ${targetItem.unit || 'Nos'} of ${targetItem.itemName} issued to ${employeeName}.`);
+        reference: '-',
+        entryDate: issueForm.date || todayStr(),
+        employeeIssue: true,
+        employeeName,
+        notes: issueForm.notes.trim() || ''
+      });
+      await reloadInventory();
+      setIssueError('');
+      setShowIssueModal(false);
+      alert(`${qty} ${targetItem.unit || 'Nos'} of ${targetItem.itemName} issued to ${employeeName}.`);
+    } catch (err) {
+      setIssueError(err.message);
+    }
   };
 
   // ---- Render helpers ----
@@ -492,6 +550,8 @@ const StorePage = ({ embeddedTab = '' } = {}) => {
       </div>}
 
       <div className={embedded ? 'store-embedded-content' : 'content-block'}>
+        {loadError && <div role="alert" className="form-error">{loadError}</div>}
+        {poLoadError && <div role="alert" className="form-error">{poLoadError}</div>}
         {/* Top-level navigation tabs */}
         {!embedded && <div style={{ display: 'flex', gap: '10px', borderBottom: '1px solid #e5e7eb', paddingBottom: '14px', marginBottom: '20px', flexWrap: 'wrap' }}>
           <button

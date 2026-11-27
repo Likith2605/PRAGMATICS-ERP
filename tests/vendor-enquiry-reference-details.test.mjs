@@ -7,8 +7,8 @@ const project = getIndentReferenceDetails({
   requiredDate: 'must not display', partName: 'must not display'
 });
 assert.deepEqual(project, {
-  prNumber: 'IND-PROJECT-TEST', origin: 'Sales Order',
+  prNumber: '', origin: 'Sales Order',
   requestedBy: 'Project Requester', indentDate: '2026-10-02'
 });
 
-console.log('Vendor Enquiry PR reference fields OK for project-based indents.');
+console.log('Vendor Enquiry indent references remain distinct from Purchase Request numbers.');

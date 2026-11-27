@@ -3,8 +3,8 @@
  *
  * Used by drawingStorage.js and workflowFiles.js so every attachment is
  * mirrored to the database while IndexedDB remains the fast local cache.
- * All server failures degrade gracefully: the local cache keeps working and
- * callers can re-attempt later (the next read refreshes from PostgreSQL).
+ * Server failures are surfaced so missing or unauthorized files cannot appear
+ * as successful empty previews.
  */
 
 const getApiBase = () => {
@@ -61,32 +61,92 @@ const request = async(path, options = {}) => {
  * Uploads a Blob/File to PostgreSQL. Returns the stored metadata.
  * Throws on failure — callers treat it as "server copy pending".
  */
-export const putFile = async(id, blob, { fileName, mimeType, scope, metadata } = {}) => {
+export const putFile = async(id, blob, { fileName, mimeType, scope, metadata, ifAbsent = false } = {}) => {
     const contentBase64 = await blobToBase64(blob);
     const payload = await request(`/files/${encodeURIComponent(id)}`, {
         method: 'PUT',
-        body: JSON.stringify({
+    body: JSON.stringify({
             fileName: fileName || (blob && blob.name) || 'document',
             mimeType: mimeType || (blob && blob.type) || 'application/octet-stream',
             scope: scope || 'generic',
             metadata: metadata || {},
-            contentBase64
+        contentBase64,
+        ifAbsent
         })
     });
     return payload.file;
 };
 
 /** Downloads a file from PostgreSQL. Returns a Blob or null when missing. */
-export const getFile = async(id) => {
+export const getFileWithMetadata = async(id) => {
     try {
         const payload = await request(`/files/${encodeURIComponent(id)}`);
-        if (!payload?.contentBase64) return null;
-        return base64ToBlob(payload.contentBase64, payload.mimeType);
+        if (typeof payload?.contentBase64 !== 'string') return null;
+        const blob = base64ToBlob(payload.contentBase64, payload.mimeType);
+        return {
+            blob,
+            id: payload.id,
+            fileName: payload.fileName || '',
+            mimeType: payload.mimeType || blob.type,
+            metadata: payload.metadata || {},
+            checksumSha256: payload.checksumSha256,
+            sizeBytes: payload.sizeBytes
+        };
     } catch (error) {
         if (String(error.message).includes('not found')) return null;
         throw error;
     }
 };
+
+/** Retrieves authenticated binary content with its persisted file metadata. */
+export const getFileContentWithMetadata = async(id) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+        const response = await fetch(`${API_BASE}/files/${encodeURIComponent(id)}/content`, {
+            signal: controller.signal,
+            headers: authHeaders()
+        });
+        if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            if (response.status === 404) return null;
+            throw new Error(payload.error || `File request failed (${response.status})`);
+        }
+
+        const blob = await response.blob();
+        const encodedMetadata = response.headers.get('x-file-metadata') || '';
+        let metadata;
+        try {
+            const base64 = encodedMetadata.replace(/-/g, '+').replace(/_/g, '/');
+            const bytes = Uint8Array.from(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')), (character) => character.charCodeAt(0));
+            metadata = JSON.parse(new TextDecoder().decode(bytes));
+        } catch {
+            throw new Error('File response metadata is invalid.');
+        }
+        return {
+            blob,
+            id: response.headers.get('x-file-id') || '',
+            metadata,
+            checksumSha256: response.headers.get('x-file-checksum-sha256') || null,
+            sizeBytes: Number(response.headers.get('x-file-size-bytes') || blob.size)
+        };
+    } finally {
+        clearTimeout(timer);
+    }
+};
+
+export const getMissingChecksumInventory = ({ limit = 100, offset = 0 } = {}) =>
+    request(`/files/integrity/checksum-review/inventory?limit=${limit}&offset=${offset}`);
+
+export const getFileChecksumReview = (id) =>
+    request(`/files/integrity/checksum-review/${encodeURIComponent(id)}`);
+
+export const confirmFileChecksum = (id, verification) => request(
+    `/files/integrity/checksum-review/${encodeURIComponent(id)}/verify`,
+    { method: 'POST', body: JSON.stringify(verification) }
+);
+
+export const getFile = async(id) => (await getFileWithMetadata(id))?.blob || null;
 
 /** Removes the server copy. Missing files resolve without error. */
 export const deleteFile = async(id) => {

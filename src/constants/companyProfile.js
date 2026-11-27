@@ -1,6 +1,5 @@
 // Neutral baseline used only when a company has not configured Company Settings
-// yet. It deliberately contains no company-specific information: all values come
-// from the saved, PostgreSQL-synchronised `companySettings` record.
+// yet. Shared values come from the authenticated PostgreSQL master API.
 export const OFFICIAL_COMPANY_PROFILE = {
   companyName: '',
   legalName: '',

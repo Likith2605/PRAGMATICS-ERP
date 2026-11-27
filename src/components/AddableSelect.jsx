@@ -1,8 +1,9 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { addCustomUnit, getCustomUnits } from '../utils/addableMasters.js';
+import { createMaster, deleteMaster, listMasters } from '../services/masterApi.js';
 
 const ADD_NEW_OPTION = '__ADDABLE_SELECT_ADD_NEW__';
+const clean = (value) => String(value ?? '').trim();
 
 /** Native select with a reusable Add New modal for approved master fields. */
 const AddableSelect = ({
@@ -21,7 +22,11 @@ const AddableSelect = ({
   const triggerRef = useRef(null);
   const menuRef = useRef(null);
   const dropdownId = useId();
-  const [masterOptions, setMasterOptions] = useState(() => masterType === 'unit' ? getCustomUnits() : []);
+  // Units of measure are permanent master records. Browser storage is never
+  // consulted here; the PostgreSQL UOM master is the only list source.
+  const uomRecordsRef = useRef([]);
+  const [masterOptions, setMasterOptions] = useState([]);
+  const [masterError, setMasterError] = useState('');
   const [recentOptions, setRecentOptions] = useState([]);
   const addNewInDropdown = addNewInOptions || masterType === 'unit';
   const availableOptions = [...new Set([...options, ...masterOptions, ...recentOptions])];
@@ -32,10 +37,28 @@ const AddableSelect = ({
   const fieldList = fields.length ? fields : masterType === 'unit'
     ? [{ key: 'name', label: 'Unit Name', placeholder: 'e.g. Kilograms', required: false }, { key: 'symbol', label: 'Unit Symbol', placeholder: 'e.g. Kg', required: true }]
     : [{ key: 'name', label: fieldLabel, required: true }];
+  const loadUoms = async () => {
+    const records = await listMasters('uoms');
+    uomRecordsRef.current = records;
+    setMasterOptions(records.map((record) => clean(record.code)).filter(Boolean));
+    setMasterError('');
+    return records;
+  };
+
+  useEffect(() => {
+    if (masterType !== 'unit') return undefined;
+    let active = true;
+    loadUoms()
+      .catch((loadError) => { if (active) setMasterError(loadError.message || 'The UOM Master could not be loaded.'); });
+    return () => { active = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [masterType]);
+
   const startAdd = () => {
     setDropdownOpen(false);
     setValues({});
     setError('');
+    setMasterError('');
     setOpen(true);
   };
   const handleSelectChange = (event) => {
@@ -108,13 +131,24 @@ const AddableSelect = ({
     setError('');
     setSaving(true);
     try {
-      const createdValue = onCreate
-        ? await onCreate(values)
-        : masterType === 'unit'
-          ? addCustomUnit(values)
-          : null;
+      let createdValue;
+      if (masterType === 'unit') {
+        // Even when a page supplies an onCreate handler, UOM additions go to
+        // the authoritative master API so every screen sees the same record.
+        const symbol = clean(values.symbol || values.name);
+        if (!symbol) throw new Error('Unit symbol is required.');
+        const response = await createMaster('uoms', {
+          code: symbol,
+          name: clean(values.name) || symbol,
+          symbol,
+          description: clean(values.description)
+        });
+        createdValue = response.record?.code || symbol;
+        await loadUoms();
+      } else if (onCreate) {
+        createdValue = await onCreate(values);
+      }
       if (createdValue == null || createdValue === '') throw new Error('The new value could not be saved.');
-      if (masterType === 'unit') setMasterOptions(getCustomUnits());
       setRecentOptions((previous) => [...new Set([...previous, String(createdValue)])]);
       if (onValueChange) onValueChange(createdValue);
       else onChange({ target: { name, value: createdValue } });
@@ -132,12 +166,20 @@ const AddableSelect = ({
     const item = typeof option === 'string' ? { value: option, label: option } : option;
     if (!window.confirm(`Delete custom ${fieldLabel.toLowerCase()} “${item.label}”?`)) return;
     try {
-      await onDeleteOption(item.value);
+      if (masterType === 'unit') {
+        const record = uomRecordsRef.current.find((entry) => clean(entry.code) === clean(item.value));
+        if (!record) throw new Error('The UOM Master record was not found. Reload before deleting.');
+        const reason = window.prompt(`Reason for deleting unit “${item.label}”?`)?.trim();
+        if (!reason) return;
+        await deleteMaster('uoms', record.id, Number(record.version) || 1, reason);
+        await loadUoms();
+      } else {
+        await onDeleteOption(item.value);
+      }
       setRecentOptions((previous) => previous.filter((entry) => entry !== String(item.value)));
-      if (masterType === 'unit') setMasterOptions(getCustomUnits());
       triggerRef.current?.focus();
-    } catch {
-      // The owning page reports failures through its existing notification UI.
+    } catch (deleteError) {
+      setMasterError(deleteError.message || 'The unit could not be deleted.');
     }
   };
 
@@ -238,6 +280,7 @@ const AddableSelect = ({
               </div>
             );
           })}
+          {masterError && <div className="addable-select__error" role="alert" style={{ padding: '6px 10px' }}>{masterError}</div>}
           {canAdd && addNewInDropdown && (
             <button type="button" className="addable-select__add-option" onClick={startAdd}>{addLabel}</button>
           )}
@@ -250,7 +293,11 @@ const AddableSelect = ({
             <div className="template-modal-header">
               <div>
                 <h3 id="addable-select-title">{title}</h3>
-                <p className="addable-select__hint">Add a value for this form. It will be available in the shared dropdown list.</p>
+                <p className="addable-select__hint">
+                  {masterType === 'unit'
+                    ? 'Units are saved to the shared PostgreSQL UOM Master.'
+                    : 'Add a value for this form. It will be available in the shared dropdown list.'}
+                </p>
               </div>
               <button type="button" className="button-secondary button-small" onClick={() => setOpen(false)} disabled={saving} aria-label="Close">×</button>
             </div>
@@ -271,6 +318,7 @@ const AddableSelect = ({
                 ))}
               </div>
               {error && <p className="addable-select__error" role="alert">{error}</p>}
+              {masterError && <p className="addable-select__error" role="alert">{masterError}</p>}
               <div className="form-actions addable-select__actions">
                 <button type="button" className="button-secondary" onClick={() => setOpen(false)} disabled={saving}>Cancel</button>
                 <button type="submit" className="button-primary" disabled={saving}>{saving ? 'Saving…' : saveLabel}</button>

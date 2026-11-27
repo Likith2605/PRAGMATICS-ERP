@@ -4,15 +4,20 @@ import { getPool } from './database.js';
 import { findChangedContactValidationError } from '../shared/fieldValidation.js';
 import { requireAdmin, safeAuditValues } from './auth.js';
 import { canAccessStateKey } from '../shared/stateAccess.js';
-import { hasPermissionForRole, validateEmployeeAssignments, normalizeEmployeeAssignments, DEPARTMENT_ROLE_OPTIONS, normalizeDepartment, ALLOWED_PERMISSION_KEYS } from './departmentAccess.js';
-import { stableDepartmentId, stableRoleId, permissionAssignmentKey } from '../shared/roleIdentity.js';
+import { hasPermissionForRole, validateEmployeeAssignments, normalizeEmployeeAssignments, DEPARTMENT_ROLE_OPTIONS, normalizeDepartment } from './departmentAccess.js';
+import { getEmployeeRecordsForAssignmentChecks } from './employeeStore.js';
+import { readDepartmentRoleCatalogs, resolveRolePermission, validateEmployeeCatalogAssignments } from './departmentRoleCatalogStore.js';
 
 const router = express.Router();
 const MAX_RECORD_BYTES = Number(process.env.MAX_ERP_STATE_BYTES || 25 * 1024 * 1024);
 // Modules that have moved to per-record storage (/api/records -> module_records)
 // are rejected here so exactly ONE authority exists per module.
-const moduleOwnedKeys = new Set(['inventoryItems', 'stockTransactions', 'productionDispatchRequests']);
-const excludedKeys = new Set(['erp_auth', 'rolePermissions', 'currentQuotation', 'currentVendorEnquiry', 'currentVendorQuotation', ...moduleOwnedKeys]);
+const moduleOwnedKeys = new Set([
+    'inventoryItems', 'stockTransactions', 'productionDispatchRequests',
+    'materialArrivals', 'qualityChecks', 'rejectionReports',
+    'soMaterialAvailabilityChecks'
+]);
+const excludedKeys = new Set(['employees','erp_auth','departmentCatalog','roleCatalog','rolePermissions','currentQuotation','quotationHistory','quotationSequence','customerPOHistory','salesOrderHistory','deliveryChallanHistory','customerInvoiceHistory','customerInvoiceSequence','exportInvoiceHistory','exportInvoiceSequence','currentVendorEnquiry','currentVendorQuotation','vendorEnquiries','vendorQuotations','purchaseIndents','storePurchaseRequests','supplierInvoiceHistory','customerAdvanceHistory','supplierAdvanceHistory','companySettings','customerDirectory','customerMaster','vendorMaster','vendorMasterSequence','supplierMaster','machines','productionRequirements','productionRequirementSequence','productionRequirementsSequence','productionJobCards','jobCards','boms','bomMasterList','debitNotes','debitNoteSequence','materialReceipts','supplierPOHistory','projectRequests','projectRequestSequence', ...moduleOwnedKeys]);
 const RETIRED_INDENT_SOURCE = 'storeDirect';
 
 const withStableCatalogIds = (key, value) => {
@@ -136,7 +141,11 @@ const validateRecords = (records) => {
     }
     const filtered = {};
     for (const [key, value] of Object.entries(records)) {
-        if (!isSyncableKey(key)) continue;
+        if (!isSyncableKey(key)) {
+            const error = new Error(`ERP state key '${key}' is excluded from generic synchronization.`);
+            error.status = 400;
+            throw error;
+        }
         const serialized = JSON.stringify(value);
         if (serialized.length > MAX_RECORD_BYTES) {
             const error = new Error(`ERP record '${key}' exceeds the configured size limit`);
@@ -170,18 +179,9 @@ const validateEmployeeList = (employees) => {
     return null;
 };
 const validateEmployeeAssignmentReferences = async (employees, executor = getPool()) => {
-    const result = await executor.query("SELECT storage_key,data FROM erp_state WHERE storage_key IN ('departmentCatalog','roleCatalog')");
-    const catalogs = Object.fromEntries(result.rows.map((row) => [row.storage_key, row.data]));
-    const departments = Array.isArray(catalogs.departmentCatalog) ? catalogs.departmentCatalog : [];
-    const roles = Array.isArray(catalogs.roleCatalog) ? catalogs.roleCatalog : [];
     for (const employee of employees) {
-        for (const assignment of normalizeEmployeeAssignments(employee)) {
-            const departmentId = stableDepartmentId(assignment.department, departments);
-            const roleId = stableRoleId(assignment.department, assignment.roleKey, roles, departments);
-            const source = (employee.departmentAssignments || []).find((entry) => normalizeDepartment(entry.department) === assignment.department);
-            if (source?.departmentId && String(source.departmentId) !== departmentId) return `${employee.employeeId || employee.name}: department assignment does not match the saved department ID.`;
-            if (source?.roleId && String(source.roleId) !== roleId) return `${employee.employeeId || employee.name}: role assignment does not match the saved role ID for '${assignment.department}'.`;
-        }
+        const error = await validateEmployeeCatalogAssignments(employee, executor);
+        if (error) return `${employee.employeeId || employee.name}: ${error}`;
     }
     return null;
 };
@@ -212,49 +212,23 @@ const validateMasterCatalog = (key, value) => {
 };
 
 router.get('/state/rolePermissions/:departmentId/:roleId', requireAdmin, async (req, res) => {
-    const key = permissionAssignmentKey(req.params.departmentId, req.params.roleId);
-    const result = await getPool().query("SELECT data FROM erp_state WHERE storage_key='rolePermissions'");
-    const entries = Array.isArray(result.rows[0]?.data) ? result.rows[0].data : [];
-    const entry = entries.find((item) => permissionAssignmentKey(item.departmentId, item.roleId) === key);
-    return res.json({ departmentId: req.params.departmentId, roleId: req.params.roleId, permissions: entry?.permissions || null });
+    const catalogs = await readDepartmentRoleCatalogs();
+    const entry = resolveRolePermission(catalogs, req.params.departmentId, req.params.roleId);
+    const version = await getPool().query(
+        'SELECT version FROM role_permission_catalog WHERE department_id=$1 AND role_id=$2',
+        [req.params.departmentId, req.params.roleId]
+    );
+    return res.json({
+        departmentId: req.params.departmentId,
+        roleId: req.params.roleId,
+        permissions: entry?.permissions || null,
+        version: Number(version.rows[0]?.version || 0),
+        legacy: Boolean(entry?.legacy)
+    });
 });
 
 router.put('/state/rolePermissions/:departmentId/:roleId', requireAdmin, async (req, res) => {
-    const departmentId = String(req.params.departmentId || '').trim();
-    const roleId = String(req.params.roleId || '').trim();
-    const permissions = req.body?.permissions;
-    if (!departmentId || !roleId || !Array.isArray(permissions)) return res.status(400).json({ error: 'Department ID, role ID, and a permission list are required.' });
-    if (permissions.some((permission) => typeof permission !== 'string' || !ALLOWED_PERMISSION_KEYS.includes(permission))) return res.status(400).json({ error: 'The permission list contains an unknown permission.' });
-    const uniquePermissions = [...new Set(permissions)];
-    const client = await getPool().connect();
-    try {
-        await client.query('BEGIN');
-        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`role-permissions:${departmentId}:${roleId}`]);
-        const result = await client.query("SELECT storage_key,data FROM erp_state WHERE storage_key IN ('departmentCatalog','roleCatalog','rolePermissions') ORDER BY storage_key FOR UPDATE");
-        const state = Object.fromEntries(result.rows.map((row) => [row.storage_key, row.data]));
-        const departments = Array.isArray(state.departmentCatalog) ? state.departmentCatalog : [];
-        const roles = Array.isArray(state.roleCatalog) ? state.roleCatalog : [];
-        const department = departments.find((item) => String(item.id) === departmentId) ||
-            Object.keys(DEPARTMENT_ROLE_OPTIONS).find((name) => stableDepartmentId(name, departments) === departmentId);
-        if (!department) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Department was not found.' }); }
-        const departmentName = typeof department === 'string' ? department : department.name;
-        const role = roles.find((item) => String(item.id) === roleId &&
-            (item.departmentId ? String(item.departmentId) === departmentId : normalizeDepartment(item.department) === normalizeDepartment(departmentName)));
-        const builtIn = (DEPARTMENT_ROLE_OPTIONS[departmentName] || []).find((item) => stableRoleId(departmentName, item.roleKey, roles, departments) === roleId);
-        if (!role && !builtIn) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Role was not found in the selected department.' }); }
-        const roleKey = role?.roleKey || builtIn.roleKey;
-        const key = permissionAssignmentKey(departmentId, roleId);
-        const before = Array.isArray(state.rolePermissions) ? state.rolePermissions : [];
-        const nextEntry = { departmentId, roleId, department: departmentName, roleKey, permissions: uniquePermissions };
-        const next = [...before.filter((entry) => permissionAssignmentKey(entry.departmentId, entry.roleId) !== key), nextEntry];
-        await auditStateChanges(client, req, 'rolePermissions', before, next);
-        const saved = await client.query("INSERT INTO erp_state(storage_key,data,updated_at) VALUES ('rolePermissions',$1::jsonb,now()) ON CONFLICT(storage_key) DO UPDATE SET data=EXCLUDED.data,updated_at=now() RETURNING updated_at", [JSON.stringify(next)]);
-        await client.query('COMMIT');
-        return res.json({ success: true, departmentId, roleId, permissions: uniquePermissions, updatedAt: saved.rows[0].updated_at?.toISOString() });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-    } finally { client.release(); }
+    return res.status(409).json({ error: 'Scoped role permissions use the versioned /api/organization-catalogs API.' });
 });
 const validateReferencedMasterRemovals = async (key, previous, next, executor = getPool(), { allowPermissionCleanup = false } = {}) => {
     if (!['departmentCatalog','roleCatalog'].includes(key) || !Array.isArray(previous) || !Array.isArray(next)) return null;
@@ -264,9 +238,11 @@ const validateReferencedMasterRemovals = async (key, previous, next, executor = 
         return !replacement || replacement.name !== item.name || (key === 'roleCatalog' && (replacement.department !== item.department || replacement.roleKey !== item.roleKey));
     });
     if (!removed.length) return null;
-    const result = await executor.query("SELECT storage_key,data FROM erp_state WHERE storage_key IN ('employees','roleCatalog','rolePermissions')");
+    const [result, employees] = await Promise.all([
+        executor.query("SELECT storage_key,data FROM erp_state WHERE storage_key IN ('roleCatalog','rolePermissions')"),
+        getEmployeeRecordsForAssignmentChecks(executor)
+    ]);
     const recordsByKey = new Map(result.rows.map((row) => [row.storage_key, row.data]));
-    const employees = Array.isArray(recordsByKey.get('employees')) ? recordsByKey.get('employees') : [];
     const roles = Array.isArray(recordsByKey.get('roleCatalog')) ? recordsByKey.get('roleCatalog') : [];
     const rolePermissions = Array.isArray(recordsByKey.get('rolePermissions')) ? recordsByKey.get('rolePermissions') : [];
     const departmentRecords = key === 'departmentCatalog'
@@ -367,7 +343,7 @@ const preserveRetiredIndentHistory = (value, previousValue) => {
 
 router.get('/state', async(req, res) => {
     const result = await getPool().query('SELECT storage_key, data, updated_at FROM erp_state ORDER BY storage_key');
-    const records = Object.fromEntries(result.rows.filter((row) => stateKeyAllowed(req, row.storage_key, 'read')).map((row) => [row.storage_key, row.data]));
+    const records = Object.fromEntries(result.rows.filter((row) => isSyncableKey(row.storage_key) && stateKeyAllowed(req, row.storage_key, 'read')).map((row) => [row.storage_key, row.data]));
     res.json({ records: withoutEmployeePasswords(records), updatedAt: result.rows.at(-1)?.updated_at?.toISOString() || null });
 });
 
@@ -436,6 +412,12 @@ router.post('/state', upsertState);
 
 router.get('/state/:key', async(req, res) => {
     const { key } = req.params;
+    if (['departmentCatalog', 'roleCatalog'].includes(key)) {
+        if (!stateKeyAllowed(req, key, 'read')) return res.status(403).json({ error: 'Your selected department role cannot access this ERP data.' });
+        const catalogs = await readDepartmentRoleCatalogs();
+        const data = key === 'departmentCatalog' ? catalogs.departments : catalogs.roles;
+        return res.json({ key, data, updatedAt: null, authoritative: 'department-role-catalog-api' });
+    }
     if (!isSyncableKey(key)) return res.status(400).json({ error: 'Invalid or excluded ERP state key' });
     if (!stateKeyAllowed(req, key, 'read')) return res.status(403).json({ error: 'Your selected department role cannot access this ERP data.' });
     let result = await getPool().query('SELECT storage_key, data, updated_at FROM erp_state WHERE storage_key = $1', [key]);
@@ -461,6 +443,10 @@ router.get('/state/:key', async(req, res) => {
 
 router.put('/state/:key', async(req, res) => {
     const { key } = req.params;
+    if (['departmentCatalog', 'roleCatalog'].includes(key)) {
+        if (!stateKeyAllowed(req, key, 'write')) return res.status(403).json({ error: 'Your selected department role cannot modify this ERP data.' });
+        return res.status(409).json({ error: 'Whole-catalog replacement is disabled. Use the versioned /api/organization-catalogs record API.' });
+    }
     if (!isSyncableKey(key)) return res.status(400).json({ error: 'Invalid or excluded ERP state key' });
     if (!stateKeyAllowed(req, key, 'write')) return res.status(403).json({ error: 'Your selected department role cannot modify this ERP data.' });
     let value = req.body?.data !== undefined ? req.body.data : req.body;
@@ -510,50 +496,9 @@ router.put('/state/:key', async(req, res) => {
     finally { client.release(); }
 });
 
-router.delete('/state/employees/:employeeId', requireAdmin, async(req, res) => {
-    const employeeId = String(req.params.employeeId || '').trim();
-    if (!employeeId || ['undefined', 'null'].includes(employeeId.toLowerCase())) return res.status(400).json({ error: 'A valid Employee ID is required.' });
-    const client = await getPool().connect();
-    try {
-        await client.query('BEGIN');
-        const locked = await client.query("SELECT data FROM erp_state WHERE storage_key='employees' FOR UPDATE");
-        const employees = Array.isArray(locked.rows[0]?.data) ? locked.rows[0].data : [];
-        // Employee ID is the human-facing master identifier (for example TEST-123).
-        // `id` may instead contain an authentication account key such as auth-multi-123.
-        const employee = employees.find((item) => String(item.employeeId || '').trim().toLowerCase() === employeeId.toLowerCase());
-        if (!employee) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Employee not found.' }); }
-        if (['admin', 'administrator'].includes(String(employee.roleKey || '').toLowerCase()) || String(employee.role || '').toLowerCase() === 'administrator' || String(employee.id) === 'admin' || employee.serverManaged === true) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({ error: 'The built-in Administrator account is server managed and cannot be deleted.' });
-        }
-        const employeeIdentity = new Set([employee.id, employee.employeeId, employee.email].filter(Boolean).map((value) => String(value).trim().toLowerCase()));
-        const adminIdentity = [req.user?.id, req.user?.employeeId, req.user?.email].filter(Boolean).map((value) => String(value).trim().toLowerCase());
-        if (adminIdentity.some((identity) => employeeIdentity.has(identity))) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({ error: 'The currently authenticated Admin account cannot be deleted.' });
-        }
-
-        // Audit rows, module records, quality inspections, approvals, and workflow
-        // documents are immutable snapshots. They have no employee foreign key and
-        // are deliberately left untouched by this operation.
-        const identities = [...employeeIdentity];
-        await client.query(
-            `UPDATE erp_sessions SET revoked_at=COALESCE(revoked_at,now())
-             WHERE revoked_at IS NULL AND (lower(user_id)=ANY($1::text[]) OR lower(email)=ANY($1::text[]) OR lower(employee_id)=ANY($1::text[]))`,
-            [identities]
-        );
-        const next = employees.filter((item) => String(item.employeeId || '').trim().toLowerCase() !== employeeId.toLowerCase());
-        await client.query("UPDATE erp_state SET data=$1::jsonb,updated_at=now() WHERE storage_key='employees'", [JSON.stringify(next)]);
-        await client.query(
-            `INSERT INTO erp_audit_log (user_id,email,role,module,record_id,record_label,action,reason,before_values,after_values)
-             VALUES ($1,$2,$3,'employees',$4,$5,'DELETE','',$6::jsonb,$7::jsonb)`,
-            [req.user.id, req.user.email, req.user.role, employeeId, employee.name || employee.employeeId || '', JSON.stringify(safeAuditValues(employee)), JSON.stringify({ deleted: true })]
-        );
-        await client.query('COMMIT');
-        res.json({ success: true, deleted: { id: employee.id, employeeId: employee.employeeId, name: employee.name } });
-    } catch (error) { await client.query('ROLLBACK'); throw error; }
-    finally { client.release(); }
-});
+router.delete('/state/employees/:employeeId', requireAdmin, async(_req, res) =>
+    res.status(409).json({ error: 'Employee records are managed through the versioned /api/employees API.' })
+);
 
 router.delete('/state/customerDirectory/:customerId', requireAdmin, async(req, res) => {
     const id = String(req.params.customerId || '').trim();
@@ -579,13 +524,27 @@ router.delete('/state/customerDirectory/:customerId', requireAdmin, async(req, r
     } finally { client.release(); }
 });
 
+router.use('/state/departmentCatalog', requireAdmin, (req, res, next) => {
+    if (['PUT', 'POST', 'DELETE', 'PATCH'].includes(req.method)) {
+        return res.status(409).json({ error: 'Department catalog mutations use the versioned /api/organization-catalogs API.' });
+    }
+    return next();
+});
+router.use('/state/roleCatalog', requireAdmin, (req, res, next) => {
+    if (['PUT', 'POST', 'DELETE', 'PATCH'].includes(req.method)) {
+        return res.status(409).json({ error: 'Role catalog mutations use the versioned /api/organization-catalogs API.' });
+    }
+    return next();
+});
+
 router.delete('/state/departmentCatalog/:id', requireAdmin, async(req, res) => {
     const id = String(req.params.id || '').trim();
     if (!id || ['undefined', 'null'].includes(id.toLowerCase())) return res.status(400).json({ error: 'A valid department ID is required.' });
     const client = await getPool().connect();
     try {
         await client.query('BEGIN');
-        const locked = await client.query("SELECT storage_key,data FROM erp_state WHERE storage_key IN ('departmentCatalog','employees','roleCatalog','rolePermissions') ORDER BY storage_key FOR UPDATE");
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('employee-assignment-catalog'))");
+        const locked = await client.query("SELECT storage_key,data FROM erp_state WHERE storage_key IN ('departmentCatalog','roleCatalog','rolePermissions') ORDER BY storage_key FOR UPDATE");
         const before = locked.rows.find((row) => row.storage_key === 'departmentCatalog')?.data || [];
         const department = before.find((item) => String(item.id) === id);
         if (!department) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Custom department not found.' }); }
@@ -646,7 +605,8 @@ router.delete('/state/roleCatalog/:id', requireAdmin, async(req, res) => {
     const client = await getPool().connect();
     try {
         await client.query('BEGIN');
-        const locked = await client.query("SELECT storage_key, data FROM erp_state WHERE storage_key IN ('roleCatalog','employees','rolePermissions') ORDER BY storage_key FOR UPDATE");
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('employee-assignment-catalog'))");
+        const locked = await client.query("SELECT storage_key, data FROM erp_state WHERE storage_key IN ('roleCatalog','rolePermissions') ORDER BY storage_key FOR UPDATE");
         const before = locked.rows.find((row) => row.storage_key === 'roleCatalog')?.data || [];
         const role = before.find((item) => String(item.id) === id);
         if (!role) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Custom role not found.' }); }

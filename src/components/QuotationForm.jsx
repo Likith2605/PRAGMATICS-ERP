@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FileText } from 'lucide-react';
 import { calculateGSTAmount, calculateLineAmount, calculateTotals } from '../utils/calculations.js';
@@ -7,13 +7,14 @@ import { generateQuotationPDF } from '../services/pdfGenerator.js';
 import QuotationPreview from './QuotationPreview.jsx';
 import { getQuotationTemplates, getTemplateColumns } from '../utils/quotationTemplates.js';
 import { getCompanyLegalName, getCompanyProfile } from '../utils/companyBranding.js';
-import { getNextSequentialNumber, getNextQuotationNumber, saveDocSequence } from '../utils/sequenceGenerator.js';
+import { getNextSequentialNumber } from '../utils/sequenceGenerator.js';
 import { getAllProjectsSummary, getFullProjectData } from '../utils/projectTracker.js';
 import ProjectIdAutocomplete from './ProjectIdAutocomplete.jsx';
 import { isAdmin } from '../utils/auth.js';
 import { getBOMs, getInventoryItems } from '../utils/storeService.js';
 import AddableSelect from './AddableSelect.jsx';
 import { addCustomUnit, DEFAULT_UNITS, getCustomUnits } from '../utils/addableMasters.js';
+import { createQuotation, reserveNextQuotationNumber, updateQuotation } from '../services/quotationApi.js';
 
 const emptyItem = {
   itemName: '',
@@ -79,10 +80,6 @@ const loadTermsTemplates = () => {
   }
 };
 
-const generateQuotationNumber = () => {
-  return getNextQuotationNumber();
-};
-
 const QuotationForm = ({ initialData = null, onCancel = null }) => {
   const [isTemplateMenuOpen, setIsTemplateMenuOpen] = useState(false);
   const [hoveredTemplateId, setHoveredTemplateId] = useState('');
@@ -90,30 +87,18 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
   const [newTemplateName, setNewTemplateName] = useState('');
   const [newTemplateContent, setNewTemplateContent] = useState('');
   const [companyDetails, setCompanyDetails] = useState(() => {
-    try {
-      const stored = localStorage.getItem('companySettings');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        return {
-          companyName: parsed.companyName || getCompanyLegalName(),
-          phone: parsed.phone || '',
-          email: parsed.email || '',
-          gstin: parsed.gstin || '',
-          state: parsed.state || '',
-          address: parsed.address || '',
-          bankName: parsed.bankName || '',
-          accountNumber: parsed.accountNumber || '',
-          ifscCode: parsed.ifscCode || '',
-          branch: parsed.branch || ''
-        };
-      }
-    } catch {}
+    const profile = getCompanyProfile();
     return initialData?.companyDetails || {
       companyName: getCompanyLegalName(),
-      phone: '',
-      email: '',
-      gstin: '',
-      state: ''
+      phone: profile.phone || '',
+      email: profile.email || '',
+      gstin: profile.gstin || '',
+      state: profile.state || '',
+      address: profile.address || '',
+      bankName: profile.bankName || profile.bankDetails?.bankName || '',
+      accountNumber: profile.accountNumber || profile.bankDetails?.accountNumber || '',
+      ifscCode: profile.ifscCode || profile.bankDetails?.ifscCode || '',
+      branch: profile.branch || profile.bankDetails?.branch || ''
     };
   });
 
@@ -129,7 +114,7 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
 
   const [quotationDetails, setQuotationDetails] = useState(() => ({
     quotationTemplate: initialData?.quotationDetails?.quotationTemplate || '',
-    quotationNumber: initialData?.quotationDetails?.quotationNumber || generateQuotationNumber(),
+    quotationNumber: initialData?.quotationDetails?.quotationNumber || '',
     quotationDate: initialData?.quotationDetails?.quotationDate || initialData?.quotationDetails?.date || new Date().toISOString().slice(0, 10),
     projectId: initialData?.quotationDetails?.projectId || '',
     bomId: initialData?.quotationDetails?.bomId || '',
@@ -175,7 +160,7 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
       if (initialData.quotationDetails) {
         setQuotationDetails({
           ...initialData.quotationDetails,
-          quotationNumber: initialData.quotationDetails.quotationNumber || generateQuotationNumber(),
+          quotationNumber: initialData.quotationDetails.quotationNumber || '',
           quotationDate: initialData.quotationDetails.quotationDate || initialData.quotationDetails.date || new Date().toISOString().slice(0, 10),
           currency: initialData.quotationDetails.currency || 'INR',
           exchangeRate: initialData.quotationDetails.exchangeRate ?? '',
@@ -700,6 +685,17 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
   const navigate = useNavigate();
   const [statusMessage, setStatusMessage] = useState('');
   const [pdfMessage, setPdfMessage] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const createToken = useRef(globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
+
+  useEffect(() => {
+    if (initialData?.quotationDetails?.quotationNumber) return;
+    let active = true;
+    reserveNextQuotationNumber()
+      .then((quotationNumber) => { if (active) setQuotationDetails((current) => ({ ...current, quotationNumber })); })
+      .catch((error) => { if (active) setStatusMessage(`Could not reserve a quotation number from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
+  }, [initialData?.quotationDetails?.quotationNumber]);
 
   const getQuotationPayload = () => ({
     companyDetails: {
@@ -715,12 +711,6 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
     totals,
     amountInWords
   });
-
-  const saveQuotation = () => {
-    const payload = getQuotationPayload();
-    localStorage.setItem('currentQuotation', JSON.stringify(payload));
-    setStatusMessage('Quotation saved to Local Storage.');
-  };
 
   const resetForm = () => {
     const confirmed = window.confirm('Clear all form fields and reset the quotation?');
@@ -747,7 +737,7 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
       state: ''
     });
     setQuotationDetails({
-      quotationNumber: generateQuotationNumber(),
+      quotationNumber: '',
       quotationDate: new Date().toISOString().slice(0, 10),
       projectId: '',
       placeOfSupply: '',
@@ -766,6 +756,8 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
       items: []
     });
     setStatusMessage('Form reset completed.');
+    reserveNextQuotationNumber().then((quotationNumber) => setQuotationDetails((current) => ({ ...current, quotationNumber })))
+      .catch((error) => setStatusMessage(`Form reset, but PostgreSQL could not reserve a quotation number: ${error.message}`));
     setPdfMessage('');
   };
 
@@ -799,53 +791,32 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
     }
 
     const payload = getQuotationPayload();
-    localStorage.setItem('currentQuotation', JSON.stringify(payload));
     navigate('/quotation/preview', { state: { quotation: payload } });
   };
-
-  const appendQuotationToHistory = (quotation) => {
-    try {
-      const stored = localStorage.getItem('quotationHistory');
-      let history = stored ? JSON.parse(stored) : [];
-      const entry = {
-        date: quotation.quotationDetails.quotationDate,
-        reference: quotation.quotationDetails.quotationNumber,
-        projectId: quotation.quotationDetails.projectId || '',
-        company: quotation.customerDetails.companyName || quotation.customerDetails.customerName || '-',
-        total: money(Number(quotation.totals?.grandTotal || 0), quotation.quotationDetails?.currency || 'INR'),
-        currency: quotation.quotationDetails?.currency || 'INR',
-        amountINR: convertToINR(
-          Number(quotation.totals?.grandTotal || 0),
-          quotation.quotationDetails?.currency || 'INR',
-          quotation.quotationDetails?.exchangeRate
-        ),
-        balanceStatus: 'Pending',
-        payload: quotation
-      };
-
-      const existingIndex = history.findIndex((h) => h.reference === entry.reference);
-      if (existingIndex !== -1) {
-        history[existingIndex] = entry;
-      } else {
-        history.unshift(entry);
-      }
-      localStorage.setItem('quotationHistory', JSON.stringify(history));
-    } catch (error) {
-      console.error('Unable to save quotation history', error);
-    }
-  };
-
-  const handleSubmit = (event) => {
+  const handleSubmit = async (event) => {
     event.preventDefault();
-    if (!validate()) {
-      return;
-    }
+    if (!validate() || isSaving) return;
 
     const payload = getQuotationPayload();
-    saveDocSequence('quotationSequence', payload.quotationDetails.quotationNumber);
-    localStorage.setItem('currentQuotation', JSON.stringify(payload));
-    appendQuotationToHistory(payload);
-    navigate('/quotation/preview', { state: { quotation: payload } });
+    if (!payload.quotationDetails.quotationNumber) {
+      setStatusMessage('Wait for PostgreSQL to reserve a quotation number before saving.');
+      return;
+    }
+    setIsSaving(true);
+    setStatusMessage('Saving quotation to PostgreSQL…');
+    try {
+      const saved = initialData?.recordVersion
+        ? await updateQuotation(payload.quotationDetails.quotationNumber, payload, initialData.recordVersion)
+        : await createQuotation(payload, createToken.current);
+      setStatusMessage('Quotation saved in PostgreSQL.');
+      navigate(`/quotation/preview?quotationNumber=${encodeURIComponent(saved.record.reference)}`, { state: { quotation: saved.record.payload } });
+    } catch (error) {
+      setStatusMessage(error.status === 409
+        ? `Quotation was not saved because the server reports a conflict: ${error.message}`
+        : `Quotation was not saved: ${error.message}`);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -1728,7 +1699,7 @@ const QuotationForm = ({ initialData = null, onCancel = null }) => {
         )}
 
         <div className="form-actions quotation-actions no-print">
-          <button type="submit" className="button-primary">Save</button>
+          <button type="submit" className="button-primary" disabled={isSaving}>{isSaving ? 'Saving…' : 'Save'}</button>
         </div>
         {statusMessage && <div className="field-success no-print">{statusMessage}</div>}
         {pdfMessage && <div className="field-success no-print">{pdfMessage}</div>}

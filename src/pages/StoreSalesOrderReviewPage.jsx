@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import {
@@ -11,7 +11,8 @@ import {
   getIndentForSO,
   getSalesOrderMaterialStatus,
   getSalesOrdersAwaitingCheck,
-  getDocumentChain
+  getDocumentChain,
+  hydrateAvailabilityChecks
 } from '../utils/workflowService.js';
 
 const badgeClass = (status) => `status-badge st-${String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
@@ -30,6 +31,21 @@ const StoreSalesOrderReviewPage = () => {
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
 
+  useEffect(() => {
+    let active = true;
+    hydrateAvailabilityChecks()
+      .then(() => { if (active) setTick((value) => value + 1); })
+      .catch((error) => {
+        if (active) setMessage({ type: 'err', text: `Availability checks could not be loaded from PostgreSQL: ${error.message}` });
+      });
+    const refresh = () => setTick((value) => value + 1);
+    window.addEventListener('availability-checks-updated', refresh);
+    return () => {
+      active = false;
+      window.removeEventListener('availability-checks-updated', refresh);
+    };
+  }, []);
+
   const salesOrders = useMemo(() => getSalesOrders(), [tick]);
   const awaiting = useMemo(() => getSalesOrdersAwaitingCheck(), [tick]);
 
@@ -42,8 +58,14 @@ const StoreSalesOrderReviewPage = () => {
   }, [salesOrders, search]);
 
   const so = viewSO ? getSalesOrderByRef(viewSO) : null;
-  const availability = so ? previewAvailability(so.reference) : null;
   const savedCheck = so ? getAvailabilityCheck(so.reference) : null;
+  const liveAvailability = so ? previewAvailability(so.reference) : null;
+  const availability = liveAvailability ? {
+    ...liveAvailability,
+    lines: savedCheck?.lines || liveAvailability.lines,
+    checked: Boolean(savedCheck),
+    savedRecord: savedCheck
+  } : null;
   const materialStatus = so ? getSalesOrderMaterialStatus(so.reference) : null;
   const indents = so ? getIndentForSO(so.reference) : [];
   const chain = so ? getDocumentChain(so.reference) : null;
@@ -59,23 +81,24 @@ const StoreSalesOrderReviewPage = () => {
     setTimeout(() => setMessage(null), 6000);
   };
 
-  const handleSaveCheck = () => {
+  const handleSaveCheck = async () => {
     try {
-      saveMaterialAvailabilityCheck({ soNumber: so.reference, remarks });
+      await saveMaterialAvailabilityCheck({ soNumber: so.reference, remarks });
       flash('ok', `Material availability check saved for ${so.reference}.`);
     } catch (err) {
       flash('err', err.message);
     }
   };
 
-  const handleCreateIndent = () => {
+  const handleCreateIndent = async () => {
     try {
-      const indent = createPurchaseIndent({
+      const indent = await createPurchaseIndent({
         soNumber: so.reference,
         reason: indentReason,
         remarks: indentRemarks,
         requiredDate: indentRequiredDate,
-        selectedCodes: selectedCodes.length ? selectedCodes : null
+        selectedCodes: selectedCodes.length ? selectedCodes : null,
+        persistToPostgres: true
       });
       setSelectedCodes([]);
       setIndentRemarks('');

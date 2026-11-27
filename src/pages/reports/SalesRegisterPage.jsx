@@ -1,6 +1,6 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { readLocalStorageList } from '../../utils/reportData.js';
+import { listCustomerInvoices } from '../../services/customerInvoiceApi.js';
 import { invTotalINR, invReceivedINR, invBalanceINR } from '../../utils/invoiceValues.js';
 
 const inr = (n) => Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -13,8 +13,34 @@ const formatInvoiceQty = (rows) => {
 };
 
 const SalesRegisterPage = () => {
+  const [invoices, setInvoices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    listCustomerInvoices()
+      .then((records) => {
+        if (!active) return;
+        setInvoices(Array.isArray(records) ? records : []);
+        setError('');
+      })
+      .catch((err) => {
+        if (!active) return;
+        console.error('Failed to load customer invoices from PostgreSQL:', err);
+        setError('Unable to load authoritative sales register data from PostgreSQL.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const { rows, customers, summary } = useMemo(() => {
-    const rawList = readLocalStorageList('customerInvoiceHistory');
+    const rawList = invoices;
     let totalTurnover = 0;
     let totalReceived = 0;
     let totalOutstanding = 0;
@@ -74,13 +100,18 @@ const SalesRegisterPage = () => {
         totalOutstanding
       }
     };
-  }, []);
+  }, [invoices]);
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
+      {error && (
+        <div style={{ background: '#fee2e2', border: '1px solid #f87171', color: '#991b1b', padding: '10px 14px', borderRadius: '6px', marginBottom: '14px', fontSize: '13px' }}>
+          {error}
+        </div>
+      )}
       <ReportRegister
         title="Sales Register"
-        subTitle="Customer-wise invoice register with taxable amounts, GST, and totals"
+        subTitle={loading ? 'Loading authoritative sales data from PostgreSQL...' : 'Customer-wise invoice register with taxable amounts, GST, and totals'}
         filename={`Sales-Register-${new Date().toISOString().slice(0, 10)}`}
         dateField="date"
         dateFilters={true}

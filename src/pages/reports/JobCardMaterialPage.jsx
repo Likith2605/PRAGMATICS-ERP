@@ -1,6 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getStoreIssues, getMaterialReturns, getJobCards } from '../../utils/storeService.js';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { getStoreIssues, getMaterialReturns } from '../../services/storeApi.js';
+import { listJobCards } from '../../services/productionApi.js';
 
 const qtyByUnit = (rows, field) => [...new Set(rows.map((row) => row.unit === 'Unit not recorded' ? '' : row.unit || ''))]
   .map((unit) => `${rows.filter((row) => (row.unit === 'Unit not recorded' ? '' : row.unit || '') === unit).reduce((sum, row) => sum + (Number(row[field]) || 0), 0).toLocaleString('en-IN', { maximumFractionDigits: 3 })}${unit ? ` ${unit}` : ''}`).join(' | ') || '0';
@@ -13,25 +16,31 @@ const groupedMovementRows = (rows, groupBy) => {
   }, {}));
 };
 
+const loadJobCardMaterialData = async () => {
+  const [issues, returns, jobCards] = await Promise.all([getStoreIssues(), getMaterialReturns(), listJobCards()]);
+  return { issues, returns, jobCards };
+};
+
 const JobCardMaterialPage = () => {
   const [groupBy, setGroupBy] = useState('none');
+  const { data, loading, error } = useAuthoritativeData(loadJobCardMaterialData, '', { issues: [], returns: [], jobCards: [] });
   const rows = useMemo(() => {
     const output = [];
     const issuedMaterials = new Set();
-    getStoreIssues().forEach((issue) => (issue.items || []).forEach((item, index) => {
+    data.issues.forEach((issue) => (issue.items || []).forEach((item, index) => {
       const materialId = item.materialId || item.materialName || '';
       issuedMaterials.add(`${String(issue.jobCardNumber || '').toUpperCase()}::${String(materialId).toLowerCase()}`);
       const issuedQty = Number(item.currentIssueQty ?? item.totalIssued ?? item.quantity) || 0;
       output.push({ jobCardNumber: issue.jobCardNumber || '-', projectId: issue.projectId || '-', materialName: item.materialName || materialId || '-', materialId, unit: item.unit || 'Unit not recorded', eventType: 'Issue', issueDate: issue.issueDate || '', date: issue.issueDate || '', issueNumber: issue.issueNumber || '', returnNumber: '', issuedQty, returnedQty: 0, netConsumed: issuedQty, sourceOrdinal: index + 1 });
     }));
-    getMaterialReturns().forEach((ret) => (ret.items || []).forEach((item, index) => {
+    data.returns.forEach((ret) => (ret.items || []).forEach((item, index) => {
       const returnedQty = Number(item.quantityReturned ?? item.returnQty ?? item.quantity) || 0;
       const date = ret.returnDate || ret.acknowledgedAt?.slice(0, 10) || '';
       const materialId = item.materialId || item.materialName || '';
       output.push({ jobCardNumber: ret.jobCardNumber || '-', projectId: ret.projectId || '-', materialName: item.materialName || materialId || '-', materialId, unit: item.unit || 'Unit not recorded', eventType: 'Return', issueDate: '', date, issueNumber: ret.issueNumber || '', returnNumber: ret.returnNumber || '', issuedQty: 0, returnedQty, netConsumed: -returnedQty, sourceOrdinal: index + 1 });
     }));
     // Retain the legacy Job Card raw-material fallback only when no matching issue line exists.
-    getJobCards().forEach((jobCard) => {
+    data.jobCards.forEach((jobCard) => {
       const material = jobCard.rawMaterial;
       if (!material || !(material.grade || material.dimensions || material.type)) return;
       const materialName = [material.type, material.grade, material.dimensions].filter(Boolean).join(' - ') || 'Raw Material';
@@ -42,7 +51,8 @@ const JobCardMaterialPage = () => {
       output.push({ jobCardNumber: jobCard.jobCardNumber || '-', projectId: jobCard.projectId || '-', materialName, materialId: '', unit: 'Unit not recorded', eventType: 'Issue', issueDate: jobCard.startDate || jobCard.poDate || '', date: jobCard.startDate || jobCard.poDate || '', issueNumber: '', returnNumber: '', issuedQty, returnedQty: 0, netConsumed: issuedQty, sourceOrdinal: 1, linkStatus: 'Legacy Job Card source; no issue slip' });
     });
     return output;
-  }, []);
+  }, [data]);
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
   const jobCards = [...new Set(rows.map((row) => row.jobCardNumber).filter((value) => value && value !== '-'))].sort();
   const projects = [...new Set(rows.map((row) => row.projectId).filter((value) => value && value !== '-'))].sort();
   const materials = [...new Set(rows.map((row) => row.materialName).filter((value) => value && value !== '-'))].sort();

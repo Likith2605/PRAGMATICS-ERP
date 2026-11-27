@@ -1,0 +1,93 @@
+{
+  "generatedOnPlatform": "win32",
+  "projectType": "webapp",
+  "setup": [],
+  "assertions": [
+    {
+      "name": "production-build",
+      "kind": "process",
+      "command": "npm",
+      "args": ["run", "build"],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "tests-pass",
+      "kind": "process",
+      "command": "npm",
+      "args": ["run", "test:reports"],
+      "verificationMethod": "test-results",
+      "expected": "0",
+      "timeoutSeconds": 180
+    },
+    {
+      "name": "track-a-report-calculations",
+      "kind": "process",
+      "command": "node",
+      "args": ["tests/track-a-reports.test.mjs"],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 240
+    },
+    {
+      "name": "store-debit-authority-consumers",
+      "kind": "process",
+      "command": "node",
+      "args": ["tests/store-debit-authority-consumers.test.mjs"],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "production-authority-consumers",
+      "kind": "process",
+      "command": "node",
+      "args": ["tests/production-authority-consumers.test.mjs"],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "guarded-postgres-sequence",
+      "kind": "process",
+      "command": "node",
+      "args": [
+        "--input-type=module",
+        "-e",
+        "import 'dotenv/config'; import { spawnSync } from 'node:child_process'; import pg from 'pg'; const url = process.env.ERP_TEST_DATABASE_URL; if (!url) throw new Error('ERP_TEST_DATABASE_URL is required; refusing test writes.'); const configuredName = decodeURIComponent(new URL(url).pathname.replace(/^\\/+/, '')); if (configuredName !== 'vyavastha_test') throw new Error('ERP_TEST_DATABASE_URL must name exactly vyavastha_test.'); const pool = new pg.Pool({ connectionString: url }); try { const identity = await pool.query('SELECT current_database() AS name'); console.log('Guarded test database:', identity.rows[0]?.name); if (identity.rows[0]?.name !== 'vyavastha_test') throw new Error('Refusing test writes: current_database() is not exactly vyavastha_test.'); } finally { await pool.end(); } const suites = ['enquiries-api.test.mjs', 'quotation-api.test.mjs', 'customer-po-api.test.mjs', 'sales-orders-api.test.mjs', 'delivery-challans-api.test.mjs', 'customer-invoices-api.test.mjs', 'export-invoices-api.test.mjs', 'procurement-intake-api.test.mjs', 'store-inventory-api.test.mjs', 'masters-api.test.mjs', 'debit-notes-api.test.mjs', 'workflow-ledger-records-api.test.mjs', 'production-api.test.mjs', 'bom-api.test.mjs', 'routing-api.test.mjs', 'authoritative-deletes-api.test.mjs', 'receipt-linked-records-api.test.mjs', 'recycle-bin-api.test.mjs', 'purchase-requests-api.test.mjs', 'financial-advances-api.test.mjs', 'availability-checks-api.test.mjs', 'supplier-outstanding-advances-api.test.mjs', 'employee-master-api.test.mjs', 'auth-login.test.mjs', 'employee-assignment-delete.test.mjs', 'role-permission-integration.test.mjs', 'department-role-catalog-api.test.mjs', 'role-permission-sync.test.mjs', 'production-dispatch.test.mjs', 'shared-masters-client.test.mjs']; for (const suite of suites) { console.log('\\\\n=== ' + suite + ' ==='); const result = spawnSync(process.execPath, ['tests/' + suite], { cwd: process.cwd(), env: process.env, stdio: 'inherit' }); if (result.error) throw result.error; if (result.status !== 0) process.exit(result.status ?? 1); } console.log('SEQUENTIAL SUITES PASSED: ' + suites.length);"
+      ],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 1800
+    },
+    {
+      "name": "recycle-bin-api-guarded",
+      "kind": "process",
+      "command": "node",
+      "args": ["tests/recycle-bin-api.test.mjs"],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "purchase-requests-api-guarded",
+      "kind": "process",
+      "command": "node",
+      "args": ["tests/purchase-requests-api.test.mjs"],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "frontend-homepage-http-200",
+      "kind": "http-probe",
+      "startCommand": "npm",
+      "startArgs": ["run", "dev:frontend", "--", "--host", "127.0.0.1", "--port", "5176", "--strictPort"],
+      "url": "http://127.0.0.1:5176/",
+      "verificationMethod": "http-status",
+      "expected": "200",
+      "timeoutSeconds": 60
+    }
+  ]
+}

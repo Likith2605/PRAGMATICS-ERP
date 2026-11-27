@@ -1,7 +1,7 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
 import { getStalePurchaseOrderRows, purchaseOrderFilters } from '../../utils/purchaseReportData.js';
-import { getPOProgress, shortClosePurchaseOrder } from '../../utils/workflowService.js';
+import { listPurchaseOrders, shortClosePurchaseOrderApi } from '../../services/procurementIntakeApi.js';
 import { hasPermission } from '../../utils/permissions.js';
 import { formatQuantityByUnit } from '../../utils/reportFilters.js';
 
@@ -15,24 +15,37 @@ const REASONS = [
 const qty = (value) => Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
 
 const StalePurchaseOrdersPage = () => {
-  const [refresh, setRefresh] = useState(0);
+  const [serverOrders, setServerOrders] = useState([]);
+  const [loadError, setLoadError] = useState('');
   const [selected, setSelected] = useState(null);
   const [reason, setReason] = useState(REASONS[0]);
   const [remarks, setRemarks] = useState('');
   const [message, setMessage] = useState('');
-  const rows = useMemo(() => getStalePurchaseOrderRows(), [refresh]);
+
+  /* The report is derived from PostgreSQL-confirmed Purchase Orders. A failed
+   * load shows an error instead of silently falling back to a browser cache. */
+  const loadOrders = useCallback(async () => {
+    const orders = await listPurchaseOrders();
+    setServerOrders(orders);
+    setLoadError('');
+  }, []);
+  useEffect(() => {
+    loadOrders().catch((error) => setLoadError(`Purchase Orders could not be loaded from PostgreSQL: ${error.message}`));
+  }, [loadOrders]);
+
+  const rows = useMemo(() => getStalePurchaseOrderRows(undefined, serverOrders), [serverOrders]);
   const filters = purchaseOrderFilters(rows);
   const canShortClose = hasPermission('purchase.order.short_close');
 
-  const submitShortClose = (event) => {
+  const submitShortClose = async (event) => {
     event.preventDefault();
     try {
-      const closed = shortClosePurchaseOrder(selected.poNumber, { reason, remarks });
-      setMessage(`PO ${closed.reference} was short-closed. Its original ordered and receipt quantities were preserved.`);
+      const closed = await shortClosePurchaseOrderApi(selected.poNumber, selected.version, reason, remarks);
+      setMessage(`PO ${closed.record.reference} was short-closed. Its original ordered and receipt quantities were preserved.`);
       setSelected(null);
       setReason(REASONS[0]);
       setRemarks('');
-      setRefresh((value) => value + 1);
+      await loadOrders();
     } catch (error) {
       setMessage(error.message || 'Unable to short-close this Purchase Order.');
     }
@@ -41,6 +54,7 @@ const StalePurchaseOrdersPage = () => {
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
       {message && <div className="field-hint" role="status" style={{ marginBottom: 12 }}>{message}</div>}
+      {loadError && <div role="alert" className="form-error" style={{ marginBottom: 12 }}>{loadError}</div>}
       <ReportRegister
         title="Stale Purchase Order Report"
         subTitle="Open and partially received POs past their expected delivery dates. Overdue is derived separately from the actual PO status."
@@ -76,7 +90,7 @@ const StalePurchaseOrdersPage = () => {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
           <form className="content-block" role="dialog" aria-modal="true" aria-labelledby="short-close-title" onSubmit={submitShortClose} style={{ maxWidth: 560, margin: '10vh auto', padding: 22 }}>
             <h2 id="short-close-title" className="block-title">Short-close PO {selected.poNumber}</h2>
-            <p className="muted-text">Supplier: {selected.supplier}. The PO and receipt history stay unchanged. Remaining open balance: {qty(getPOProgress(selected.poNumber).pending)}.</p>
+            <p className="muted-text">Supplier: {selected.supplier}. The PO and receipt history stay unchanged. Remaining open balance: {qty(selected.pendingQty)}.</p>
             <label className="field-group" style={{ display: 'block', marginTop: 16 }}>
               <span>Closure reason</span>
               <select className="action-select" value={reason} onChange={(event) => setReason(event.target.value)} required>

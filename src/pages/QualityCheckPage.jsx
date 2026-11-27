@@ -6,11 +6,8 @@ import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterMaterialRecords } from '../utils/historySearch.js';
 import { hasPermission } from '../utils/permissions.js';
 import {
-  getReceipts,
   getReceiptsForPO,
-  getReceipt,
   getQualityChecks,
-  getQualityCheck,
   getQualityCheckForReceipt,
   getQualityCheckForIndent,
   getDebitNotesForQualityCheck,
@@ -22,6 +19,8 @@ import {
   QC_STATUS
 } from '../utils/workflowService.js';
 import { openWorkflowDocument } from '../utils/workflowFiles.js';
+import { listPurchaseIndentQualityChecks, listProcurementRecords } from '../services/procurementIntakeApi.js';
+import { listMaterialReceiptsApi, listMaterialReceiptQualityChecksApi } from '../services/materialReceiptApi.js';
 
 const badgeClass = (status) => `status-badge st-${String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
 const num = (v) => Number(v) || 0;
@@ -37,7 +36,37 @@ const QualityCheckPage = () => {
   const [openQC, setOpenQC] = useState(null);
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
+  const [serverIndentQCs, setServerIndentQCs] = useState([]);
+  const [serverReceipts, setServerReceipts] = useState([]);
+  const [serverReceiptQCs, setServerReceiptQCs] = useState([]);
+  const [receiptListReady, setReceiptListReady] = useState(false);
+  const [receiptListFailed, setReceiptListFailed] = useState(false);
+  const [indentQCsReady, setIndentQCsReady] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([listPurchaseIndentQualityChecks(), listProcurementRecords('purchaseIndent')]).then(([checks]) => {
+      if (!active) return;
+      setServerIndentQCs(checks);
+      setIndentQCsReady(true);
+      setTick((value) => value + 1);
+    }).catch((error) => {
+      if (!active) return;
+      setServerIndentQCs([]);
+      setIndentQCsReady(false);
+      setMessage({ type: 'err', text: `Purchase Indent Quality Checks could not be loaded from PostgreSQL: ${error.message}` });
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([listMaterialReceiptsApi(), listMaterialReceiptQualityChecksApi()])
+      .then(([rows, checks]) => { if (active) { setServerReceipts(rows); setServerReceiptQCs(checks); setReceiptListFailed(false); setReceiptListReady(true); } })
+      .catch((error) => { if (active) { setServerReceipts([]); setServerReceiptQCs([]); setReceiptListFailed(true); setReceiptListReady(true); setMessage({ type: 'err', text: `PostgreSQL receipt or Quality Check data could not be loaded: ${error.message}` }); } });
+    return () => { active = false; };
+  }, [tick]);
 
   /* Notification deep link: /quality-checks?receipt=MR-xxxx opens the
      inspection (or the saved Quality Check when it already exists). */
@@ -45,7 +74,9 @@ const QualityCheckPage = () => {
     const rec = searchParams.get('receipt');
     const indentNo = searchParams.get('indent');
     if (rec) {
-      const receipt = getReceipt(rec);
+      if (!receiptListReady) return;
+      if (receiptListFailed) { setSearchParams({}, { replace: true }); return; }
+      const receipt = serverReceipts.find((row) => String(row.receiptNumber) === String(rec)) || null;
       if (!receipt) {
         setSearchParams({}, { replace: true });
         setMessage({ type: 'err', text: `Material Receipt ${rec} could not be found. Refresh the receipt list and try again.` });
@@ -64,6 +95,7 @@ const QualityCheckPage = () => {
       return;
     }
     if (indentNo) {
+      if (!indentQCsReady) return;
       const indent = getIndent(indentNo);
       if (!indent) {
         setSearchParams({}, { replace: true });
@@ -82,10 +114,10 @@ const QualityCheckPage = () => {
       setSearchParams({}, { replace: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams]);
+  }, [searchParams, indentQCsReady, receiptListReady, receiptListFailed]);
 
-  const receipts = useMemo(() => getReceipts(), [tick]);
-  const qcs = useMemo(() => getQualityChecks(), [tick]);
+  const receipts = serverReceipts;
+  const qcs = useMemo(() => [...getQualityChecks().filter((check) => !check.indentNumber && !check.receiptNumber), ...serverReceiptQCs, ...serverIndentQCs], [tick, serverIndentQCs, serverReceiptQCs]);
   const indentQueue = useMemo(() => getIndentsAwaitingQualityCheck(), [tick]);
   const canManage = hasPermission('production.qc.manage');
   const isStoreUser = hasPermission('store.module') && !hasPermission('purchase.order');
@@ -100,7 +132,7 @@ const QualityCheckPage = () => {
     setTimeout(() => setMessage(null), 7000);
   };
 
-  const qc = openQC ? getQualityCheck(openQC) : null;
+  const qc = openQC ? qcs.find((check) => String(check.qcNumber) === String(openQC)) || null : null;
 
   if (inspectReceipt || inspectIndent) {
     const inspectTarget = inspectReceipt || inspectIndent;
@@ -142,7 +174,23 @@ const QualityCheckPage = () => {
             key={inspectTarget}
             receiptNumber={inspectReceipt || ''}
             indentNumber={inspectIndent || ''}
-            onDone={(qcNumber) => { setInspectReceipt(null); setInspectIndent(null); setOpenQC(qcNumber); flash('ok', `Quality check ${qcNumber} saved.`); }}
+            receiptRecord={inspectReceipt ? (serverReceipts.find((row) => String(row.receiptNumber) === String(inspectReceipt)) || null) : null}
+            serverQC={
+              inspectReceipt
+                ? (serverReceiptQCs.find((row) => String(row.receiptNumber) === String(inspectReceipt)) || null)
+                : (serverIndentQCs.find((row) => String(row.indentNumber) === String(inspectIndent)) || null)
+            }
+            onDone={async (qcNumber) => {
+              if (inspectReceipt) {
+                try { setServerReceiptQCs(await listMaterialReceiptQualityChecksApi()); }
+                catch (error) { flash('err', `Quality Check was saved, but PostgreSQL refresh failed: ${error.message}`); return; }
+              }
+              if (inspectIndent) {
+                try { setServerIndentQCs(await listPurchaseIndentQualityChecks()); }
+                catch (error) { flash('err', `Quality check was saved, but refresh failed: ${error.message}`); return; }
+              }
+              setInspectReceipt(null); setInspectIndent(null); setOpenQC(qcNumber); flash('ok', `Quality check ${qcNumber} saved.`);
+            }}
             onError={(err) => flash('err', err.message)}
           />
         ) : (
@@ -254,9 +302,9 @@ const QualityCheckPage = () => {
             {canManage && !posted && num(qc.items.reduce((a, i) => a + num(i.acceptedQty), 0)) > 0 && (
               <button
                 className="button-primary"
-                onClick={() => {
+                onClick={async () => {
                   try {
-                    postApprovedMaterialToInventory(qc.qcNumber);
+                    await postApprovedMaterialToInventory(qc.qcNumber);
                     flash('ok', 'Approved quantity added to inventory.');
                   } catch (err) {
                     flash('err', err.message);
@@ -498,10 +546,11 @@ const QualityCheckPage = () => {
 
 /* ------------------------------ inspection form ------------------------------ */
 
-const InspectionForm = ({ receiptNumber = '', indentNumber = '', onDone, onError }) => {
-  const receipt = receiptNumber ? getReceipt(receiptNumber) : null;
+const InspectionForm = ({ receiptNumber = '', indentNumber = '', receiptRecord = null, serverQC = null, onDone, onError }) => {
+  /* Only PostgreSQL rows handed in by the page are used as the receipt record. */
+  const receipt = receiptRecord || null;
   const indent = indentNumber ? getIndent(indentNumber) : null;
-  const existing = receiptNumber ? getQualityCheckForReceipt(receiptNumber) : getQualityCheckForIndent(indentNumber);
+  const existing = serverQC || (receiptNumber ? getQualityCheckForReceipt(receiptNumber) : getQualityCheckForIndent(indentNumber));
   const progress = !receipt && indent?.poNumber ? getPOProgress(indent.poNumber) : null;
   const receiptItems = Array.isArray(receipt?.items) ? receipt.items : [];
   const existingItems = Array.isArray(existing?.items) ? existing.items : [];
@@ -578,10 +627,10 @@ const InspectionForm = ({ receiptNumber = '', indentNumber = '', onDone, onError
   const totalsBalanced = totalAccepted + totalRejected === totalReceived;
   const undecidedLine = lines.find((l) => num(l.acceptedQty) + num(l.rejectedQty) !== num(l.receivedQty));
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
     try {
-      const result = saveQualityCheck({
+      const result = await saveQualityCheck({
         receiptNumber,
         indentNumber,
         inspectionDate,

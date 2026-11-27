@@ -26,18 +26,26 @@ put('erp_auth', {
 const vite = await createServer({ server: { middlewareMode: true }, appType: 'custom' });
 try {
   const { default: WorkflowDashboardPage } = await vite.ssrLoadModule('/src/pages/WorkflowDashboardPage.jsx');
+  const { default: DashboardPage } = await vite.ssrLoadModule('/src/pages/DashboardPage.jsx');
   const render = () => renderToStaticMarkup(
     React.createElement(MemoryRouter, null, React.createElement(WorkflowDashboardPage))
   );
 
-  put('supplierPOHistory', []);
-  assert.match(render(), /Purchase Dashboard/, 'purchase dashboard renders without PO data');
-
-  put('supplierPOHistory', [null, {}, { reference: 'PO-INCOMPLETE-TEST', vendor: 'Test Supplier', payload: {} }]);
+  put('supplierPOHistory', [null, {}, { reference: 'PO-STALE-LOCAL-TEST', vendor: 'Stale Supplier', payload: {} }]);
   const html = render();
-  assert.match(html, /Purchase Dashboard/, 'purchase dashboard tolerates incomplete PO records');
-  assert.match(html, /PO-INCOMPLETE-TEST/, 'purchase activity includes the incomplete PO without a render error');
-  console.log('Workflow dashboard render checks passed (empty and incomplete PO data; Purchase Department role).');
+  assert.match(html, /Purchase Dashboard/, 'purchase dashboard renders');
+  assert.match(html, /Loading dashboard data from PostgreSQL/, 'dashboard waits for authoritative API data');
+  assert.doesNotMatch(html, /PO-STALE-LOCAL-TEST/, 'dashboard does not render stale browser PO records');
+
+  put('supplierInvoiceHistory', [{ reference: 'SI-STALE-LOCAL-TEST' }]);
+  const executiveHtml = renderToStaticMarkup(
+    React.createElement(MemoryRouter, null, React.createElement(DashboardPage))
+  );
+  assert.match(executiveHtml, /Executive Dashboard/, 'executive dashboard renders');
+  assert.match(executiveHtml, /Loading dashboard data from PostgreSQL/, 'executive dashboard waits for all authoritative sources');
+  assert.doesNotMatch(executiveHtml, /SI-STALE-LOCAL-TEST/, 'executive dashboard ignores stale browser invoice records');
+  assert.doesNotMatch(executiveHtml, /Inventory valuation/, 'dashboard does not present partial totals while data is loading');
+  console.log('Workflow and executive dashboard render checks passed (PostgreSQL loading; stale local data ignored).');
 } finally {
   await vite.close();
 }

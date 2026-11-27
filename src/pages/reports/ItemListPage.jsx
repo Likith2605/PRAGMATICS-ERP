@@ -1,23 +1,25 @@
-import React, { useMemo, useState } from 'react';
+import React from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getInventoryItems } from '../../utils/storeService.js';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { listInventoryItems } from '../../services/inventoryApi.js';
+import { normalizeInventoryItem } from '../../utils/reportApiData.js';
 import { formatQuantityByUnit } from '../../utils/reportFilters.js';
 
+const loadItems = async () => (await listInventoryItems()).map(normalizeInventoryItem);
+
 const ItemListPage = () => {
-  const rows = useMemo(() => {
-    const list = getInventoryItems().map((it) => {
-      return {
-        itemCode: it.itemCode || '',
-        materialName: it.materialName || '',
-        category: it.category || 'Uncategorised',
-        unit: it.unit || '',
-        hsnSac: it.hsnSac || '',
-        currentQty: Number(it.currentQty) || 0,
-        unitCost: Number(it.unitCost) || 0
-      };
-    });
-    return list;
-  }, []);
+  const { data: inventoryItems, loading, error } = useAuthoritativeData(loadItems);
+  const rows = inventoryItems.map((it) => ({
+    itemCode: it.itemCode || '',
+    materialName: it.materialName || '',
+    category: it.category || 'Uncategorised',
+    unit: it.unit || '',
+    hsnSac: it.hsnSac || '',
+    currentQty: Number(it.currentQty) || 0,
+    unitCost: Number(it.unitCost) || 0
+  }));
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
       <ReportRegister
@@ -40,7 +42,7 @@ const ItemListPage = () => {
           { key: 'currentQty', label: 'Current Qty', align: 'right' },
           { key: 'unitCost', label: 'Unit Cost (₹)', align: 'right' },
         ]}
-        rows={filteredRows}
+        rows={rows}
         totals={[{ colKey: 'currentQty', render: (rs) => formatQuantityByUnit(rs, 'currentQty') }]}
       />
     </div>

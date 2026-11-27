@@ -1,11 +1,57 @@
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getJobCardMaterialProfile, getMaterialShortages } from '../utils/storeService.js';
+import { getMaterialRequests, getStoreIssues } from '../services/storeApi.js';
+import { listInventoryItems } from '../services/inventoryApi.js';
+import { listProcurementRecords } from '../services/procurementIntakeApi.js';
+import { normalizeInventoryItem } from '../utils/reportApiData.js';
 import {
   ACK_STATUS,
   computeAckLines,
   getAcknowledgement,
   findIndentForMR
 } from '../utils/materialAckService.js';
+
+const normalizeRequest = (row = {}) => {
+  const payload = row.payload || {};
+  const items = (Array.isArray(row.items) ? row.items : []).map((item = {}) => ({
+    ...(item.payload || {}),
+    ...item,
+    materialId: item.materialId || item.material_id || item.payload?.materialId || '',
+    materialName: item.materialName || item.material_name || item.payload?.materialName || '',
+    requiredQty: Number(item.requiredQty ?? item.required_qty ?? item.payload?.requiredQty) || 0,
+    issuedQty: Number(item.issuedQty ?? item.issued_qty ?? item.payload?.issuedQty) || 0,
+    balanceQty: Number(item.balanceQty ?? item.balance_qty ?? item.payload?.balanceQty) || 0,
+    unit: item.unit || item.payload?.unit || 'Nos'
+  }));
+  return {
+    ...payload,
+    ...row,
+    mrNumber: row.mrNumber || row.mr_number || payload.mrNumber || '',
+    requestDate: row.requestDate || row.date || row.mrDate || row.mr_date || '',
+    jobCardNumber: row.jobCardNumber || row.job_card_number || payload.jobCardNumber || '',
+    salesOrderRef: row.salesOrderRef || row.sales_order_ref || payload.salesOrderRef || '',
+    status: row.status || 'Draft',
+    acknowledgement: row.acknowledgement || payload.acknowledgement || null,
+    items
+  };
+};
+
+const getMaterialShortages = (mr, inventory) => {
+  const byCode = new Map(inventory.map((item) => [String(item.itemCode || '').toLowerCase(), item]));
+  return (mr.items || []).map((item) => {
+    const inv = byCode.get(String(item.materialId || '').toLowerCase());
+    const required = Number(item.requiredQty) || 0;
+    const issued = Number(item.issuedQty) || 0;
+    const balance = Math.max(0, required - issued);
+    const available = Math.max(0, (Number(inv?.currentQty) || 0) - (Number(inv?.reservedQty) || 0));
+    const shortage = Math.max(0, balance - available);
+    return {
+      materialId: item.materialId,
+      available,
+      shortage
+    };
+  });
+};
 
 const StatusChip = ({ status }) => {
   const cls = (status || '').toLowerCase().replace(/\s+/g, '-');
@@ -17,10 +63,10 @@ const StatusChip = ({ status }) => {
  * material panel so Production sees availability (and shortage) *before*
  * releasing work, exactly as the acknowledgement screen left it.
  */
-const StoreAckStrip = ({ mr }) => {
+const StoreAckStrip = ({ mr, requests, inventory, indents }) => {
   const ack = getAcknowledgement(mr);
-  const live = computeAckLines(mr);
-  const indentNumber = ack.purchaseIndentNumber || findIndentForMR(mr.mrNumber)?.indentNumber || '';
+  const live = computeAckLines(mr, { requests, inventory });
+  const indentNumber = ack.purchaseIndentNumber || findIndentForMR(mr.mrNumber, indents)?.indentNumber || '';
   const pending = ack.status === ACK_STATUS.PENDING;
 
   const rows = live.map((l) => {
@@ -96,9 +142,68 @@ const StoreAckStrip = ({ mr }) => {
 
 const MaterialStatusPanel = ({ jobCardNumber }) => {
   const navigate = useNavigate();
-  const profile = getJobCardMaterialProfile(jobCardNumber);
+  const [requests, setRequests] = useState([]);
+  const [storeIssues, setStoreIssues] = useState([]);
+  const [inventory, setInventory] = useState([]);
+  const [indents, setIndents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [indentError, setIndentError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError('');
+    setRequests([]);
+    setStoreIssues([]);
+    setInventory([]);
+    setIndents([]);
+    setIndentError('');
+    Promise.all([getMaterialRequests(), getStoreIssues(), listInventoryItems()])
+      .then(async ([requestRows, issueRows, inventoryRows]) => {
+        if (!active) return;
+        const normalizedRequests = requestRows.map(normalizeRequest);
+        const normalizedInventory = inventoryRows.map(normalizeInventoryItem);
+        setRequests(normalizedRequests);
+        setStoreIssues(issueRows);
+        setInventory(normalizedInventory);
+        try {
+          const indentRows = await listProcurementRecords('purchaseIndent');
+          if (active) {
+            setIndents(indentRows);
+            setIndentError('');
+          }
+        } catch (indentLoadError) {
+          if (active) {
+            setIndents([]);
+            setIndentError(`Purchase Indent details are unavailable: ${indentLoadError.message}`);
+          }
+        }
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setRequests([]);
+        setStoreIssues([]);
+        setInventory([]);
+        setIndents([]);
+        setIndentError('');
+        setError(`Job Card material data could not be loaded from PostgreSQL: ${loadError.message}`);
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [jobCardNumber]);
+
+  const profile = useMemo(() => requests
+    .filter((mr) => mr.jobCardNumber === jobCardNumber)
+    .map((mr) => ({
+      mr,
+      status: mr.status,
+      issues: storeIssues.filter((issue) => issue.mrNumber === mr.mrNumber)
+    })), [requests, storeIssues, jobCardNumber]);
 
   if (profile.length === 0) {
+    if (loading) return <div className="content-block" role="status">Loading Job Card material status from PostgreSQL…</div>;
+    if (error) return <div className="content-block"><div role="alert" className="form-error">{error}</div></div>;
     return (
       <div className="content-block">
         <div className="block-header">
@@ -120,9 +225,11 @@ const MaterialStatusPanel = ({ jobCardNumber }) => {
         <h3 className="block-title">Raw Material Status</h3>
         <span className="muted-text">Linked Material Requests &amp; Store Issues</span>
       </div>
+      {error && <div role="alert" className="form-error">{error}</div>}
+      {indentError && <div role="alert" className="form-error">{indentError}</div>}
 
       {profile.map(({ mr, status, issues }) => {
-        const shortages = getMaterialShortages(mr);
+        const shortages = getMaterialShortages(mr, inventory);
         return (
           <div key={mr.mrNumber} className="material-status-block">
             <div className="material-status-head">
@@ -143,7 +250,7 @@ const MaterialStatusPanel = ({ jobCardNumber }) => {
               </div>
             </div>
 
-            <StoreAckStrip mr={mr} />
+            <StoreAckStrip mr={mr} requests={requests} inventory={inventory} indents={indents} />
 
             <div className="history-table-wrapper">
               <table className="history-table">

@@ -13,12 +13,14 @@ import AdvanceRegister from '../components/AdvanceRegister.jsx';
 import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterMaterialRecords } from '../utils/historySearch.js';
 import VendorMasterAutocomplete from '../components/VendorMasterAutocomplete.jsx';
-import { getVendorMaster } from '../utils/vendorMaster.js';
+import { listMasters } from '../services/masterApi.js';
+import { listSupplierInvoicesApi, createSupplierInvoiceApi, updateSupplierInvoiceApi, getSupplierInvoiceMigrationPreviewApi, importSupplierInvoicesApi, listPurchaseOrders, getPurchaseOrder } from '../services/procurementIntakeApi.js';
+import { isAdmin } from '../utils/auth.js';
+import { listMaterialReceiptsApi } from '../services/materialReceiptApi.js';
 import {
   getReceipts,
   getReceiptInvoiceValue,
   getSupplierInvoicePrefill,
-  markReceiptSupplierInvoice
 } from '../utils/workflowService.js';
 
 const parseINR = (v) => Number(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
@@ -42,6 +44,14 @@ const SupplierInvoicePage = () => {
 
   const [mode, setMode] = useState('list'); // 'list' | 'create' | 'view'
   const [history, setHistory] = useState([]);
+  const [historyReady, setHistoryReady] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [editingInvoice, setEditingInvoice] = useState(null);
+  const [savingInvoice, setSavingInvoice] = useState(false);
+  const [pendingInvoiceCreateToken, setPendingInvoiceCreateToken] = useState('');
+  const [migrationPreview, setMigrationPreview] = useState(null);
+  const [migrationSelection, setMigrationSelection] = useState([]);
+  const [migrationMessage, setMigrationMessage] = useState('');
   const [poList, setPoList] = useState([]);
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [reportTab, setReportTab] = useState('invoices'); // 'invoices' | 'purchase' | 'payables' | 'advances'
@@ -61,6 +71,8 @@ const SupplierInvoicePage = () => {
     paymentTerms: '30 Days Net',
     paymentStatus: 'Pending', // 'Pending' | 'Partial' | 'Paid'
     amountPaid: '0',
+    advanceAdjusted: 0,
+    advanceAdjustedINR: 0,
     paymentMode: 'Bank Transfer (NEFT/RTGS)',
     paymentReference: '',
     paymentDate: '',
@@ -79,39 +91,25 @@ const SupplierInvoicePage = () => {
     state: ''
   });
 
-  const [companyDetails, setCompanyDetails] = useState(() => {
-    try {
-      const stored = localStorage.getItem('companySettings');
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    const profile = getCompanyProfile();
-    return {
-      companyName: profile.companyName || '',
-      phone: profile.phone || '',
-      email: profile.email || '',
-      address: profile.address || '',
-      gstin: profile.gstin || '',
-      state: profile.state || ''
-    };
-  });
+  const [companyDetails, setCompanyDetails] = useState(() => getCompanyProfile());
+  const [vendorMasterRecords, setVendorMasterRecords] = useState([]);
+  const [vendorMasterError, setVendorMasterError] = useState('');
 
   const [items, setItems] = useState([{ ...emptyItem }]);
 
-  // Load from localStorage
+  // PostgreSQL is authoritative; localStorage is refreshed only after the API confirms.
   useEffect(() => {
-    try {
-      const storedInvoices = localStorage.getItem('supplierInvoiceHistory');
-      setHistory(storedInvoices ? JSON.parse(storedInvoices) : []);
-    } catch {
-      setHistory([]);
-    }
-
-    try {
-      const storedPOs = localStorage.getItem('supplierPOHistory');
-      setPoList(storedPOs ? JSON.parse(storedPOs) : []);
-    } catch {
-      setPoList([]);
-    }
+    let active = true;
+    listMasters('vendors')
+      .then((records) => { if (active) { setVendorMasterRecords(records); setVendorMasterError(''); } })
+      .catch((error) => { if (active) { setVendorMasterRecords([]); setVendorMasterError(`Vendor Master could not be loaded from PostgreSQL: ${error.message}`); } });
+    listSupplierInvoicesApi().then((rows) => { if (active) { setHistory(rows); setHistoryError(''); setHistoryReady(true); } })
+      .catch((error) => { if (active) { setHistory([]); setHistoryError(`Supplier Invoices could not be loaded from PostgreSQL: ${error.message}`); setHistoryReady(false); } });
+    /* Purchase Orders are loaded from PostgreSQL so PO references, progress and
+     * amounts on this screen never come from a browser-only list. */
+    listPurchaseOrders().then((rows) => { if (active) setPoList(rows); })
+      .catch((error) => { if (active) { setPoList([]); console.warn(`Purchase Orders could not be loaded from PostgreSQL: ${error.message}`); } });
+    return () => { active = false; };
   }, []);
 
   const [poAutoLinkMsg, setPoAutoLinkMsg] = useState('');
@@ -121,8 +119,34 @@ const SupplierInvoicePage = () => {
   const [vendorInvoices, setVendorInvoices] = useState([]);
   const [sourceReceipt, setSourceReceipt] = useState('');
 
-  const refreshVendorInvoices = () =>
-    setVendorInvoices(getReceipts().filter((r) => String(r.invoiceNumber || '').trim()));
+  const openMigrationPreview = async () => {
+    try {
+      const preview = await getSupplierInvoiceMigrationPreviewApi();
+      setMigrationPreview(preview);
+      setMigrationSelection([]);
+      setMigrationMessage('');
+    } catch (error) { setMigrationMessage(`Migration preview failed: ${error.message}`); }
+  };
+  const importSelectedLegacyInvoices = async () => {
+    if (!migrationSelection.length) return;
+    try {
+      const result = await importSupplierInvoicesApi(migrationSelection);
+      setHistory(result.records);
+      setMigrationMessage(`Imported ${result.imported.length}; unchanged conflicts ${result.conflicts.length}; skipped ${result.skipped.length}.`);
+      setMigrationPreview(null);
+      setHistoryReady(true);
+    } catch (error) { setMigrationMessage(`Import failed: ${error.message}`); }
+  };
+
+  const refreshVendorInvoices = async () => {
+    try {
+      const records = await listMaterialReceiptsApi();
+      setVendorInvoices(records.filter((r) => String(r.invoiceNumber || '').trim()));
+    } catch (error) {
+      setVendorInvoices([]);
+      setMigrationMessage(`Material Receipts could not be loaded from PostgreSQL: ${error.message}`);
+    }
+  };
 
   useEffect(() => {
     refreshVendorInvoices();
@@ -135,6 +159,7 @@ const SupplierInvoicePage = () => {
   /** Start the Supplier Invoice from the vendor invoice Store already recorded. */
   const handleConvertReceipt = (receiptNumber) => {
     try {
+      setPendingInvoiceCreateToken('');
       const prefill = getSupplierInvoicePrefill(receiptNumber);
       setInvoiceDetails((prev) => ({
         ...prev,
@@ -186,9 +211,14 @@ const SupplierInvoicePage = () => {
     const rec = searchParams.get('receipt');
     if (!rec) return;
     setSearchParams({}, { replace: true });
-    const receipt = getReceipts().find((r) => String(r.receiptNumber) === String(rec));
-    if (receipt && String(receipt.invoiceNumber || '').trim()) handleConvertReceipt(rec);
-    else if (receipt) handleSelectPO(String(receipt.poNumber || receipt.poReference || ''));
+    /* Resolve the receipt from PostgreSQL, not the browser cache. */
+    listMaterialReceiptsApi()
+      .then((records) => {
+        const receipt = records.find((r) => String(r.receiptNumber) === String(rec));
+        if (receipt && String(receipt.invoiceNumber || '').trim()) handleConvertReceipt(rec);
+        else if (receipt) handleSelectPO(String(receipt.poNumber || receipt.poReference || ''));
+      })
+      .catch((error) => console.warn(`Material Receipt ${rec} could not be loaded from PostgreSQL: ${error.message}`));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
@@ -245,8 +275,9 @@ const SupplierInvoicePage = () => {
   const balanceDue = useMemo(() => {
     const total = Number(totals.grandTotal) || 0;
     const paid = Number(invoiceDetails.amountPaid) || 0;
-    return Math.max(0, total - paid);
-  }, [totals.grandTotal, invoiceDetails.amountPaid]);
+    const advanceAdjusted = Number(invoiceDetails.advanceAdjusted) || 0;
+    return Math.max(0, total - paid - advanceAdjusted);
+  }, [totals.grandTotal, invoiceDetails.amountPaid, invoiceDetails.advanceAdjusted]);
 
   // KPIs
   const kpis = useMemo(() => {
@@ -257,12 +288,13 @@ const SupplierInvoicePage = () => {
 
     history.forEach((h) => {
       const grandTotal = Number(h.payload?.totals?.grandTotal) || 0;
-      const paid = Number(h.payload?.invoiceDetails?.amountPaid) || (h.status === 'Paid' ? grandTotal : 0);
+      const paid = Number(h.payload?.invoiceDetails?.amountPaid) || 0;
+      const advanceAdjusted = Number(h.payload?.invoiceDetails?.advanceAdjusted) || 0;
       totalPayable += grandTotal;
       if (h.status === 'Paid') {
         paidCount++;
       } else {
-        pendingDues += Math.max(0, grandTotal - paid);
+        pendingDues += Math.max(0, grandTotal - paid - advanceAdjusted);
       }
     });
 
@@ -277,7 +309,7 @@ const SupplierInvoicePage = () => {
     });
   };
 
-  const handleSaveInvoice = (e) => {
+  const handleSaveInvoice = async (e) => {
     e.preventDefault();
     if (!invoiceDetails.supplierInvoiceNumber.trim()) {
       alert('Please enter Supplier Invoice / Bill Number.');
@@ -300,13 +332,14 @@ const SupplierInvoicePage = () => {
       amountInWords
     };
 
+    if (!historyReady) { alert('Supplier Invoice records are not confirmed from PostgreSQL. Reload before saving.'); return; }
+    setSavingInvoice(true);
     try {
-      const stored = localStorage.getItem('supplierInvoiceHistory');
-      let current = stored ? JSON.parse(stored) : [];
       const entry = {
         date: invoiceDetails.supplierInvoiceDate,
         reference: invoiceDetails.supplierInvoiceNumber,
         poRef: invoiceDetails.poReference || '-',
+        receiptNumber: sourceReceipt || '',
         vendor: vendorDetails.companyName || vendorDetails.vendorName || '-',
         dueDate: invoiceDetails.paymentDueDate || '-',
         total: `₹ ${Number(totals.grandTotal || 0).toFixed(2)}`,
@@ -314,59 +347,30 @@ const SupplierInvoicePage = () => {
         balanceDue: `₹ ${balanceDue.toFixed(2)}`,
         payload
       };
-
-      const existingIndex = current.findIndex((h) => h.reference === entry.reference);
-      if (existingIndex !== -1) {
-        current[existingIndex] = entry;
-      } else {
-        current.unshift(entry);
+      let createToken = pendingInvoiceCreateToken;
+      if (!editingInvoice && !createToken) {
+        createToken = `supplier-invoice:${crypto.randomUUID()}`;
+        setPendingInvoiceCreateToken(createToken);
       }
-      localStorage.setItem('supplierInvoiceHistory', JSON.stringify(current));
+      const result = editingInvoice
+        ? await updateSupplierInvoiceApi(editingInvoice.reference, entry, editingInvoice.version)
+        : await createSupplierInvoiceApi(entry, createToken);
+      const current = [result.record, ...history.filter((h) => String(h.reference) !== String(result.record.reference))];
       setHistory(current);
-
-      // Cross-link back to Purchase Order in supplierPOHistory
-      if (invoiceDetails.poReference) {
-        try {
-          const poStored = localStorage.getItem('supplierPOHistory');
-          if (poStored) {
-            const poHistory = JSON.parse(poStored);
-            let updated = false;
-            poHistory.forEach((p) => {
-              if (
-                p.reference?.trim().toLowerCase() === invoiceDetails.poReference?.trim().toLowerCase() ||
-                p.payload?.poDetails?.poNumber?.trim().toLowerCase() === invoiceDetails.poReference?.trim().toLowerCase()
-              ) {
-                p.billedInvoiceRef = invoiceDetails.supplierInvoiceNumber;
-                p.billingStatus = 'Billed';
-                updated = true;
-              }
-            });
-            if (updated) {
-              localStorage.setItem('supplierPOHistory', JSON.stringify(poHistory));
-            }
-          }
-        } catch (e) {
-          console.warn('Could not update PO status with bill', e);
-        }
-      }
+      setEditingInvoice(null);
+      setPendingInvoiceCreateToken('');
 
       setSelectedInvoice(payload);
       setMode('view');
 
-      // Purchase has just converted a Store-shared vendor invoice: remember the
-      // Supplier Invoice number on the receipt so the Store/Purchase registers
-      // show it as recorded (and it stops appearing as "awaiting conversion").
-      if (sourceReceipt) {
-        try {
-          markReceiptSupplierInvoice(sourceReceipt, invoiceDetails.supplierInvoiceNumber);
-        } catch (err) {
-          console.warn('Could not link the Supplier Invoice to the receipt', err);
-        }
-        setSourceReceipt('');
-      }
+      // The Supplier Invoice API atomically links the confirmed invoice to the
+      // PostgreSQL receipt; only clear the page's source after confirmation.
+      if (sourceReceipt) setSourceReceipt('');
       refreshVendorInvoices();
     } catch (err) {
-      console.error('Failed to save supplier invoice', err);
+      alert(`Supplier Invoice was not saved: ${err.message}`);
+    } finally {
+      setSavingInvoice(false);
     }
   };
 
@@ -454,6 +458,8 @@ const SupplierInvoicePage = () => {
             <button
               className="button-primary"
               onClick={() => {
+                  setEditingInvoice(null);
+                  setPendingInvoiceCreateToken('');
                 setInvoiceDetails({
                   supplierInvoiceNumber: '',
                   supplierInvoiceDate: new Date().toISOString().slice(0, 10),
@@ -463,6 +469,8 @@ const SupplierInvoicePage = () => {
                   paymentTerms: '30 Days Net',
                   paymentStatus: 'Pending',
                   amountPaid: '0',
+                  advanceAdjusted: 0,
+                  advanceAdjustedINR: 0,
                   paymentMode: 'Bank Transfer (NEFT/RTGS)',
                   paymentReference: '',
                   paymentDate: '',
@@ -535,7 +543,31 @@ const SupplierInvoicePage = () => {
             <>
             <div className="block-header">
               <h2>Supplier Invoice Records</h2>
+              {isAdmin() && <button type="button" className="button-secondary" onClick={openMigrationPreview}>Review legacy records</button>}
             </div>
+            {migrationMessage && <div role="status" className="form-info">{migrationMessage}</div>}
+            {migrationPreview && (
+              <section className="content-block" aria-label="Supplier Invoice migration review">
+                <h3>Legacy Supplier Invoice migration preview</h3>
+                <p>Eligible: {migrationPreview.counts?.eligible || 0} · Existing: {migrationPreview.counts?.existing || 0} · Conflicts: {migrationPreview.counts?.conflicts || 0} · Invalid: {migrationPreview.counts?.invalid || 0}</p>
+                <p>Only selected eligible records will be imported. Existing, conflicting and invalid records remain unchanged.</p>
+                <div style={{ maxHeight: 260, overflow: 'auto' }}>
+                  {(migrationPreview.eligible || []).map((record) => (
+                    <label key={record.reference} style={{ display: 'block', padding: '5px 0' }}>
+                      <input type="checkbox" checked={migrationSelection.includes(record.reference)} onChange={(event) => setMigrationSelection((current) => event.target.checked ? [...current, record.reference] : current.filter((id) => id !== record.reference))} />{' '}
+                      {record.reference} · {record.vendor} · {record.total}
+                    </label>
+                  ))}
+                  {(migrationPreview.existing || []).map((record) => <div key={`existing-${record.reference}`} role="status">Already present, unchanged: {record.reference}</div>)}
+                  {(migrationPreview.conflicts || []).map((entry) => <div key={`conflict-${entry.record.reference}`} role="status">Conflict, unchanged: {entry.record.reference}</div>)}
+                  {(migrationPreview.invalid || []).map((entry, index) => <div key={`invalid-${index}`} role="status">Invalid, unchanged: {entry.record?.reference || 'unidentified'} — {entry.reason}</div>)}
+                </div>
+                <div className="form-actions">
+                  <button type="button" className="button-secondary" onClick={() => setMigrationPreview(null)}>Close review</button>
+                  <button type="button" className="button-primary" disabled={!migrationSelection.length} onClick={importSelectedLegacyInvoices}>Import selected records</button>
+                </div>
+              </section>
+            )}
             <RecordSearchBar value={invoiceSearch} onChange={setInvoiceSearch} placeholder="Search bill, PO, supplier, invoice date, due date, value, status..." label="Search supplier bills" />
             <div className="history-table-wrapper">
               <table className="history-table">
@@ -562,9 +594,13 @@ const SupplierInvoicePage = () => {
                             <button
                               className="button-small"
                               style={{ padding: '2px 6px', fontSize: '11px', color: '#2563eb', borderColor: '#bfdbfe' }}
-                              onClick={() => {
-                                const storedPOs = JSON.parse(localStorage.getItem('supplierPOHistory') || '[]');
-                                const match = storedPOs.find((p) => p.reference === inv.poRef);
+                              onClick={async () => {
+                                /* PO detail comes from PostgreSQL (state first,
+                                   server lookup when the list is stale). */
+                                let match = poList.find((p) => p.reference === inv.poRef);
+                                if (!match) {
+                                  try { match = await getPurchaseOrder(inv.poRef); } catch { match = null; }
+                                }
                                 navigate('/purchase-order', {
                                   state: {
                                     viewPO: match ? match.payload : null
@@ -600,6 +636,7 @@ const SupplierInvoicePage = () => {
                               className="button-small"
                               onClick={() => {
                                 const p = inv.payload;
+                                setEditingInvoice({ reference: inv.reference, version: inv.version });
                                 setInvoiceDetails(p.invoiceDetails);
                                 setVendorDetails(p.vendorDetails);
                                 setCompanyDetails(p.companyDetails);
@@ -705,7 +742,8 @@ const SupplierInvoicePage = () => {
                   { key: 'vendor', label: 'Vendor / Supplier' },
                   { key: 'dueDate', label: 'Payment Due', render: (r) => r.dueDate || '-' },
                   { key: 'gt', label: 'Bill Total (₹)', align: 'right', render: (r) => parseINR(r.total).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
-                  { key: 'paid', label: 'Paid (₹)', align: 'right', render: (r) => parseINR(r.status === 'Paid' ? r.total : r.payload?.invoiceDetails?.amountPaid).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
+                  { key: 'paid', label: 'Paid (₹)', align: 'right', render: (r) => parseINR(r.payload?.invoiceDetails?.amountPaid).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
+                  { key: 'advance', label: 'Advance Applied (₹)', align: 'right', render: (r) => parseINR(r.payload?.invoiceDetails?.advanceAdjusted).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
                   { key: 'bal', label: 'Balance Due (₹)', align: 'right', render: (r) => parseINR(r.status === 'Paid' ? 0 : r.balanceDue).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
                 ]}
                 rows={filterMaterialRecords(history, purchaseSearch, ['reference','poRef','vendor','date','dueDate','total','balanceDue','status'])}
@@ -713,7 +751,8 @@ const SupplierInvoicePage = () => {
                 excludeCommonFilterKeys={['status']}
                 totals={[
                   { colKey: 'gt', render: (rs) => rs.reduce((a, r) => a + parseINR(r.total), 0) },
-                  { colKey: 'paid', render: (rs) => rs.reduce((a, r) => a + parseINR(r.status === 'Paid' ? r.total : r.payload?.invoiceDetails?.amountPaid), 0) },
+                  { colKey: 'paid', render: (rs) => rs.reduce((a, r) => a + parseINR(r.payload?.invoiceDetails?.amountPaid), 0) },
+                  { colKey: 'advance', render: (rs) => rs.reduce((a, r) => a + parseINR(r.payload?.invoiceDetails?.advanceAdjusted), 0) },
                   { colKey: 'bal', render: (rs) => rs.reduce((a, r) => a + parseINR(r.status === 'Paid' ? 0 : r.balanceDue), 0) }
                 ]}
               />
@@ -736,6 +775,7 @@ const SupplierInvoicePage = () => {
                   { key: 'dueDate', label: 'Due Date', render: (r) => r.dueDate || '-' },
                   { key: 'gt', label: 'Bill Total (₹)', align: 'right', render: (r) => parseINR(r.total).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
                   { key: 'paid', label: 'Paid (₹)', align: 'right', render: (r) => parseINR(r.payload?.invoiceDetails?.amountPaid).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
+                  { key: 'advance', label: 'Advance Applied (₹)', align: 'right', render: (r) => parseINR(r.payload?.invoiceDetails?.advanceAdjusted).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
                   { key: 'bal', label: 'Outstanding (₹)', align: 'right', render: (r) => parseINR(r.balanceDue).toLocaleString('en-IN', { maximumFractionDigits: 2 }) },
                 ]}
                 rows={filterMaterialRecords(history.filter((r) => r.status !== 'Paid'), payablesSearch, ['reference','poRef','vendor','date','dueDate','total','balanceDue','status'])}
@@ -744,6 +784,7 @@ const SupplierInvoicePage = () => {
                 totals={[
                   { colKey: 'gt', render: (rs) => rs.reduce((a, r) => a + parseINR(r.total), 0) },
                   { colKey: 'paid', render: (rs) => rs.reduce((a, r) => a + parseINR(r.payload?.invoiceDetails?.amountPaid), 0) },
+                  { colKey: 'advance', render: (rs) => rs.reduce((a, r) => a + parseINR(r.payload?.invoiceDetails?.advanceAdjusted), 0) },
                   { colKey: 'bal', render: (rs) => rs.reduce((a, r) => a + parseINR(r.balanceDue), 0) }
                 ]}
               />
@@ -754,21 +795,25 @@ const SupplierInvoicePage = () => {
               <>
               <RecordSearchBar value={advanceSearch} onChange={setAdvanceSearch} placeholder="Search supplier, PO / bill, date, amount, status..." label="Search supplier advances" />
               <AdvanceRegister
-                storageKey="supplierAdvanceHistory"
+                kind="supplier"
                 title="Advance Paid to Suppliers"
                 filenamer={`Advance-Paid-${new Date().toISOString().slice(0, 10)}`}
                 partyLabel="Supplier"
                 prefix="SAP"
                 againstLabel="Against PO / Bill"
-                partyList={getVendorMaster().map((v) => v.name)}
+                partyList={vendorMasterRecords.map((v) => v.name)}
                 searchQuery={advanceSearch}
+                invoiceOptions={history}
+                onRefresh={async () => setHistory(await listSupplierInvoicesApi())}
               />
               </>
             )}
           </>
         )}
 
-        {mode === 'create' && (
+      {historyError && <div role="alert" className="form-error">{historyError}</div>}
+      {vendorMasterError && <div role="alert" className="form-error">{vendorMasterError}</div>}
+      {mode === 'create' && (
           <form className="quotation-form" onSubmit={handleSaveInvoice}>
             <div className="form-section">
               <div className="section-heading">
@@ -1098,8 +1143,8 @@ const SupplierInvoicePage = () => {
               <button type="button" className="button-secondary" onClick={() => setMode('list')}>
                 Cancel
               </button>
-              <button type="submit" className="button-primary">
-                Save Supplier Invoice
+              <button type="submit" className="button-primary" disabled={savingInvoice || !historyReady}>
+                {savingInvoice ? 'Saving to PostgreSQL…' : 'Save Supplier Invoice'}
               </button>
             </div>
           </form>
@@ -1117,6 +1162,8 @@ const SupplierInvoicePage = () => {
               <button
                 className="button-secondary"
                 onClick={() => {
+                  const found = history.find((row) => String(row.reference) === String(selectedInvoice.invoiceDetails?.supplierInvoiceNumber));
+                  setEditingInvoice(found ? { reference: found.reference, version: found.version } : null);
                   setInvoiceDetails(selectedInvoice.invoiceDetails);
                   setVendorDetails(selectedInvoice.vendorDetails);
                   setCompanyDetails(selectedInvoice.companyDetails);

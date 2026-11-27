@@ -6,25 +6,25 @@ import {
   STATUS,
   SOURCE_TYPE,
   SOURCE_TYPE_LABEL,
-  createMaterialRequest,
-  updateMaterialRequest,
-  deleteMaterialRequest,
-  submitMaterialRequest,
-  approveMaterialRequest,
-  rejectMaterialRequest,
-  cancelMaterialRequest,
-  closeMaterialRequest,
-  decorateMR,
   isMRStatusEditable,
-  getInventoryItems,
-  getJobCards,
-  getMaterialRequests,
-  getMaterialShortages,
-  getStoreIssues,
-  getBOMs,
   todayStr
 } from '../utils/storeService.js';
-import { getSalesOrders } from '../utils/workflowService.js';
+import {
+  getMaterialRequests as getServerMaterialRequests,
+  createMaterialRequest as createServerMaterialRequest,
+  updateMaterialRequest as updateServerMaterialRequest,
+  deleteMaterialRequestRecord,
+  submitMaterialRequest as submitServerMaterialRequest,
+  approveMaterialRequest as approveServerMaterialRequest,
+  rejectMaterialRequest as rejectServerMaterialRequest,
+  closeMaterialRequest as closeServerMaterialRequest,
+  getStoreIssues as getServerStoreIssues
+} from '../services/storeApi.js';
+import { listJobCards, listRequirements } from '../services/productionApi.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { listProcurementRecords } from '../services/procurementIntakeApi.js';
+import { listBoms } from '../services/bomApi.js';
+import { listInventoryItems } from '../services/inventoryApi.js';
 import {
   ACK_STATUS,
   computeAckLines,
@@ -69,6 +69,63 @@ const StatusChip = ({ status }) => {
 /* Store acknowledgement chip — colours live in quotation.css. */
 const AckChip = ({ status }) => <StatusChip status={status} />;
 
+const mapInventoryRow = (row = {}) => ({
+  ...(row.payload || {}),
+  ...row,
+  id: row.item_code || row.itemCode || row.id,
+  itemCode: row.item_code || row.itemCode || row.payload?.itemCode || '',
+  itemName: row.material_name || row.itemName || row.payload?.itemName || '',
+  unit: row.unit || row.payload?.unit || 'Nos',
+  currentQty: Number(row.current_qty ?? row.currentQty ?? row.payload?.currentQty) || 0,
+  reservedQty: Number(row.payload?.reservedQty ?? row.reservedQty) || 0
+});
+
+const decorateServerRequest = (request, inventory) => {
+  const inventoryByCode = new Map(inventory.map((item) => [String(item.itemCode || '').toLowerCase(), item]));
+  const items = (request.items || []).map((item) => {
+    const materialId = String(item.materialId || item.material_id || item.payload?.materialId || '');
+    const requiredQty = Number(item.requiredQty ?? item.required_qty ?? item.payload?.requiredQty) || 0;
+    const issuedQty = Number(item.issuedQty ?? item.issued_qty ?? item.payload?.issuedQty) || 0;
+    const inv = inventoryByCode.get(materialId.toLowerCase());
+    return {
+      ...item,
+      materialId,
+      requiredQty,
+      issuedQty,
+      balanceQty: Math.max(0, requiredQty - issuedQty),
+      lineStatus: requiredQty > 0 && issuedQty >= requiredQty
+        ? 'Issued'
+        : issuedQty > 0 ? 'Partially Issued' : 'Pending',
+      unit: item.unit || inv?.unit || 'Nos'
+    };
+  });
+  return { ...request, items };
+};
+
+const getServerMaterialShortages = (request, inventory) => {
+  const inventoryByCode = new Map(inventory.map((item) => [String(item.itemCode || '').toLowerCase(), item]));
+  return (request.items || []).map((item) => {
+    const inv = inventoryByCode.get(String(item.materialId || '').toLowerCase());
+    const required = Number(item.requiredQty) || 0;
+    const issued = Number(item.issuedQty) || 0;
+    const balance = Math.max(0, required - issued);
+    const available = Math.max(0, (Number(inv?.currentQty) || 0) - (Number(inv?.reservedQty) || 0));
+    const shortage = Math.max(0, balance - available);
+    return {
+      materialId: item.materialId,
+      materialName: item.materialName || inv?.itemName || item.materialId,
+      unit: item.unit || inv?.unit || 'Nos',
+      required,
+      issued,
+      balance,
+      available,
+      shortage,
+      hasShortage: shortage > 0,
+      canIssuePartially: balance > 0 && available > 0
+    };
+  });
+};
+
 const ProductionMaterialRequestsPage = () => {
   const navigate = useNavigate();
   const location = useLocation();
@@ -85,13 +142,64 @@ const ProductionMaterialRequestsPage = () => {
   const [projectFilter, setProjectFilter] = useState('All');
   const [search, setSearch] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
+  const [serverMRS, setServerMRS] = useState([]);
+  const [jobCards, setJobCards] = useState([]);
+  const [boms, setBoms] = useState([]);
+  const [inventory, setInventory] = useState([]);
+  const [storeIssues, setStoreIssues] = useState([]);
+  const [requirements, setRequirements] = useState([]);
+  const [salesOrders, setSalesOrders] = useState([]);
+  const [indents, setIndents] = useState([]);
+  const [indentLoadError, setIndentLoadError] = useState('');
+  const [loadError, setLoadError] = useState('');
 
   const canCreate = hasPermission('material_request.create');
   const canSubmit = hasPermission('material_request.submit');
   const canCancel = isAdmin();
   const canApprove = hasPermission('material_request.approve');
 
-  const refresh = () => setRefreshTick((t) => t + 1);
+  const refresh = async () => {
+    setLoadError('');
+    try {
+      const [requests, cards, bomRows, inventoryRows, issues, requirementRows, salesOrderRows] = await Promise.all([
+        getServerMaterialRequests(),
+        listJobCards(),
+        listBoms(),
+        listInventoryItems(),
+        getServerStoreIssues(),
+        listRequirements(),
+        listSalesOrders()
+      ]);
+      setServerMRS(requests);
+      setJobCards(cards);
+      setBoms(bomRows);
+      setInventory(inventoryRows);
+      setStoreIssues(issues);
+      setRequirements(requirementRows);
+      setSalesOrders(salesOrderRows);
+      setIndentLoadError('');
+      try {
+        setIndents(await listProcurementRecords('purchaseIndent'));
+      } catch (indentError) {
+        setIndents([]);
+        setIndentLoadError(`Purchase Indent status could not be loaded from PostgreSQL: ${indentError.message}`);
+      }
+    } catch (error) {
+      setServerMRS([]);
+      setJobCards([]);
+      setBoms([]);
+      setInventory([]);
+      setStoreIssues([]);
+      setRequirements([]);
+      setSalesOrders([]);
+      setIndents([]);
+      setIndentLoadError('');
+      setLoadError(error.message || 'Could not load Production Material Requests from PostgreSQL.');
+    }
+    setRefreshTick((t) => t + 1);
+  };
+
+  useEffect(() => { void refresh(); }, []);
 
   useEffect(() => {
     if (location.state?.viewMrNumber) {
@@ -110,7 +218,7 @@ const ProductionMaterialRequestsPage = () => {
   useEffect(() => {
     const wanted = searchParams.get('mr');
     if (!wanted) return;
-    const found = getMaterialRequests().find((m) => m.mrNumber === wanted);
+    const found = serverMRS.find((m) => m.mrNumber === wanted);
     if (!found) return;
     setMode('view');
     setViewMrNumber(found.mrNumber);
@@ -121,9 +229,9 @@ const ProductionMaterialRequestsPage = () => {
     if (viewMrNumber) setTab('requests');
   }, [viewMrNumber]);
 
-  const mrs = getMaterialRequests();
-  const jobCards = getJobCards();
-  const inventory = getInventoryItems();
+  const mrs = serverMRS;
+  const inventoryForAck = useMemo(() => inventory.map(mapInventoryRow), [inventory]);
+  const termsSourceData = { requests: serverMRS, issues: storeIssues, inventory, requirements, salesOrders };
 
   const isProdEmployee = isRole('production_employee');
   const myEmpId = getMyEmployeeId();
@@ -138,11 +246,11 @@ const ProductionMaterialRequestsPage = () => {
   const visibleJobCardNos = useMemo(() => new Set(visibleJobCards.map((j) => j.jobCardNumber)), [visibleJobCards]);
 
   const decorated = useMemo(() => {
-    const dec = mrs.map((m) => decorateMR(m));
+    const dec = mrs.map((m) => decorateServerRequest(m, inventoryForAck));
     dec.sort((a, b) => (b.mrNumber.localeCompare(a.mrNumber)));
     return dec;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mrs, refreshTick]);
+  }, [mrs, inventoryForAck, refreshTick]);
 
   const filtered = decorated.filter((mr) => {
     if (statusFilter !== 'All' && mr.status !== statusFilter) return false;
@@ -187,7 +295,7 @@ const ProductionMaterialRequestsPage = () => {
   /* Sales Order / Job Card pickers (searchable, spec §16) */
   const salesOrderOptions = useMemo(() => {
     const map = new Map();
-    getSalesOrders().forEach((so) => {
+    salesOrders.forEach((so) => {
       const ref = String(so.reference || '').trim();
       if (!ref || map.has(ref)) return;
       const cust = so.payload?.customerDetails?.companyName || so.payload?.customerDetails?.customerName || '';
@@ -202,7 +310,7 @@ const ProductionMaterialRequestsPage = () => {
     if (current && !map.has(current)) map.set(current, { value: current, label: current, hint: 'Current selection' });
     return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTick]);
+  }, [salesOrders, refreshTick]);
 
   /* Job Cards are filtered to the selected Sales Order when a match exists,
      otherwise the full list is shown (legacy Job Cards may hold a PO ref). */
@@ -224,10 +332,11 @@ const ProductionMaterialRequestsPage = () => {
     return getMaterialRequestLines({
       salesOrderId: form.salesOrderRef,
       jobCardNumber: form.jobCardNumber,
-      excludeMrNumber: mode === 'edit' ? editMrNumber : ''
+      excludeMrNumber: mode === 'edit' ? editMrNumber : '',
+      sourceData: termsSourceData
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form.salesOrderRef, form.jobCardNumber, mode, editMrNumber, refreshTick]);
+  }, [form.salesOrderRef, form.jobCardNumber, mode, editMrNumber, refreshTick, requirements, salesOrders, serverMRS, storeIssues, inventory]);
 
   /* Already-requested / already-issued quantities for every line in scope. */
   const scopeQty = useMemo(() => {
@@ -235,14 +344,20 @@ const ProductionMaterialRequestsPage = () => {
     return getScopeQtyMaps({
       salesOrderRef: form.salesOrderRef,
       jobCardNumber: form.jobCardNumber,
-      excludeMrNumber: mode === 'edit' ? editMrNumber : ''
+      excludeMrNumber: mode === 'edit' ? editMrNumber : '',
+      sourceData: termsSourceData
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form.salesOrderRef, form.jobCardNumber, mode, editMrNumber, refreshTick]);
+  }, [form.salesOrderRef, form.jobCardNumber, mode, editMrNumber, refreshTick, requirements, salesOrders, serverMRS, storeIssues, inventory]);
 
   /* Builds the request rows straight from Terms & Requirement (spec §2/§3). */
   const buildTermsLines = (so, jc) =>
-    getMaterialRequestLines({ salesOrderId: so, jobCardNumber: jc, excludeMrNumber: mode === 'edit' ? editMrNumber : '' }).map((ln) => ({
+    getMaterialRequestLines({
+      salesOrderId: so,
+      jobCardNumber: jc,
+      excludeMrNumber: mode === 'edit' ? editMrNumber : '',
+      sourceData: termsSourceData
+    }).map((ln) => ({
       materialId: ln.materialId,
       materialName: ln.itemName,
       materialDesc: ln.description || ln.itemName,
@@ -329,7 +444,7 @@ const ProductionMaterialRequestsPage = () => {
     const currentJc = jobCards.find((j) => j.jobCardNumber === form.jobCardNumber);
     const keepJc = currentJc && String(currentJc.salesOrderRef || '').trim() === String(so || '').trim() ? currentJc.jobCardNumber : '';
     if (!applyScope(so, keepJc)) return;
-    const soRec = getSalesOrders().find((s) => String(s.reference) === String(so));
+    const soRec = salesOrders.find((s) => String(s.reference) === String(so));
     setForm((prev) => ({
       ...prev,
       salesOrderRef: so,
@@ -353,7 +468,7 @@ const ProductionMaterialRequestsPage = () => {
 
   const handleBOMSelect = (bomId) => {
     if (!bomId) return;
-    const bom = getBOMs().find((b) => b.id === bomId);
+    const bom = boms.find((b) => b.id === bomId || b.bomNumber === bomId);
     if (!bom) return;
     const toRows = () =>
       bom.items.map((it) => {
@@ -477,7 +592,7 @@ const ProductionMaterialRequestsPage = () => {
     return '';
   };
 
-  const handleSaveAsDraft = () => {
+  const handleSaveAsDraft = async () => {
     setFormError('');
     const error = validateForm();
     if (error) return setFormError(error);
@@ -485,8 +600,9 @@ const ProductionMaterialRequestsPage = () => {
     try {
       setBusy(true);
       const mr = mode === 'edit' && editMrNumber
-        ? updateMaterialRequest(editMrNumber, { ...form, items: ready })
-        : createMaterialRequest({ ...form, items: ready });
+        ? await updateServerMaterialRequest(editMrNumber, { ...form, items: ready, status: 'Draft' }, Number(serverMRS.find((row) => row.mrNumber === editMrNumber)?.recordVersion) || 1)
+        : await createServerMaterialRequest({ ...form, status: 'Draft', items: ready });
+      await refresh();
       setMode('list');
       setEditMrNumber(null);
       setSelectedMrNumber(null);
@@ -499,7 +615,7 @@ const ProductionMaterialRequestsPage = () => {
     }
   };
 
-  const handleSubmitDirect = () => {
+  const handleSubmitDirect = async () => {
     setFormError('');
     const error = validateForm();
     if (error) return setFormError(error);
@@ -507,9 +623,10 @@ const ProductionMaterialRequestsPage = () => {
     try {
       setBusy(true);
       let mr = mode === 'edit' && editMrNumber
-        ? updateMaterialRequest(editMrNumber, { ...form, items: ready })
-        : createMaterialRequest({ ...form, items: ready });
-      mr = submitMaterialRequest(mr.mrNumber);
+        ? await updateServerMaterialRequest(editMrNumber, { ...form, items: ready }, Number(serverMRS.find((row) => row.mrNumber === editMrNumber)?.recordVersion) || 1)
+        : await createServerMaterialRequest({ ...form, items: ready, status: 'Submitted' });
+      mr = await submitServerMaterialRequest(mr.mrNumber, Number(mr.recordVersion) || 1);
+      await refresh();
       setBusy(false);
       setMode('list');
       setEditMrNumber(null);
@@ -547,7 +664,8 @@ const ProductionMaterialRequestsPage = () => {
     const terms = getMaterialRequestLines({
       salesOrderId: mr.salesOrderRef || '',
       jobCardNumber: mr.jobCardNumber || '',
-      excludeMrNumber: mr.mrNumber
+      excludeMrNumber: mr.mrNumber,
+      sourceData: termsSourceData
     });
     const termsByCode = new Map(terms.map((t) => [String(t.materialId || '').toLowerCase(), t]));
     setLines((mr.items || []).map((it) => {
@@ -578,14 +696,20 @@ const ProductionMaterialRequestsPage = () => {
     setMode('edit');
   };
 
-  const handleDelete = (mr) => {
+  const handleDelete = async (mr) => {
     if (!isMRStatusEditable(mr.status)) {
       alert(`Cannot delete ${mr.mrNumber} — status is "${mr.status}".\nOnly Material Requests with no material issued yet can be deleted.`);
       return;
     }
     if (!window.confirm(`Delete ${mr.mrNumber}? This cannot be undone.`)) return;
+    const reason = window.prompt(`Reason for deleting ${mr.mrNumber}:`)?.trim();
+    if (!reason) return;
     try {
-      deleteMaterialRequest(mr.mrNumber);
+      const serverRecords = await getServerMaterialRequests();
+      const server = serverRecords.find((row) => row.mrNumber === mr.mrNumber);
+      const version = Number(server?.recordVersion ?? mr.recordVersion ?? 0);
+      if (!version) throw new Error('Reload the list before deleting this Material Request.');
+      await deleteMaterialRequestRecord(mr.mrNumber, version, reason);
       if (viewMrNumber === mr.mrNumber) {
         setViewMrNumber(null);
         setMode('list');
@@ -596,55 +720,54 @@ const ProductionMaterialRequestsPage = () => {
     }
   };
 
-  const handleSubmit = (mr) => {
+  const handleSubmit = async (mr) => {
     try {
-      submitMaterialRequest(mr.mrNumber);
-      refresh();
+      await submitServerMaterialRequest(mr.mrNumber, Number(mr.recordVersion) || 1);
+      await refresh();
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleApprove = (mr) => {
+  const handleApprove = async (mr) => {
     const remarks = window.prompt(`Approve ${mr.mrNumber}? Enter remarks (optional):`);
     if (remarks === null) return;
     try {
-      approveMaterialRequest(mr.mrNumber, remarks);
-      refresh();
+      await approveServerMaterialRequest(mr.mrNumber, Number(mr.recordVersion) || 1, remarks);
+      await refresh();
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleRejectMR = (mr) => {
+  const handleRejectMR = async (mr) => {
     const reason = window.prompt(`Reject ${mr.mrNumber}? Enter a reason (required):`);
     if (reason === null) return;
     if (!reason || !reason.trim()) { alert('Rejection reason is required.'); return; }
     try {
-      rejectMaterialRequest(mr.mrNumber, reason);
-      refresh();
+      await rejectServerMaterialRequest(mr.mrNumber, Number(mr.recordVersion) || 1, reason);
+      await refresh();
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleCancel = (mr) => {
+  const handleCancel = async (mr) => {
     const reason = window.prompt(`Cancel ${mr.mrNumber}? Enter a reason:`);
     if (reason === null || !reason.trim()) return;
     try {
-      cancelMaterialRequest(mr.mrNumber, reason);
-      refresh();
+      await updateServerMaterialRequest(mr.mrNumber, { status: 'Cancelled', cancelReason: reason }, Number(mr.recordVersion) || 1);
+      await refresh();
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleClose = (mr) => {
+  const handleClose = async (mr) => {
     if (!window.confirm(`Close ${mr.mrNumber} now that all material is issued?`)) return;
     try {
-      closeMaterialRequest(mr.mrNumber);
-      refresh();
-      setViewMrNumber(decorateMR(getMaterialRequests().find((m) => m.mrNumber === mr.mrNumber)).mrNumber);
+      await closeServerMaterialRequest(mr.mrNumber, Number(mr.recordVersion) || 1, new Date().toISOString());
+      await refresh();
     } catch (err) {
       alert(err.message);
     }
@@ -654,6 +777,8 @@ const ProductionMaterialRequestsPage = () => {
 
   return (
     <section className="page-section">
+      {loadError && <div className="form-error" style={{ marginBottom: '12px' }}>{loadError}</div>}
+      {indentLoadError && <div className="form-error" style={{ marginBottom: '12px' }}>{indentLoadError}</div>}
       <div className="page-header">
         <div>
           <h1 className="page-title">Material Requests</h1>
@@ -747,7 +872,7 @@ const ProductionMaterialRequestsPage = () => {
             <div className="block-header">
               <h3 className="block-title">Materials Required</h3>
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <BOMSelector onSelect={handleBOMSelect} />
+                <BOMSelector onSelect={handleBOMSelect} boms={boms} />
                 <button type="button" className="button-secondary button-small" onClick={openAddItem}>+ Add Item</button>
               </div>
             </div>
@@ -936,6 +1061,7 @@ const ProductionMaterialRequestsPage = () => {
                     <label>Item *</label>
                     <MaterialNameSelector
                       value={addItem.material?.itemName || ''}
+                      items={inventory}
                       placeholder="Search Item... (code, name, description)"
                       onSelect={(rec) => {
                         if (rec.active === false) {
@@ -1008,17 +1134,20 @@ const ProductionMaterialRequestsPage = () => {
       ) : mode === 'view' && selected ? (
         <SelectedView
           mr={selected}
+          storeIssues={storeIssues}
           jobCards={jobCards}
-          inventory={inventory}
+          inventory={inventoryForAck}
+          requests={serverMRS}
+          indents={indents}
           canSubmit={canSubmit}
           canCancel={canCancel}
           canApprove={canApprove}
           onBack={() => { setMode('list'); setViewMrNumber(null); navigate('/production/material-requests'); }}
-          onSubmit={() => { handleSubmit(selected); refresh(); setViewMrNumber(decorateMR(getMaterialRequests().find((m) => m.mrNumber === selected.mrNumber)).mrNumber); }}
+          onSubmit={() => { handleSubmit(selected); refresh(); setViewMrNumber(selected.mrNumber); }}
           onCancel={() => { handleCancel(selected); refresh(); }}
           onClose={() => handleClose(selected)}
-          onApprove={() => { handleApprove(selected); refresh(); setViewMrNumber(decorateMR(getMaterialRequests().find((m) => m.mrNumber === selected.mrNumber)).mrNumber); }}
-          onRejectMR={() => { handleRejectMR(selected); refresh(); setViewMrNumber(decorateMR(getMaterialRequests().find((m) => m.mrNumber === selected.mrNumber)).mrNumber); }}
+          onApprove={() => { handleApprove(selected); refresh(); setViewMrNumber(selected.mrNumber); }}
+          onRejectMR={() => { handleRejectMR(selected); refresh(); setViewMrNumber(selected.mrNumber); }}
         />
       ) : (
         <div>
@@ -1124,12 +1253,7 @@ const ProductionMaterialRequestsPage = () => {
 
 function getEmployeesForForm() {
   const auth = getStoredAuth();
-  try {
-    const list = JSON.parse(localStorage.getItem('employees') || '[]');
-    const found = list.find((e) => e.email && auth && e.email.toLowerCase() === (auth.email || '').toLowerCase());
-    if (found) return { name: found.name, employeeId: found.employeeId };
-  } catch {}
-  return { name: auth?.username || auth?.email || 'User', employeeId: '-' };
+  return { name: auth?.username || auth?.email || 'User', employeeId: auth?.employeeId || '-' };
 }
 
 /**
@@ -1138,10 +1262,10 @@ function getEmployeesForForm() {
  * assumption. Confirmed figures come from the stored acknowledgement; the
  * "stock now" note flags availability that moved since Stores replied.
  */
-const StoreAckBlock = ({ mr, onOpenIndent }) => {
+const StoreAckBlock = ({ mr, onOpenIndent, requests, inventory, indents }) => {
   const ack = getAcknowledgement(mr);
-  const live = computeAckLines(mr);
-  const indentNumber = ack.purchaseIndentNumber || findIndentForMR(mr.mrNumber)?.indentNumber || '';
+  const live = computeAckLines(mr, { requests, inventory });
+  const indentNumber = ack.purchaseIndentNumber || findIndentForMR(mr.mrNumber, indents)?.indentNumber || '';
   const pending = ack.status === ACK_STATUS.PENDING;
 
   const rows = live.map((l) => {
@@ -1256,10 +1380,10 @@ const StoreAckBlock = ({ mr, onOpenIndent }) => {
   );
 };
 
-const SelectedView = ({ mr, canSubmit, canCancel, canApprove, onBack, onSubmit, onCancel, onClose, onApprove, onRejectMR }) => {
+const SelectedView = ({ mr, storeIssues = [], inventory = [], requests = [], indents = [], canSubmit, canCancel, canApprove, onBack, onSubmit, onCancel, onClose, onApprove, onRejectMR }) => {
   const navigate = useNavigate();
-  const shortages = getMaterialShortages(mr);
-  const issues = getStoreIssues().filter((i) => i.mrNumber === mr.mrNumber);
+  const shortages = getServerMaterialShortages(mr, inventory);
+  const issues = storeIssues.filter((i) => i.mrNumber === mr.mrNumber);
 
   return (
     <div>
@@ -1286,6 +1410,9 @@ const SelectedView = ({ mr, canSubmit, canCancel, canApprove, onBack, onSubmit, 
 
         <StoreAckBlock
           mr={mr}
+          requests={requests}
+          inventory={inventory}
+          indents={indents}
           onOpenIndent={(n) => navigate(`/purchase-indents?indent=${encodeURIComponent(n)}`)}
         />
 
@@ -1392,8 +1519,7 @@ const SelectedView = ({ mr, canSubmit, canCancel, canApprove, onBack, onSubmit, 
   );
 };
 
-const BOMSelector = ({ onSelect }) => {
-  const boms = getBOMs();
+const BOMSelector = ({ onSelect, boms = [] }) => {
   if (boms.length === 0) return null;
   return (
     <select className="action-select" style={{ width: 'auto', minWidth: '180px' }} onChange={(e) => { onSelect(e.target.value); e.target.value = ''; }}>

@@ -44,7 +44,6 @@ export const exportFullJSONBackup = () => {
     'quotationHistory',
     'customerPOHistory',
     'salesOrderHistory',
-    'productionJobCards',
     'inventoryItems',
     'stockTransactions',
     'supplierPOHistory',

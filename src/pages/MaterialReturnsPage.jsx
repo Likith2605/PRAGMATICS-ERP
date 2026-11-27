@@ -1,10 +1,23 @@
 import { useEffect, useMemo, useState } from 'react';
-import { hasPermission } from '../utils/permissions.js';
+import { hasPermission, isAdmin } from '../utils/permissions.js';
+import { returnMaterial as returnMaterialApi, getMaterialReturns, getStoreIssues } from '../services/storeApi.js';
+import { listCustomerInvoices } from '../services/customerInvoiceApi.js';
+import { listSupplierInvoicesFromPostgres } from '../services/procurementIntakeApi.js';
 import {
-  returnMaterial,
-  getMaterialReturns,
-  getStoreIssues
-} from '../utils/storeService.js';
+  commercialReturnCreateToken,
+  createPurchaseReturn,
+  createSalesReturn,
+  listPurchaseReturns,
+  listSalesReturns,
+  submitSalesReturn,
+  submitPurchaseReturn,
+  approveSalesReturn,
+  approvePurchaseReturn,
+  rejectSalesReturn,
+  rejectPurchaseReturn,
+  deleteSalesReturn,
+  deletePurchaseReturn
+} from '../services/commercialReturnsApi.js';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import StoreAuditLogView from '../components/StoreAuditLogView.jsx';
 import EmployeeSearchSelect from '../components/EmployeeSearchSelect.jsx';
@@ -13,31 +26,14 @@ import VendorMasterAutocomplete from '../components/VendorMasterAutocomplete.jsx
 
 const parseINR = (v) => Number(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
 
-const load = (key) => {
-  try {
-    return JSON.parse(localStorage.getItem(key) || '[]');
-  } catch {
-    return [];
-  }
-};
-const save = (key, list) => localStorage.setItem(key, JSON.stringify(list));
-
-const nextSegmentNumber = (prefix, list, field) => {
-  let maxSeq = 0;
-  list.forEach((r) => {
-    const m = String(r[field] || '').match(/(\d+)$/);
-    if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
-  });
-  const fy = new Date().getFullYear().toString().slice(-2);
-  return `${prefix}-${fy}${String(maxSeq + 1).padStart(4, '0')}`;
-};
-
-const SalesReturnForm = ({ invoices, onDone, onCancel }) => {
+const SalesReturnForm = ({ invoices, onCreate, onDone, onCancel }) => {
   const [invRef, setInvRef] = useState('');
   const [items, setItems] = useState([]);
   const [returnedBy, setReturnedBy] = useState('');
   const [remarks, setRemarks] = useState('');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [createToken] = useState(commercialReturnCreateToken);
 
   const selectedInv = invoices.find((i) => i.reference === invRef);
 
@@ -46,7 +42,8 @@ const SalesReturnForm = ({ invoices, onDone, onCancel }) => {
     const inv = invoices.find((i) => i.reference === ref);
     if (inv && inv.payload?.items) {
       setItems(
-        inv.payload.items.map((it) => ({
+        inv.payload.items.map((it, index) => ({
+          sourceLineNumber: index + 1,
           itemCode: it.itemCode || '',
           itemName: it.itemName || '',
           drawingNo: it.drawingNo || '',
@@ -62,7 +59,7 @@ const SalesReturnForm = ({ invoices, onDone, onCancel }) => {
     }
   };
 
-  const handleConfirm = () => {
+  const handleConfirm = async () => {
     setError('');
     if (!invRef) return setError('Select a Customer Invoice to return against.');
     if (!returnedBy.trim()) return setError('Enter who is returning the goods.');
@@ -74,19 +71,21 @@ const SalesReturnForm = ({ invoices, onDone, onCancel }) => {
         amount: ((Number(it.returnQty) || 0) * Number(it.unitPrice) || 0)
       }));
     if (lines.length === 0) return setError('Enter a return quantity for at least one item.');
-    const existing = load('salesReturnHistory');
-    const rec = {
-      returnNumber: nextSegmentNumber('SRTN', existing, 'returnNumber'),
+    setBusy(true);
+    try {
+      const { record } = await onCreate({
       date: new Date().toISOString().slice(0, 10),
       invRef,
-      customer: selectedInv?.company || selectedInv?.payload?.customerDetails?.companyName || '-',
       items: lines,
-      totalValue: lines.reduce((a, l) => a + l.amount, 0),
       returnedBy,
       remarks
-    };
-    save('salesReturnHistory', [rec, ...existing]);
-    onDone(rec);
+      }, createToken);
+      onDone(record);
+    } catch (requestError) {
+      setError(requestError.message || 'Sales Return could not be saved to PostgreSQL.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -185,18 +184,20 @@ const SalesReturnForm = ({ invoices, onDone, onCancel }) => {
 
       <div className="template-modal-actions start-actions">
         <button type="button" className="button-secondary" onClick={onCancel}>Cancel</button>
-        <button type="button" className="button-primary" onClick={handleConfirm}>Confirm Sales Return</button>
+        <button type="button" className="button-primary" onClick={handleConfirm} disabled={busy}>{busy ? 'Saving…' : 'Confirm Sales Return'}</button>
       </div>
     </div>
   );
 };
 
-const PurchaseReturnForm = ({ bills, onDone, onCancel }) => {
+const PurchaseReturnForm = ({ bills, onCreate, onDone, onCancel }) => {
   const [billRef, setBillRef] = useState('');
   const [items, setItems] = useState([]);
   const [returnedTo, setReturnedTo] = useState('');
   const [remarks, setRemarks] = useState('');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [createToken] = useState(commercialReturnCreateToken);
 
   const selectedBill = bills.find((b) => b.reference === billRef);
 
@@ -205,7 +206,8 @@ const PurchaseReturnForm = ({ bills, onDone, onCancel }) => {
     const bill = bills.find((b) => b.reference === ref);
     if (bill && bill.payload?.items) {
       setItems(
-        bill.payload.items.map((it) => ({
+        bill.payload.items.map((it, index) => ({
+          sourceLineNumber: index + 1,
           itemCode: it.itemCode || '',
           itemName: it.itemName || '',
           drawingNo: it.drawingNo || '',
@@ -221,7 +223,7 @@ const PurchaseReturnForm = ({ bills, onDone, onCancel }) => {
     }
   };
 
-  const handleConfirm = () => {
+  const handleConfirm = async () => {
     setError('');
     if (!billRef) return setError('Select a Supplier Bill to return against.');
     if (!returnedTo.trim()) return setError('Enter the supplier returning goods to.');
@@ -233,19 +235,21 @@ const PurchaseReturnForm = ({ bills, onDone, onCancel }) => {
         amount: ((Number(it.returnQty) || 0) * Number(it.unitPrice) || 0)
       }));
     if (lines.length === 0) return setError('Enter a return quantity for at least one item.');
-    const existing = load('purchaseReturnHistory');
-    const rec = {
-      returnNumber: nextSegmentNumber('PRTN', existing, 'returnNumber'),
+    setBusy(true);
+    try {
+      const { record } = await onCreate({
       date: new Date().toISOString().slice(0, 10),
       billRef,
-      supplier: selectedBill?.vendor || selectedBill?.payload?.vendorDetails?.companyName || '-',
       items: lines,
-      totalValue: lines.reduce((a, l) => a + l.amount, 0),
       returnedTo,
       remarks
-    };
-    save('purchaseReturnHistory', [rec, ...existing]);
-    onDone(rec);
+      }, createToken);
+      onDone(record);
+    } catch (requestError) {
+      setError(requestError.message || 'Purchase Return could not be saved to PostgreSQL.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -349,7 +353,7 @@ const PurchaseReturnForm = ({ bills, onDone, onCancel }) => {
 
       <div className="template-modal-actions start-actions">
         <button type="button" className="button-secondary" onClick={onCancel}>Cancel</button>
-        <button type="button" className="button-primary" onClick={handleConfirm}>Confirm Purchase Return</button>
+        <button type="button" className="button-primary" onClick={handleConfirm} disabled={busy}>{busy ? 'Saving…' : 'Confirm Purchase Return'}</button>
       </div>
     </div>
   );
@@ -361,45 +365,51 @@ const MaterialReturnsPage = () => {
   const [viewNumber, setViewNumber] = useState(null);
   const [search, setSearch] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
+  const [returns, setReturns] = useState([]);
+  const [issues, setIssues] = useState([]);
+  const [salesReturns, setSalesReturns] = useState([]);
+  const [purchaseReturns, setPurchaseReturns] = useState([]);
+  const [invoices, setInvoices] = useState([]);
+  const [bills, setBills] = useState([]);
+  const [loadError, setLoadError] = useState('');
+  const [commercialLoadError, setCommercialLoadError] = useState('');
+  const [invoiceSourceError, setInvoiceSourceError] = useState('');
+  const [loading, setLoading] = useState(true);
 
   const canCreate = hasPermission('material_return.create');
 
-  const returns = getMaterialReturns();
-  const issues = getStoreIssues();
-
-  const salesReturns = useMemo(() => {
-    try {
-      return JSON.parse(localStorage.getItem('salesReturnHistory') || '[]');
-    } catch {
-      return [];
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTick, mode]);
-
-  const purchaseReturns = useMemo(() => {
-    try {
-      return JSON.parse(localStorage.getItem('purchaseReturnHistory') || '[]');
-    } catch {
-      return [];
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTick, mode]);
-
-  const invoices = useMemo(() => {
-    try {
-      return JSON.parse(localStorage.getItem('customerInvoiceHistory') || '[]');
-    } catch {
-      return [];
-    }
-  }, [refreshTick, mode]);
-
-  const bills = useMemo(() => {
-    try {
-      return JSON.parse(localStorage.getItem('supplierInvoiceHistory') || '[]');
-    } catch {
-      return [];
-    }
-  }, [refreshTick, mode]);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setReturns([]);
+    setIssues([]);
+    Promise.allSettled([
+      getMaterialReturns(),
+      getStoreIssues(),
+      listSalesReturns(),
+      listPurchaseReturns(),
+      listCustomerInvoices(),
+      listSupplierInvoicesFromPostgres()
+    ])
+      .then((results) => {
+        if (!active) return;
+        const [storeReturns, storeIssues, sales, purchases, customerInvoices, supplierInvoices] = results;
+        setReturns(storeReturns.status === 'fulfilled' && Array.isArray(storeReturns.value) ? storeReturns.value : []);
+        setIssues(storeIssues.status === 'fulfilled' && Array.isArray(storeIssues.value) ? storeIssues.value : []);
+        setSalesReturns(sales.status === 'fulfilled' && Array.isArray(sales.value) ? sales.value : []);
+        setPurchaseReturns(purchases.status === 'fulfilled' && Array.isArray(purchases.value) ? purchases.value : []);
+        setInvoices(customerInvoices.status === 'fulfilled' && Array.isArray(customerInvoices.value) ? customerInvoices.value : []);
+        setBills(supplierInvoices.status === 'fulfilled' && Array.isArray(supplierInvoices.value) ? supplierInvoices.value : []);
+        const storeErrors = [storeReturns, storeIssues].filter((result) => result.status === 'rejected');
+        const returnErrors = [sales, purchases].filter((result) => result.status === 'rejected');
+        const sourceErrors = [customerInvoices, supplierInvoices].filter((result) => result.status === 'rejected');
+        setLoadError(storeErrors.length ? `Store returns could not be loaded from PostgreSQL: ${storeErrors.map((result) => result.reason.message).join('; ')}` : '');
+        setCommercialLoadError(returnErrors.length ? `Sales/Purchase Returns could not be loaded from PostgreSQL: ${returnErrors.map((result) => result.reason.message).join('; ')}` : '');
+        setInvoiceSourceError(sourceErrors.length ? `Return source invoices could not be loaded from PostgreSQL: ${sourceErrors.map((result) => result.reason.message).join('; ')}` : '');
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [refreshTick]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -417,6 +427,33 @@ const MaterialReturnsPage = () => {
   }, [returns, search, refreshTick]);
 
   const refresh = () => { setRefreshTick((t) => t + 1); setMode('list'); setViewNumber(null); }; 
+
+  const runCommercialReturnAction = async (kind, number, action) => {
+    const rec = kind === 'sales'
+      ? salesReturns.find((row) => row.returnNumber === number)
+      : purchaseReturns.find((row) => row.returnNumber === number);
+    if (!rec) return;
+    const version = Number(rec.version) || 1;
+    try {
+      if (action === 'submit') {
+        await (kind === 'sales' ? submitSalesReturn : submitPurchaseReturn)(number, version);
+      } else if (action === 'approve') {
+        await (kind === 'sales' ? approveSalesReturn : approvePurchaseReturn)(number, version);
+      } else if (action === 'reject') {
+        const reason = window.prompt('Return rejection reason:', '')?.trim();
+        if (!reason) return;
+        await (kind === 'sales' ? rejectSalesReturn : rejectPurchaseReturn)(number, version, reason);
+      } else if (action === 'delete') {
+        const reason = window.prompt('Return deletion reason:', '')?.trim();
+        if (!reason) return;
+        await (kind === 'sales' ? deleteSalesReturn : deletePurchaseReturn)(number, version, reason);
+      }
+      setCommercialLoadError('');
+      refresh();
+    } catch (error) {
+      setCommercialLoadError(error.message || `Commercial Return ${action} failed.`);
+    }
+  };
 
   const selected = viewNumber ? returns.find((r) => r.returnNumber === viewNumber) : null;
   const selectedSalesReturn = viewNumber ? salesReturns.find((r) => r.returnNumber === viewNumber) : null;
@@ -438,6 +475,11 @@ const MaterialReturnsPage = () => {
         </div>
       </div>
 
+      {loading && <p className="muted" role="status">Loading Store returns from PostgreSQL…</p>}
+      {loadError && <p className="form-error" role="alert">{loadError}</p>}
+      {commercialLoadError && <p className="form-error" role="alert">{commercialLoadError}</p>}
+      {invoiceSourceError && <p className="form-error" role="alert">{invoiceSourceError}</p>}
+
       <div className="tab-nav">
         <button type="button" className={`tab-link ${tab === 'returns' ? 'active' : ''}`} onClick={() => { setTab('returns'); setMode('list'); setViewNumber(null); }}>Store Returns</button>
         <button type="button" className={`tab-link ${tab === 'sales' ? 'active' : ''}`} onClick={() => { setTab('sales'); setMode('list'); setViewNumber(null); }}>Sales Returns</button>
@@ -451,14 +493,15 @@ const MaterialReturnsPage = () => {
         mode === 'create' ? (
           <SalesReturnForm
             invoices={invoices}
-            onDone={(rec) => { setViewNumber(rec.returnNumber); setMode('view'); }}
+            onCreate={createSalesReturn}
+            onDone={(rec) => { setSalesReturns((current) => [rec, ...current]); setViewNumber(rec.returnNumber); setMode('view'); }}
             onCancel={() => setMode('list')}
           />
         ) : selectedSalesReturn ? (
           <div className="content-block">
             <div className="block-header">
               <h3 className="block-title">Sales Return {selectedSalesReturn.returnNumber}</h3>
-              <span className="status-badge st-filled">Recorded</span>
+              <span className="status-badge st-filled">{selectedSalesReturn.status || 'Draft'}</span>
             </div>
             <div className="detail-grid">
               <div><strong>Invoice:</strong> {selectedSalesReturn.invRef}</div>
@@ -492,6 +535,18 @@ const MaterialReturnsPage = () => {
             </div>
             <div className="template-modal-actions start-actions">
               <button type="button" className="button-secondary" onClick={() => window.print()}>Print</button>
+              {['Draft', 'Rejected'].includes(selectedSalesReturn.status || 'Draft') && hasPermission('material_return.create') && (
+                <button type="button" className="button-primary" onClick={() => runCommercialReturnAction('sales', selectedSalesReturn.returnNumber, 'submit')}>Submit</button>
+              )}
+              {selectedSalesReturn.status === 'Submitted' && (isAdmin() || hasPermission('invoice.view')) && (
+                <>
+                  <button type="button" className="button-primary" onClick={() => runCommercialReturnAction('sales', selectedSalesReturn.returnNumber, 'approve')}>Approve & Post</button>
+                  <button type="button" className="button-secondary" onClick={() => runCommercialReturnAction('sales', selectedSalesReturn.returnNumber, 'reject')}>Reject</button>
+                </>
+              )}
+              {['Draft', 'Rejected'].includes(selectedSalesReturn.status || 'Draft') && hasPermission('material_return.create') && (
+                <button type="button" className="button-secondary" onClick={() => runCommercialReturnAction('sales', selectedSalesReturn.returnNumber, 'delete')}>Delete</button>
+              )}
               <button type="button" className="button-primary" onClick={() => { setViewNumber(null); setMode('list'); setRefreshTick((t) => t + 1); }}>&larr; Back to Sales Returns</button>
             </div>
           </div>
@@ -520,14 +575,15 @@ const MaterialReturnsPage = () => {
         mode === 'create' ? (
           <PurchaseReturnForm
             bills={bills}
-            onDone={(rec) => { setViewNumber(rec.returnNumber); setMode('view'); }}
+            onCreate={createPurchaseReturn}
+            onDone={(rec) => { setPurchaseReturns((current) => [rec, ...current]); setViewNumber(rec.returnNumber); setMode('view'); }}
             onCancel={() => setMode('list')}
           />
         ) : selectedPurchaseReturn ? (
           <div className="content-block">
             <div className="block-header">
               <h3 className="block-title">Purchase Return {selectedPurchaseReturn.returnNumber}</h3>
-              <span className="status-badge st-filled">Recorded</span>
+              <span className="status-badge st-filled">{selectedPurchaseReturn.status || 'Draft'}</span>
             </div>
             <div className="detail-grid">
               <div><strong>Supplier Bill:</strong> {selectedPurchaseReturn.billRef}</div>
@@ -561,6 +617,18 @@ const MaterialReturnsPage = () => {
             </div>
             <div className="template-modal-actions start-actions">
               <button type="button" className="button-secondary" onClick={() => window.print()}>Print</button>
+              {['Draft', 'Rejected'].includes(selectedPurchaseReturn.status || 'Draft') && hasPermission('material_return.create') && (
+                <button type="button" className="button-primary" onClick={() => runCommercialReturnAction('purchase', selectedPurchaseReturn.returnNumber, 'submit')}>Submit</button>
+              )}
+              {selectedPurchaseReturn.status === 'Submitted' && (isAdmin() || hasPermission('purchase.supplier_invoice')) && (
+                <>
+                  <button type="button" className="button-primary" onClick={() => runCommercialReturnAction('purchase', selectedPurchaseReturn.returnNumber, 'approve')}>Approve & Post</button>
+                  <button type="button" className="button-secondary" onClick={() => runCommercialReturnAction('purchase', selectedPurchaseReturn.returnNumber, 'reject')}>Reject</button>
+                </>
+              )}
+              {['Draft', 'Rejected'].includes(selectedPurchaseReturn.status || 'Draft') && hasPermission('material_return.create') && (
+                <button type="button" className="button-secondary" onClick={() => runCommercialReturnAction('purchase', selectedPurchaseReturn.returnNumber, 'delete')}>Delete</button>
+              )}
               <button type="button" className="button-primary" onClick={() => { setViewNumber(null); setMode('list'); setRefreshTick((t) => t + 1); }}>&larr; Back to Purchase Returns</button>
             </div>
           </div>
@@ -588,7 +656,11 @@ const MaterialReturnsPage = () => {
       ) : mode === 'create' ? (
         <CreateReturn
           issues={issues}
-          onDone={(rec) => { setViewNumber(rec.returnNumber); setMode('view'); }}
+          onDone={(rec) => {
+            setReturns((current) => [rec, ...current]);
+            setViewNumber(rec.returnNumber);
+            setMode('view');
+          }}
           onCancel={() => setMode('list')}
         />
       ) : selected ? (
@@ -644,7 +716,7 @@ const CreateReturn = ({ issues, onDone, onCancel }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issueNumber]);
 
-  const handleConfirm = () => {
+  const handleConfirm = async () => {
     setError('');
     if (!issueNumber) return setError('Select a Store Issue to return material against.');
     if (!receiver) return setError('Select the employee returning the material.');
@@ -661,7 +733,7 @@ const CreateReturn = ({ issues, onDone, onCancel }) => {
       .filter((it) => it.quantityReturned > 0);
     try {
       setBusy(true);
-      const rec = returnMaterial({
+      const rec = await returnMaterialApi({
         issueNumber,
         receiver: { ...receiver, acknowledged },
         items,

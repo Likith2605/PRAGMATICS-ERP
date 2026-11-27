@@ -49,14 +49,51 @@ const checkRows = (name, rows, predicate = (value) => value.length > 0) => {
   return rows;
 };
 
-checkRows('Supplier directory', getSupplierDirectoryRows(), (rows) => rows.some((row) => row.supplierName === 'Fixture Supplier'));
-checkRows('Available / issued stock', getAvailableIssuedStockRows(), (rows) => rows.some((row) => row.itemCode === 'RM-1' && row.issuedQty === 3));
-checkRows('Inward', getInwardRows(), (rows) => rows.some((row) => row.reference === 'ARR-1' && row.acceptedQty === 4));
-checkRows('GRN–PO–PR', getGRNPOPRRows(), (rows) => rows.some((row) => row.poNumber === 'PO-1'));
+checkRows('Supplier directory', getSupplierDirectoryRows({
+  vendors: fixture.vendorMaster, receipts: fixture.materialReceipts,
+  purchaseOrders: fixture.supplierPOHistory, supplierInvoices: [], htOutsource: fixture.htOutsourceRequests
+}), (rows) => rows.some((row) => row.supplierName === 'Fixture Supplier'));
+checkRows('Available / issued stock', getAvailableIssuedStockRows({
+  inventoryItems: fixture.inventoryItems, stockLedger: fixture.stockTransactions
+}), (rows) => rows.some((row) => row.itemCode === 'RM-1' && row.issuedQty === 3));
+checkRows('Inward', getInwardRows({
+  arrivals: fixture.materialArrivals, receipts: fixture.materialReceipts,
+  qualityChecks: fixture.qualityChecks, grns: fixture.storeGRNs
+}), (rows) => rows.some((row) => row.reference === 'ARR-1' && row.acceptedQty === 4));
+checkRows('GRN–PO–PR', getGRNPOPRRows({
+  receipts: fixture.materialReceipts, purchaseOrders: fixture.supplierPOHistory,
+  purchaseRequests: fixture.purchaseRequestHistory, purchaseIndents: fixture.purchaseIndents,
+  qualityChecks: fixture.qualityChecks, grns: fixture.storeGRNs
+}), (rows) => rows.some((row) => row.poNumber === 'PO-1'));
+const authoritativeLinkRows = getGRNPOPRRows({
+  receipts: [],
+  purchaseOrders: [{
+    reference: 'PO-PG-1', vendor: 'PostgreSQL Supplier', status: 'Submitted',
+    pr_number: 'PR-PG-1', progress: { lines: [{ receivedQty: 2, pendingQty: 1 }], ordered: 3, status: 'Submitted' },
+    payload: {
+      poDetails: { poNumber: 'PO-PG-1', prRef: 'PR-PG-1', poDate: '2026-11-25' },
+      items: [{ itemCode: 'PG-MAT', itemName: 'PostgreSQL Material', quantity: 3, unit: 'Nos', unitPrice: 5 }]
+    }
+  }],
+  purchaseRequests: [{ prNumber: 'PR-PG-1', status: 'Converted to PO' }],
+  purchaseIndents: [], qualityChecks: [], grns: []
+});
+assert.equal(authoritativeLinkRows.length, 1, 'GRN–PO–PR report accepts PostgreSQL source records');
+assert.equal(authoritativeLinkRows[0].prNumber, 'PR-PG-1', 'GRN–PO–PR report displays the normalized PostgreSQL Purchase Request link');
+assert.equal(authoritativeLinkRows[0].receivedQty, 2, 'GRN–PO–PR report preserves server-reconciled receipt quantities');
+checks.push('GRN–PO–PR report uses PostgreSQL Purchase Request and PO sources');
 checkRows('Advance shipment empty without source', getAdvanceShipmentRows(), (rows) => rows.length === 0);
-checkRows('Customer material status', getCustomerMaterialStatusRows(), (rows) => rows.some((row) => row.salesOrder === 'SO-1'));
-checkRows('MRN detail', getMRNDetailRows(), (rows) => rows.some((row) => row.mrNumber === 'MR-001'));
-checkRows('Outsourcing source coverage', getOutsourcingReportRows(), (rows) => rows.length === 0);
+checkRows('Customer material status', getCustomerMaterialStatusRows({
+  salesOrders: fixture.salesOrderHistory, jobCards: fixture.productionJobCards,
+  deliveryChallans: fixture.deliveryChallanHistory
+}), (rows) => rows.some((row) => row.salesOrder === 'SO-1'));
+checkRows('MRN detail', getMRNDetailRows({
+  requests: fixture.materialRequests, issues: fixture.storeIssueHistory, returns: fixture.materialReturnHistory,
+  purchaseRequests: fixture.purchaseRequestHistory, purchaseIndents: fixture.purchaseIndents
+}), (rows) => rows.some((row) => row.mrNumber === 'MR-001'));
+checkRows('Outsourcing source coverage', getOutsourcingReportRows({ htOutsource: fixture.htOutsourceRequests }), (rows) => rows.length === 0);
+assert.deepEqual(getAvailableIssuedStockRows(), [], 'report calculations do not fall back to local browser data');
+checks.push('No local-storage fallback');
 
 const reportTypes = [
   'suppliers', 'stock', 'inward', 'grnPoPr', 'advanceShipment', 'customerMaterialStatus', 'mrnDetail'
@@ -81,9 +118,13 @@ try {
   const companySettings = { companyName: 'Fixture Company', address: 'Fixture Address', phone: '123' };
   for (const [name, component] of pageComponents) {
     const html = renderToStaticMarkup(component);
-    assert.match(html, /Download PDF/, `${name} renders PDF option`);
-    assert.match(html, /Download Excel/, `${name} renders Excel option`);
-    assert.match(html, />Print</, `${name} renders Print option`);
+    if (name === 'Ready to Dispatch with Value') {
+      assert.match(html, /Download PDF/, `${name} retains its export controls`);
+      assert.match(html, /Download Excel/, `${name} retains its export controls`);
+      assert.match(html, />Print</, `${name} retains its print control`);
+    } else {
+      assert.match(html, /Loading report data from PostgreSQL/, `${name} waits for authoritative data`);
+    }
     checks.push(`${name} view and PDF/XLSX/Print controls`);
 
     const workbook = buildReportWorkbook({ company: companySettings, title: name, columns: [{ key: 'value', label: 'Value' }], rows: [{ value: 'fixture' }] });

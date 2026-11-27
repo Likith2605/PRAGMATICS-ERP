@@ -4,13 +4,28 @@ import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBrandin
 import { useCompanyBranding } from '../utils/companyBranding.js';
 import { downloadBackupWorkbook, buildFullBackupWorkbookSheets } from '../utils/backupWorkbook.js';
 import {
-  getBackupAuditLogs,
   triggerFullManualBackupAndDownload,
   restoreSystemFromJSON,
-  checkAndPerformDailyAutoBackup,
-  formatAuditDateTime,
   collectAllERPData
 } from '../utils/backupManager.js';
+import { listJobCards } from '../services/productionApi.js';
+import { listInventoryItems } from '../services/inventoryApi.js';
+import { listQuotations } from '../services/quotationApi.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { listCustomerInvoices } from '../services/customerInvoiceApi.js';
+import { listEnquiries } from '../services/enquiryApi.js';
+import { getCustomerPurchaseOrders } from '../services/customerPurchaseOrderApi.js';
+import { listDeliveryChallans } from '../services/deliveryChallanApi.js';
+import { listPurchaseOrders, listSupplierInvoicesFromPostgres } from '../services/procurementIntakeApi.js';
+import {
+  createDatabaseBackup,
+  downloadDatabaseBackup,
+  getDatabaseBackupStatus,
+  listDatabaseBackups,
+  restoreDatabaseBackup,
+  verifyDatabaseBackup
+} from '../services/databaseBackupApi.js';
+import { isAdmin } from '../utils/auth.js';
 
 const exportTable = (baseName, sheetName, headers, rows) => {
   const dateKeys = headers.filter(({ key, label }) => /date|timestamp/i.test(`${key} ${label}`)).map(({ key }) => key);
@@ -34,54 +49,82 @@ const BackupExportPage = () => {
     totalRecords: 0
   });
 
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [lastBackupTime, setLastBackupTime] = useState('');
   const [restoreStatus, setRestoreStatus] = useState(null);
+  const [databaseBackupStatus, setDatabaseBackupStatus] = useState(null);
+  const [databaseBackups, setDatabaseBackups] = useState([]);
+  const [backupBusy, setBackupBusy] = useState('');
+  const [backupError, setBackupError] = useState('');
+  const [exportDataError, setExportDataError] = useState('');
 
-  const refreshData = () => {
+  const refreshData = async () => {
+    setExportDataError('');
     try {
-      const getCount = (key) => {
-        const val = localStorage.getItem(key);
-        return val ? JSON.parse(val).length : 0;
-      };
-
-      const { totalRecordCount } = collectAllERPData();
-
+      const [
+        enquiries, quotations, salesOrders, customerPOs, jobCards,
+        inventory, supplierPOs, supplierInvoices, deliveryChallans, customerInvoices
+      ] = await Promise.all([
+        listEnquiries(),
+        listQuotations(),
+        listSalesOrders(),
+        getCustomerPurchaseOrders(),
+        listJobCards(),
+        listInventoryItems(),
+        listPurchaseOrders(),
+        listSupplierInvoicesFromPostgres(),
+        listDeliveryChallans(),
+        listCustomerInvoices()
+      ]);
       setStats({
-        enquiries: getCount('projectRequests'),
-        quotations: getCount('quotationHistory'),
-        salesOrders: getCount('salesOrderHistory'),
-        customerPOs: getCount('customerPOHistory'),
-        jobCards: getCount('productionJobCards'),
-        inventory: getCount('inventoryItems'),
-        supplierPOs: getCount('supplierPOHistory'),
-        supplierInvoices: getCount('supplierInvoiceHistory'),
-        deliveryChallans: getCount('deliveryChallanHistory'),
-        customerInvoices: getCount('customerInvoiceHistory'),
-        totalRecords: totalRecordCount
+        enquiries: enquiries.length,
+        quotations: quotations.length,
+        salesOrders: salesOrders.length,
+        customerPOs: customerPOs.length,
+        jobCards: jobCards.length,
+        inventory: inventory.length,
+        supplierPOs: supplierPOs.length,
+        supplierInvoices: supplierInvoices.length,
+        deliveryChallans: deliveryChallans.length,
+        customerInvoices: customerInvoices.length,
+        totalRecords: enquiries.length + quotations.length + salesOrders.length + customerPOs.length
+          + jobCards.length + inventory.length + supplierPOs.length + supplierInvoices.length
+          + deliveryChallans.length + customerInvoices.length
       });
-
-      const logs = getBackupAuditLogs();
-      setAuditLogs(logs);
-
-      const lastIso = localStorage.getItem('lastBackupTimestamp') || (logs[0] ? logs[0].timestamp : null);
-      if (lastIso) {
-        setLastBackupTime(formatAuditDateTime(lastIso));
-      } else {
-        setLastBackupTime('Today, Automated');
-      }
     } catch (err) {
-      console.warn('Error refreshing backup page data', err);
+      setExportDataError(`PostgreSQL export data counts could not be loaded: ${err.message}`);
+    }
+  };
+
+  const exportFromPostgres = async ({ label, loader, emptyMessage, baseName, sheetName, headers, mapRows }) => {
+    setExportDataError('');
+    try {
+      const items = await loader();
+      if (!Array.isArray(items)) throw new Error('The API returned an invalid records list.');
+      if (items.length === 0) {
+        setExportDataError(emptyMessage);
+        return;
+      }
+      exportTable(baseName, sheetName, headers, mapRows(items));
+    } catch (error) {
+      setExportDataError(`${label} could not be loaded from PostgreSQL: ${error.message}`);
+    }
+  };
+
+  const refreshPostgresBackups = async () => {
+    setBackupError('');
+    try {
+      const status = await getDatabaseBackupStatus();
+      setDatabaseBackupStatus(status);
+      setDatabaseBackups(await listDatabaseBackups());
+    } catch (err) {
+      setBackupError(err.message || 'PostgreSQL backup history could not be loaded.');
     }
   };
 
   useEffect(() => {
-    // Run daily auto backup if not done yet
-    checkAndPerformDailyAutoBackup();
     refreshData();
+    refreshPostgresBackups();
   }, []);
 
-  // Manual Full Backup
   const handleManualBackup = () => {
     const { dataset } = collectAllERPData();
     const log = triggerFullManualBackupAndDownload();
@@ -89,23 +132,90 @@ const BackupExportPage = () => {
     if (sheets.length) downloadBackupWorkbook(`VYAVASTA-full-backup-data-${new Date().toISOString().slice(0, 10)}.xlsx`, 'VYAVASTA ERP Full Backup Data', sheets);
     setRestoreStatus({
       success: true,
-      message: `Full System Backup downloaded successfully at ${log.time} on ${log.date} (${log.totalRecords} total records secured).`
+      message: `Legacy browser-only archive downloaded at ${log.time} on ${log.date} (${log.totalRecords} browser records). It is not a PostgreSQL backup.`
     });
     refreshData();
   };
 
+  const handleCreatePostgresBackup = async () => {
+    setBackupBusy('create');
+    setBackupError('');
+    try {
+      await createDatabaseBackup();
+      await refreshPostgresBackups();
+    } catch (err) {
+      setBackupError(err.message || 'PostgreSQL backup could not be created.');
+    } finally { setBackupBusy(''); }
+  };
+
+  const handleVerifyPostgresBackup = async (id) => {
+    setBackupBusy(id);
+    setBackupError('');
+    try {
+      await verifyDatabaseBackup(id);
+      await refreshPostgresBackups();
+    } catch (err) {
+      setBackupError(err.message || 'PostgreSQL backup integrity check failed.');
+    } finally { setBackupBusy(''); }
+  };
+
+  const handleDownloadPostgresBackup = async (id) => {
+    setBackupBusy(id);
+    setBackupError('');
+    try { await downloadDatabaseBackup(id); }
+    catch (err) { setBackupError(err.message || 'PostgreSQL backup could not be downloaded.'); }
+    finally { setBackupBusy(''); }
+  };
+
+  const handleRestorePostgresBackup = async (backup) => {
+    if (!databaseBackupStatus?.restoreEnabled) return;
+    const confirmationPhrase = `RESTORE ${backup.id}`;
+    const confirmation = window.prompt(
+      `This replaces database contents. Current database identity fingerprint: ${databaseBackupStatus.identityFingerprint}\nType "${confirmationPhrase}" to continue.`
+    );
+    if (confirmation !== confirmationPhrase) return;
+    const reason = window.prompt('Enter the recovery reason (required):');
+    if (!reason?.trim()) return;
+    setBackupBusy(backup.id);
+    setBackupError('');
+    try {
+      const result = await restoreDatabaseBackup(backup.id, {
+        confirmation,
+        identityFingerprint: databaseBackupStatus.identityFingerprint,
+        reason: reason.trim()
+      });
+      setRestoreStatus({
+        success: true,
+        message: `PostgreSQL restore completed. Safety backup ${result.safetyBackupId} was created first.`
+      });
+      await refreshPostgresBackups();
+    } catch (err) {
+      setBackupError(err.message || 'PostgreSQL restore did not complete.');
+    } finally { setBackupBusy(''); }
+  };
+
   // 1. Export Inventory XLSX
-  const handleExportInventory = () => {
-    const raw = localStorage.getItem('inventoryItems');
-    const items = raw ? JSON.parse(raw) : [];
-    if (items.length === 0) {
-      alert('No inventory items to export.');
-      return;
-    }
-
-    const rows = items.map((it, idx) => ({ ...it, slNo: idx + 1 }));
-
-    const headers = [
+  const handleExportInventory = () => exportFromPostgres({
+    label: 'Inventory',
+    loader: listInventoryItems,
+    emptyMessage: 'No inventory items are available in PostgreSQL to export.',
+    baseName: 'VYAVASTA-inventory',
+    sheetName: 'Inventory Catalog',
+    mapRows: (items) => items.map((item, index) => ({
+      ...item.payload,
+      slNo: index + 1,
+      itemName: item.material_name || item.itemName || item.payload?.itemName || '',
+      category: item.category || item.payload?.category || '',
+      hsnSac: item.hsn_code || item.hsnSac || item.payload?.hsnSac || '',
+      unit: item.unit || item.payload?.unit || '',
+      currentQty: item.current_qty ?? item.currentQty ?? item.payload?.currentQty ?? 0,
+      reservedQty: item.reserved_qty ?? item.reservedQty ?? item.payload?.reservedQty ?? 0,
+      minReorderLevel: item.reorder_level ?? item.minReorderLevel ?? item.payload?.minReorderLevel ?? 0,
+      unitCost: item.unit_price ?? item.unitCost ?? item.payload?.unitCost ?? 0,
+      sellingPrice: item.selling_price ?? item.sellingPrice ?? item.payload?.sellingPrice ?? 0,
+      location: item.location || item.payload?.location || ''
+    })),
+    headers: [
       { key: 'slNo', label: 'SL.No' },
       { key: 'itemName', label: 'Item Description' },
       { key: 'category', label: 'Category' },
@@ -117,31 +227,26 @@ const BackupExportPage = () => {
       { key: 'unitCost', label: 'Unit Cost (INR)' },
       { key: 'sellingPrice', label: 'Selling Price (INR)' },
       { key: 'location', label: 'Warehouse Location' }
-    ];
-
-    exportTable('VYAVASTA-inventory', 'Inventory Catalog', headers, rows);
-  };
+    ]
+  });
 
   // 2. Export Quotations XLSX
-  const handleExportQuotations = () => {
-    const raw = localStorage.getItem('quotationHistory');
-    const items = raw ? JSON.parse(raw) : [];
-    if (items.length === 0) {
-      alert('No quotations to export.');
-      return;
-    }
-
-    const rows = items.map((q) => ({
-      date: q.date,
-      quotationNumber: q.reference,
-      company: q.company,
-      totalAmount: q.total,
-      status: q.balanceStatus || 'Active',
+  const handleExportQuotations = () => exportFromPostgres({
+    label: 'Quotations',
+    loader: listQuotations,
+    emptyMessage: 'No quotations are available in PostgreSQL to export.',
+    baseName: 'VYAVASTA-quotations',
+    sheetName: 'Quotations',
+    mapRows: (items) => items.map((q) => ({
+      date: q.date || q.payload?.quotationDetails?.quotationDate,
+      quotationNumber: q.reference || q.quotationNumber,
+      company: q.company || q.payload?.customerDetails?.companyName || q.payload?.customerDetails?.customerName,
+      totalAmount: q.total || q.payload?.totals?.grandTotal,
+      status: q.balanceStatus || q.status || 'Active',
       itemsCount: q.payload?.items?.length || 0,
       projectId: q.payload?.quotationDetails?.projectId || '-'
-    }));
-
-    const headers = [
+    })),
+    headers: [
       { key: 'date', label: 'Date' },
       { key: 'quotationNumber', label: 'Quotation Number' },
       { key: 'company', label: 'Customer / Company' },
@@ -149,32 +254,27 @@ const BackupExportPage = () => {
       { key: 'status', label: 'Status' },
       { key: 'itemsCount', label: 'Items Count' },
       { key: 'projectId', label: 'Project ID' }
-    ];
-
-    exportTable('VYAVASTA-quotations', 'Quotations', headers, rows);
-  };
+    ]
+  });
 
   // 3. Export Sales Orders XLSX
-  const handleExportSalesOrders = () => {
-    const raw = localStorage.getItem('salesOrderHistory');
-    const items = raw ? JSON.parse(raw) : [];
-    if (items.length === 0) {
-      alert('No sales orders to export.');
-      return;
-    }
-
-    const rows = items.map((so) => ({
-      date: so.date,
-      soNumber: so.reference,
-      customer: so.customer,
-      projectId: so.projectId || '-',
-      quotationRef: so.quotationRef || '-',
-      deliveryDueDate: so.dueDate || '-',
-      totalAmount: so.total,
+  const handleExportSalesOrders = () => exportFromPostgres({
+    label: 'Sales Orders',
+    loader: listSalesOrders,
+    emptyMessage: 'No sales orders are available in PostgreSQL to export.',
+    baseName: 'VYAVASTA-sales-orders',
+    sheetName: 'Sales Orders',
+    mapRows: (items) => items.map((so) => ({
+      date: so.date || so.payload?.soDetails?.soDate,
+      soNumber: so.reference || so.soNumber,
+      customer: so.customer || so.payload?.customerDetails?.companyName || so.payload?.customerDetails?.customerName,
+      projectId: so.projectId || so.payload?.soDetails?.projectId || '-',
+      quotationRef: so.quotationRef || so.payload?.soDetails?.quotationRef || '-',
+      deliveryDueDate: so.dueDate || so.payload?.soDetails?.deliveryDate || '-',
+      totalAmount: so.total || so.payload?.totals?.grandTotal,
       status: so.status || 'Active'
-    }));
-
-    const headers = [
+    })),
+    headers: [
       { key: 'date', label: 'SO Date' },
       { key: 'soNumber', label: 'Sales Order No' },
       { key: 'customer', label: 'Customer' },
@@ -183,59 +283,49 @@ const BackupExportPage = () => {
       { key: 'deliveryDueDate', label: 'Delivery Due Date' },
       { key: 'totalAmount', label: 'Total Amount' },
       { key: 'status', label: 'Status' }
-    ];
-
-    exportTable('VYAVASTA-sales-orders', 'Sales Orders', headers, rows);
-  };
+    ]
+  });
 
   // 4. Export Customer Invoices XLSX
-  const handleExportInvoices = () => {
-    const raw = localStorage.getItem('customerInvoiceHistory');
-    const items = raw ? JSON.parse(raw) : [];
-    if (items.length === 0) {
-      alert('No customer invoices to export.');
-      return;
-    }
-
-    const rows = items.map((inv) => ({
-      date: inv.date,
-      invoiceNumber: inv.reference,
-      quotationRef: inv.quotationRef || '-',
-      customer: inv.customer,
-      totalAmount: inv.total
-    }));
-
-    const headers = [
+  const handleExportInvoices = () => exportFromPostgres({
+    label: 'Customer Invoices',
+    loader: listCustomerInvoices,
+    emptyMessage: 'No customer invoices are available in PostgreSQL to export.',
+    baseName: 'VYAVASTA-tax-invoices',
+    sheetName: 'Customer Tax Invoices',
+    mapRows: (items) => items.map((invoice) => ({
+      date: invoice.date || invoice.payload?.invoiceDetails?.invoiceDate,
+      invoiceNumber: invoice.reference || invoice.payload?.invoiceDetails?.invoiceNumber,
+      quotationRef: invoice.quotationRef || invoice.payload?.invoiceDetails?.quotationRef || '-',
+      customer: invoice.company || invoice.payload?.billTo?.name || invoice.payload?.customerDetails?.companyName || invoice.payload?.customerDetails?.customerName,
+      totalAmount: invoice.total || invoice.payload?.totals?.grandTotal
+    })),
+    headers: [
       { key: 'date', label: 'Invoice Date' },
       { key: 'invoiceNumber', label: 'Invoice Number' },
       { key: 'quotationRef', label: 'Quotation Ref' },
       { key: 'customer', label: 'Customer / Company' },
       { key: 'totalAmount', label: 'Total Amount' }
-    ];
-
-    exportTable('VYAVASTA-tax-invoices', 'Customer Tax Invoices', headers, rows);
-  };
+    ]
+  });
 
   // 5. Export Supplier POs XLSX
-  const handleExportSupplierPOs = () => {
-    const raw = localStorage.getItem('supplierPOHistory');
-    const items = raw ? JSON.parse(raw) : [];
-    if (items.length === 0) {
-      alert('No supplier purchase orders to export.');
-      return;
-    }
-
-    const rows = items.map((po) => ({
-      date: po.date,
-      poNumber: po.reference,
-      vendor: po.vendor,
-      projectRef: po.projectRef || '-',
-      dueDate: po.dueDate || '-',
-      totalAmount: po.total,
+  const handleExportSupplierPOs = () => exportFromPostgres({
+    label: 'Supplier Purchase Orders',
+    loader: listPurchaseOrders,
+    emptyMessage: 'No supplier purchase orders are available in PostgreSQL to export.',
+    baseName: 'VYAVASTA-purchase-orders',
+    sheetName: 'Supplier Purchase Orders',
+    mapRows: (items) => items.map((po) => ({
+      date: po.date || po.payload?.poDetails?.poDate,
+      poNumber: po.reference || po.poNumber,
+      vendor: po.vendor || po.vendorName || po.payload?.vendorDetails?.vendorName,
+      projectRef: po.projectRef || po.payload?.poDetails?.projectRef || '-',
+      dueDate: po.dueDate || po.payload?.poDetails?.deliveryDate || '-',
+      totalAmount: po.total || po.payload?.totals?.grandTotal,
       status: po.status || 'Issued'
-    }));
-
-    const headers = [
+    })),
+    headers: [
       { key: 'date', label: 'PO Date' },
       { key: 'poNumber', label: 'Purchase Order No' },
       { key: 'vendor', label: 'Supplier / Vendor' },
@@ -243,21 +333,17 @@ const BackupExportPage = () => {
       { key: 'dueDate', label: 'Due Date' },
       { key: 'totalAmount', label: 'Total Amount' },
       { key: 'status', label: 'Status' }
-    ];
-
-    exportTable('VYAVASTA-purchase-orders', 'Supplier Purchase Orders', headers, rows);
-  };
+    ]
+  });
 
   // 6. Export Production Job Cards XLSX
-  const handleExportJobCards = () => {
-    const raw = localStorage.getItem('productionJobCards');
-    const items = raw ? JSON.parse(raw) : [];
-    if (items.length === 0) {
-      alert('No job cards to export.');
-      return;
-    }
-
-    const rows = items.map((jc) => ({
+  const handleExportJobCards = () => exportFromPostgres({
+    label: 'Job Cards',
+    loader: listJobCards,
+    emptyMessage: 'No job cards are available in PostgreSQL to export.',
+    baseName: 'VYAVASTA-production-jobcards',
+    sheetName: 'Production Job Cards',
+    mapRows: (items) => items.map((jc) => ({
       jobCardNumber: jc.jobCardNumber,
       projectId: jc.projectId || '-',
       projectName: jc.projectName || '-',
@@ -271,9 +357,8 @@ const BackupExportPage = () => {
       materialType: jc.rawMaterial?.type || '-',
       status: jc.status,
       qcResult: jc.qualityControl?.finalQC?.disposition || 'Pending'
-    }));
-
-    const headers = [
+    })),
+    headers: [
       { key: 'jobCardNumber', label: 'Job Card No' },
       { key: 'projectId', label: 'Project ID' },
       { key: 'projectName', label: 'Project Name' },
@@ -287,21 +372,17 @@ const BackupExportPage = () => {
       { key: 'materialType', label: 'Material Form' },
       { key: 'status', label: 'Status' },
       { key: 'qcResult', label: 'QC Result' }
-    ];
-
-    exportTable('VYAVASTA-production-jobcards', 'Production Job Cards', headers, rows);
-  };
+    ]
+  });
 
   // 7. Export Customer Enquiries XLSX
-  const handleExportEnquiries = () => {
-    const raw = localStorage.getItem('projectRequests');
-    const items = raw ? JSON.parse(raw) : [];
-    if (items.length === 0) {
-      alert('No customer enquiries to export.');
-      return;
-    }
-
-    const rows = items.map((pr) => ({
+  const handleExportEnquiries = () => exportFromPostgres({
+    label: 'Customer Enquiries',
+    loader: listEnquiries,
+    emptyMessage: 'No customer enquiries are available in PostgreSQL to export.',
+    baseName: 'VYAVASTA-customer-enquiries',
+    sheetName: 'Customer Enquiries',
+    mapRows: (items) => items.map((pr) => ({
       projectId: pr.projectId,
       company: pr.companyName,
       customer: pr.customerName,
@@ -312,9 +393,8 @@ const BackupExportPage = () => {
       itemCount: pr.items?.length || 0,
       firstItemName: pr.items?.[0]?.itemName || '-',
       firstItemDrawing: pr.items?.[0]?.drawingNo || '-'
-    }));
-
-    const headers = [
+    })),
+    headers: [
       { key: 'projectId', label: 'Enquiry / Project ID' },
       { key: 'company', label: 'Company Name' },
       { key: 'customer', label: 'Customer Name' },
@@ -325,10 +405,8 @@ const BackupExportPage = () => {
       { key: 'itemCount', label: 'Total Items' },
       { key: 'firstItemName', label: 'Primary Component' },
       { key: 'firstItemDrawing', label: 'Drawing No.' }
-    ];
-
-    exportTable('VYAVASTA-customer-enquiries', 'Customer Enquiries', headers, rows);
-  };
+    ]
+  });
 
   // Restore JSON file
   const handleRestoreFile = (e) => {
@@ -343,7 +421,7 @@ const BackupExportPage = () => {
           const log = restoreSystemFromJSON(json);
           setRestoreStatus({
             success: true,
-            message: `Successfully restored ${log.totalRecords} records from backup file at ${log.time} on ${log.date}!`
+            message: `Restored ${log.totalRecords} records from a legacy browser archive at ${log.time} on ${log.date}. PostgreSQL was not changed.`
           });
           refreshData();
           setTimeout(() => window.location.reload(), 1500);
@@ -370,7 +448,6 @@ const BackupExportPage = () => {
         'customerPOHistory',
         'salesOrderHistory',
         // Production
-        'productionJobCards',
         // Store / Warehouse
         'materialRequests',
         'storeIssueHistory',
@@ -431,7 +508,7 @@ const BackupExportPage = () => {
     <div className="page-section">
       <div className="page-header">
         <div>
-          <h1>Daily Backup & Data Export</h1>
+          <h1>PostgreSQL Backup & Data Export</h1>
         </div>
         <div className="header-actions no-print">
           <img className="page-header-logo" src={logoUrl} alt={`${brandName} logo`} />
@@ -442,8 +519,8 @@ const BackupExportPage = () => {
           >
             <Trash2 size={15} aria-hidden="true" /> Delete All Test Data
           </button>
-          <button className="button-primary" onClick={handleManualBackup}>
-            💾 Download Full System Backup (.json)
+          <button className="button-secondary" onClick={handleManualBackup}>
+            Download legacy browser archive
           </button>
         </div>
       </div>
@@ -464,23 +541,56 @@ const BackupExportPage = () => {
         </div>
       )}
 
-      {/* Daily Backup Status & Live KPIs */}
-      <div className="kpi-grid" style={{ marginBottom: '24px', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))' }}>
-        <div className="kpi-card" style={{ borderLeft: '4px solid #16a34a' }}>
-          <span className="kpi-title">Daily Automated Backup</span>
-          <div className="kpi-value" style={{ color: '#166534', fontSize: '18px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', background: '#16a34a' }}></span>
-            Active (Everyday)
-          </div>
-          <span className="kpi-delta positive">Runs daily on system use</span>
+      <div className="content-block" style={{ marginBottom: '28px' }}>
+        <div className="block-header">
+          <h2>PostgreSQL Backup History</h2>
+          <p style={{ fontSize: '13px', color: '#64748b' }}>
+            Server-generated full database backups with SHA-256 integrity verification. Browser archives below are legacy exports and are not database recovery files.
+          </p>
         </div>
-        <div className="kpi-card" style={{ borderLeft: '4px solid #2563eb' }}>
-          <span className="kpi-title">Last Backup Recorded</span>
-          <div className="kpi-value" style={{ fontSize: '16px', color: '#1e293b' }}>
-            {lastBackupTime || 'Today, Active'}
-          </div>
-          <span className="kpi-delta neutral">Timestamp with date & time</span>
+        {backupError && <p role="alert" style={{ color: '#b91c1c' }}>{backupError}</p>}
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
+          <button className="button-primary" disabled={!isAdmin() || backupBusy === 'create'} onClick={handleCreatePostgresBackup}>
+            {backupBusy === 'create' ? 'Creating PostgreSQL backup...' : 'Create PostgreSQL backup'}
+          </button>
+          <span style={{ fontSize: 12, color: '#64748b', overflowWrap: 'anywhere' }}>
+            Database identity: {databaseBackupStatus?.identityFingerprint || 'Loading...'}
+          </span>
+          {databaseBackupStatus && !databaseBackupStatus.backupDirectoryConfigured && (
+            <span style={{ fontSize: 12, color: '#b91c1c' }}>Server backup storage is not configured.</span>
+          )}
+          {databaseBackupStatus && !databaseBackupStatus.restoreEnabled && (
+            <span style={{ fontSize: 12, color: '#92400e' }}>Controlled restore is disabled in this environment.</span>
+          )}
         </div>
+        {databaseBackups.length === 0 ? <p>No PostgreSQL backups have been recorded.</p> : (
+          <div style={{ overflowX: 'auto' }}>
+            <table>
+              <thead><tr><th>Created</th><th>Created by</th><th>Size</th><th>Integrity</th><th>Actions</th></tr></thead>
+              <tbody>
+                {databaseBackups.map((backup) => (
+                  <tr key={backup.id}>
+                    <td>{new Date(backup.createdAt).toLocaleString()}</td>
+                    <td>{backup.createdBy}</td>
+                    <td>{Number(backup.byteSize).toLocaleString()} bytes</td>
+                    <td>{backup.integrityStatus}{backup.verifiedAt ? ` — ${new Date(backup.verifiedAt).toLocaleString()}` : ''}</td>
+                    <td>
+                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        {isAdmin() && <>
+                          <button className="button-secondary" disabled={Boolean(backupBusy)} onClick={() => handleVerifyPostgresBackup(backup.id)}>Verify</button>
+                          <button className="button-secondary" disabled={Boolean(backupBusy)} onClick={() => handleDownloadPostgresBackup(backup.id)}>Download</button>
+                          {databaseBackupStatus?.restoreEnabled && (
+                            <button className="button-secondary" disabled={Boolean(backupBusy)} onClick={() => handleRestorePostgresBackup(backup)}>Restore</button>
+                          )}
+                        </>}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* 1-Click Spreadsheet Exports */}
@@ -491,6 +601,7 @@ const BackupExportPage = () => {
             Download tabular datasets directly compatible with Microsoft Excel, Google Sheets, and accounting software.
           </p>
         </div>
+        {exportDataError && <p role="alert" style={{ color: '#b91c1c' }}>{exportDataError}</p>}
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
           {/* Enquiries */}
@@ -610,26 +721,26 @@ const BackupExportPage = () => {
       {/* System Backup, Restore & Data Reset Section */}
       <div className="content-block">
         <div className="block-header">
-          <h2>Complete System Backup, Restore & Data Reset</h2>
+          <h2>Legacy Browser Archive and Data Export</h2>
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '20px', marginTop: '14px' }}>
           {/* Backup Box */}
           <div style={{ border: '1px solid #cbd5e1', borderRadius: '10px', padding: '20px', background: '#ffffff' }}>
-            <h3 style={{ fontSize: '16px', marginBottom: '8px', color: '#0f172a' }}>Create Full System Backup</h3>
+            <h3 style={{ fontSize: '16px', marginBottom: '8px', color: '#0f172a' }}>Download Browser Archive</h3>
             <p style={{ fontSize: '13px', color: '#64748b', lineHeight: '1.5', marginBottom: '16px' }}>
-              Downloads the existing JSON data archive for this browser and a companion Excel workbook with separate sheets for available tabular records. PostgreSQL records and server-side uploaded files are not included in this browser archive.
+              Downloads the browser's legacy JSON data archive and workbook. It does not contain PostgreSQL records or server-side uploaded files.
             </p>
             <button className="button-primary" style={{ width: '100%' }} onClick={handleManualBackup}>
-              💾 Download Full ERP Backup (.json + .xlsx)
+              Download Legacy Browser Archive (.json + .xlsx)
             </button>
           </div>
 
           {/* Restore Box */}
           <div style={{ border: '1px solid #cbd5e1', borderRadius: '10px', padding: '20px', background: '#ffffff' }}>
-            <h3 style={{ fontSize: '16px', marginBottom: '8px', color: '#0f172a' }}>Restore from Backup Archive</h3>
+            <h3 style={{ fontSize: '16px', marginBottom: '8px', color: '#0f172a' }}>Restore Browser Archive Only</h3>
             <p style={{ fontSize: '13px', color: '#64748b', lineHeight: '1.5', marginBottom: '16px' }}>
-              Select a previously downloaded `.json` backup file to restore all ERP database records and settings.
+              Select a legacy `.json` archive to restore browser storage only. This never restores PostgreSQL records.
             </p>
             <label
               className="button-secondary"
@@ -642,7 +753,7 @@ const BackupExportPage = () => {
                 boxSizing: 'border-box'
               }}
             >
-              📂 Select Backup File (.json) to Restore
+              Select Browser Archive (.json)
               <input
                 type="file"
                 accept=".json"

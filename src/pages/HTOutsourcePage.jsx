@@ -1,19 +1,29 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { hasPermission, isAdmin } from '../utils/permissions.js';
-import {
-  HT_OUTSOURCE_STATUS,
-  getHTOutsourceRequests,
-  getJobCards,
-  createHTOutsourceRequest,
-  assignVendorToHTR,
-  issueHTRToVendor,
-  receiveHTRFromVendor,
-  completeHTR,
-  cancelHTR,
-  todayStr
-} from '../utils/storeService.js';
 import VendorMasterAutocomplete from '../components/VendorMasterAutocomplete.jsx';
+import {
+  listJobCards,
+  listHtOutsource,
+  createHtOutsource,
+  assignHtVendor,
+  issueHt,
+  receiveHt,
+  completeHt,
+  cancelHt
+} from '../services/productionApi.js';
+
+const HT_OUTSOURCE_STATUS = Object.freeze({
+  RAISED: 'Raised',
+  VENDOR_ASSIGNED: 'Vendor Assigned',
+  ISSUED: 'Issued to Vendor',
+  RECEIVED: 'Received at Store',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled'
+});
+
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const newCreateToken = () => globalThis.crypto?.randomUUID?.() || `htr-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
 
 const StatusChip = ({ status }) => {
   const cls = (status || '').toLowerCase().replace(/\s+/g, '-');
@@ -45,7 +55,8 @@ const acInputStyle = { ...inputStyle, width: '100%' };
 const HTOutsourcePage = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const [tick, setTick] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [statusFilter, setStatusFilter] = useState('All');
   const [search, setSearch] = useState('');
   const [viewNumber, setViewNumber] = useState(location.state?.viewHtrNumber || null);
@@ -70,15 +81,24 @@ const HTOutsourcePage = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.state]);
 
-  const all = useMemo(() => {
-    void tick;
-    return getHTOutsourceRequests().slice().sort((a, b) => String(b.requestDate).localeCompare(String(a.requestDate)));
-  }, [tick]);
+  const [all, setAll] = useState([]);
+  const [jobCards, setJobCards] = useState([]);
 
-  const jobCards = useMemo(() => {
-    void tick;
-    return getJobCards().slice().sort((a, b) => String(b.jobCardNumber).localeCompare(String(a.jobCardNumber)));
-  }, [tick]);
+  const refresh = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [requests, cards] = await Promise.all([listHtOutsource(), listJobCards()]);
+      setAll(requests.slice().sort((a, b) => String(b.requestDate).localeCompare(String(a.requestDate))));
+      setJobCards(cards.slice().sort((a, b) => String(b.jobCardNumber).localeCompare(String(a.jobCardNumber))));
+    } catch (err) {
+      setError(err.message || 'Could not load HT outsource data from PostgreSQL.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void refresh(); }, []);
 
   const activeHTRByJc = useMemo(() => {
     const map = {};
@@ -132,7 +152,7 @@ const HTOutsourcePage = () => {
     if (keepMode) setMode('create');
   };
 
-  const handleCreateHTR = () => {
+  const handleCreateHTR = async () => {
     setFormErr('');
     if (!form.jobCardNumber) return setFormErr('Select a Job Card from the dropdown (do not type).');
     if (activeHTRByJc[form.jobCardNumber]) {
@@ -147,9 +167,10 @@ const HTOutsourcePage = () => {
       return setFormErr('Qty to send must be greater than 0.');
     }
     try {
-      const rec = createHTOutsourceRequest({
+      const result = await createHtOutsource({
         jobCardNumber: form.jobCardNumber,
         projectId: jc.projectId || '',
+        partCode: jc.partNumber || jc.drawingNumber || '',
         partName: jc.partName || '',
         drawingNumber: jc.drawingNumber || '',
         processType: form.processType,
@@ -159,13 +180,14 @@ const HTOutsourcePage = () => {
         vendorName: form.vendorName || '',
         needByDate: form.needByDate || jc.targetDate || '',
         remarks: form.remarks || ''
-      });
+      }, newCreateToken());
+      const rec = result.record;
       setForm(emptyCreate);
       setMode('list');
       setViewNumber(rec.htrNumber);
-      setTick((t) => t + 1);
+      await refresh();
     } catch (e) {
-      setFormErr(e.message);
+      setFormErr(e.message || 'Could not create the HTR.');
     }
   };
 
@@ -208,19 +230,16 @@ const HTOutsourcePage = () => {
     setIssueErr('');
   };
 
-  const handleIssue = () => {
+  const handleIssue = async () => {
     if (!selected) return;
     setIssueErr('');
     try {
-      issueHTRToVendor({
-        htrNumber: selected.htrNumber,
-        qty: Number(issueQty),
-        outwardChallan,
-        vehicleNo
+      await issueHt(selected.htrNumber, Number(selected.version) || 1, {
+        qty: Number(issueQty), outwardChallan, vehicleNo
       });
-      refresh();
+      await refresh();
     } catch (e) {
-      setIssueErr(e.message);
+      setIssueErr(e.message || 'Could not issue stock.');
     }
   };
 
@@ -229,18 +248,16 @@ const HTOutsourcePage = () => {
   const [inwardChallan, setInwardChallan] = useState('');
   const [recvErr, setRecvErr] = useState('');
 
-  const handleReceive = () => {
+  const handleReceive = async () => {
     if (!selected) return;
     setRecvErr('');
     try {
-      receiveHTRFromVendor({
-        htrNumber: selected.htrNumber,
-        qty: Number(recvQty),
-        inwardChallan
+      await receiveHt(selected.htrNumber, Number(selected.version) || 1, {
+        qty: Number(recvQty), inwardChallan
       });
-      refresh();
+      await refresh();
     } catch (e) {
-      setRecvErr(e.message);
+      setRecvErr(e.message || 'Could not receive stock.');
     }
   };
 
@@ -253,12 +270,11 @@ const HTOutsourcePage = () => {
   const [rateInfo, setRateInfo] = useState('');
   const [venErr, setVenErr] = useState('');
 
-  const handleAssignVendor = () => {
+  const handleAssignVendor = async () => {
     if (!selected) return;
     setVenErr('');
     try {
-      assignVendorToHTR({
-        htrNumber: selected.htrNumber,
+      await assignHtVendor(selected.htrNumber, Number(selected.version) || 1, {
         vendorName: venName,
         vendorAddress: venAddr,
         vendorPhone: venPhone,
@@ -266,9 +282,9 @@ const HTOutsourcePage = () => {
         poRef,
         rateInfo
       });
-      refresh();
+      await refresh();
     } catch (e) {
-      setVenErr(e.message);
+      setVenErr(e.message || 'Could not assign vendor.');
     }
   };
 
@@ -278,31 +294,30 @@ const HTOutsourcePage = () => {
   const [compRemarks, setCompRemarks] = useState('');
   const [compErr, setCompErr] = useState('');
 
-  const handleComplete = () => {
+  const handleComplete = async () => {
     if (!selected) return;
     setCompErr('');
     try {
-      completeHTR({
-        htrNumber: selected.htrNumber,
+      await completeHt(selected.htrNumber, Number(selected.version) || 1, {
         actualHardness: actualHrc,
         disposition: disp,
         remarks: compRemarks
       });
-      refresh();
+      await refresh();
     } catch (e) {
-      setCompErr(e.message);
+      setCompErr(e.message || 'Could not save hardness result.');
     }
   };
 
-  const handleCancel = () => {
+  const handleCancel = async () => {
     if (!selected) return;
     const reason = window.prompt(`Cancel ${selected.htrNumber}? Enter reason:`);
     if (reason === null || !reason.trim()) return;
     try {
-      cancelHTR(selected.htrNumber, reason);
-      refresh();
+      await cancelHt(selected.htrNumber, Number(selected.version) || 1, reason.trim());
+      await refresh();
     } catch (e) {
-      alert(e.message);
+      setError(e.message || 'Could not cancel this HTR.');
     }
   };
 
@@ -350,6 +365,9 @@ const HTOutsourcePage = () => {
         </div>
 
       </div>
+
+      {loading && <div className="form-error" style={{ marginBottom: '12px' }}>Loading HT outsource requests from PostgreSQL…</div>}
+      {error && <div className="form-error" style={{ marginBottom: '12px' }}>{error}</div>}
 
       {mode === 'create' ? (
         <div className="form-section" style={{ padding: '20px' }}>

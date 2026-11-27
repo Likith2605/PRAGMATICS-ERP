@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import AddableSelect from '../components/AddableSelect.jsx';
 import { DEFAULT_UNITS } from '../utils/addableMasters.js';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -15,6 +15,10 @@ import ProjectIdAutocomplete from '../components/ProjectIdAutocomplete.jsx';
 import ReportRegister from '../components/ReportRegister.jsx';
 import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterSalesOrderHistory } from '../utils/historySearch.js';
+import { createSalesOrder, deleteSalesOrder, getSalesOrder, listSalesOrders, updateSalesOrder } from '../services/salesOrderApi.js';
+import { listQuotations } from '../services/quotationApi.js';
+import { getCustomerPurchaseOrders } from '../services/customerPurchaseOrderApi.js';
+import { isAdmin } from '../utils/auth.js';
 
 const parseINR = (v) => Number(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
 
@@ -63,6 +67,11 @@ const SalesOrderPage = () => {
   const [quotationList, setQuotationList] = useState([]);
   const [customerPOList, setCustomerPOList] = useState([]);
   const [selectedOrder, setSelectedOrder] = useState(null);
+  const [selectedOrderVersion, setSelectedOrderVersion] = useState(null);
+  const [editingOrderVersion, setEditingOrderVersion] = useState(null);
+  const createToken = useRef(globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
+  const [loadError, setLoadError] = useState('');
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [reportTab, setReportTab] = useState('orders'); // 'orders' | 'open'
 
   // Form states
@@ -96,23 +105,16 @@ const SalesOrderPage = () => {
     state: ''
   });
 
-  const [companyDetails, setCompanyDetails] = useState(() => {
-    try {
-      const stored = localStorage.getItem('companySettings');
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    const profile = getCompanyProfile();
-    return {
-      companyName: profile.companyName || '',
-      phone: profile.phone || '',
-      email: profile.email || '',
-      address: profile.address || '',
-      gstin: profile.gstin || '',
-      state: profile.state || ''
-    };
-  });
+  const [companyDetails, setCompanyDetails] = useState(() => getCompanyProfile());
 
   const [items, setItems] = useState([{ ...emptyItem }]);
+
+  const refreshSalesOrders = async () => {
+    setHistoryLoading(true);
+    try { setHistory(await listSalesOrders()); setLoadError(''); }
+    catch (error) { setLoadError(`Could not load Sales Orders from PostgreSQL: ${error.message}`); }
+    finally { setHistoryLoading(false); }
+  };
 
   const applyQuotationSource = (quotation, soNumber) => {
     const q = quotation?.quotationDetails || {};
@@ -177,32 +179,14 @@ const SalesOrderPage = () => {
     if (match?.payload) applyCustomerPOSource(match.payload);
   };
 
-  // Load history from localStorage
   useEffect(() => {
-    const loadHistory = () => {
-      try {
-        const stored = localStorage.getItem('salesOrderHistory');
-        setHistory(stored ? JSON.parse(stored) : []);
-      } catch {
-        setHistory([]);
-      }
-    };
-    const onERPStateChange = (event) => {
-      if (!event.detail?.key || event.detail.key === 'salesOrderHistory') loadHistory();
-    };
-    const onStorage = (event) => {
-      if (event.key === 'salesOrderHistory') loadHistory();
-    };
-    loadHistory();
-    window.addEventListener('erp-state-hydrated', loadHistory);
-    window.addEventListener('erp-state-change', onERPStateChange);
-    window.addEventListener('storage', onStorage);
-    window.addEventListener('focus', loadHistory);
+    let active = true;
+    const load = () => { if (active) refreshSalesOrders(); };
+    load();
+    window.addEventListener('focus', load);
     return () => {
-      window.removeEventListener('erp-state-hydrated', loadHistory);
-      window.removeEventListener('erp-state-change', onERPStateChange);
-      window.removeEventListener('storage', onStorage);
-      window.removeEventListener('focus', loadHistory);
+      active = false;
+      window.removeEventListener('focus', load);
     };
   }, []);
 
@@ -212,8 +196,13 @@ const SalesOrderPage = () => {
   );
 
   useEffect(() => {
-    try { setQuotationList(JSON.parse(localStorage.getItem('quotationHistory') || '[]')); } catch { setQuotationList([]); }
-    try { setCustomerPOList(JSON.parse(localStorage.getItem('customerPOHistory') || '[]')); } catch { setCustomerPOList([]); }
+    let active = true;
+    Promise.all([listQuotations(), getCustomerPurchaseOrders()]).then(([quotes, pos]) => {
+      if (!active) return;
+      setQuotationList(quotes);
+      setCustomerPOList(pos);
+    }).catch((error) => { if (active) setLoadError(`Could not load source documents from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
   }, []);
 
   const [projectSummaryList, setProjectSummaryList] = useState([]);
@@ -275,8 +264,9 @@ const SalesOrderPage = () => {
     } else if (location.state?.fromQuotation && location.state?.quotation) {
       applyQuotationSource(location.state.quotation, location.state.soNumber || generateSONumber());
     } else if (location.state?.viewOrder) {
-      setSelectedOrder(location.state.viewOrder);
-      setMode('view');
+      getSalesOrder(location.state.viewOrder.soDetails?.soNumber || location.state.viewOrder.reference)
+        .then((record) => { setSelectedOrder(record.payload); setSelectedOrderVersion(record.version); setMode('view'); })
+        .catch((error) => setLoadError(`Could not load Sales Order from PostgreSQL: ${error.message}`));
     }
   }, [location.state]);
 
@@ -324,7 +314,7 @@ const SalesOrderPage = () => {
     });
   };
 
-  const handleSaveOrder = (e) => {
+  const handleSaveOrder = async (e) => {
     e.preventDefault();
     if (!customerDetails.customerName.trim()) {
       alert('Please provide Customer Name.');
@@ -348,52 +338,24 @@ const SalesOrderPage = () => {
     };
 
     try {
-      const stored = localStorage.getItem('salesOrderHistory');
-      let current = stored ? JSON.parse(stored) : [];
-      const entry = {
-        date: soDetails.soDate,
-        reference: soDetails.soNumber,
-        quotationRef: soDetails.quotationRef || '-',
-        company: customerDetails.companyName || customerDetails.customerName || '-',
-        total: money(totals.grandTotal, currencyCode),
-        currency: currencyCode,
-        amountINR: totalINR,
-        status: soDetails.orderStatus || 'Confirmed',
-        payload
-      };
-
-      const existingIndex = current.findIndex((h) => h.reference === entry.reference);
-      const isNew = existingIndex === -1;
-      if (existingIndex !== -1) {
-        current[existingIndex] = entry;
-      } else {
-        current.unshift(entry);
-      }
-      localStorage.setItem('salesOrderHistory', JSON.stringify(current));
-      setHistory(current);
-      setSelectedOrder(payload);
+      const saved = editingOrderVersion
+        ? await updateSalesOrder(soDetails.soNumber, payload, editingOrderVersion)
+        : await createSalesOrder(payload, createToken.current);
+      const entry = saved.record;
+      const isNew = !editingOrderVersion;
+      setHistory((current) => [entry, ...current.filter((row) => row.reference !== entry.reference)]);
+      setSelectedOrder(entry.payload);
+      setSelectedOrderVersion(entry.version);
+      setEditingOrderVersion(null);
       setMode('view');
+      setLoadError('');
 
       if (isNew) {
-        if (soDetails.customerPoNumber) {
-          const customerPOs = JSON.parse(localStorage.getItem('customerPOHistory') || '[]');
-          const updatedPOs = customerPOs.map((po) => po.reference === soDetails.customerPoNumber
-            ? { ...po, status: `Converted (${soDetails.soNumber})` }
-            : po);
-          if (updatedPOs.some((po, index) => po !== customerPOs[index])) {
-            localStorage.setItem('customerPOHistory', JSON.stringify(updatedPOs));
-            setCustomerPOList(updatedPOs);
-          }
-        } else if (soDetails.quotationRef) {
-          const quotations = JSON.parse(localStorage.getItem('quotationHistory') || '[]');
-          const updatedQuotations = quotations.map((quotation) => quotation.reference === soDetails.quotationRef
-            ? { ...quotation, balanceStatus: `Converted (${soDetails.soNumber})` }
-            : quotation);
-          if (updatedQuotations.some((quotation, index) => quotation !== quotations[index])) {
-            localStorage.setItem('quotationHistory', JSON.stringify(updatedQuotations));
-            setQuotationList(updatedQuotations);
-          }
-        }
+        // Linked Quotation / Customer PO status and audit updates are committed
+        // by the Sales Order API in the same PostgreSQL transaction.
+        Promise.all([listQuotations(), getCustomerPurchaseOrders()])
+          .then(([quotes, pos]) => { setQuotationList(quotes); setCustomerPOList(pos); })
+          .catch((error) => setLoadError(`Sales Order saved, but source refresh failed: ${error.message}`));
         appendAuditLog({
           action: 'SALES ORDER CREATED',
           reference: soDetails.soNumber,
@@ -409,7 +371,7 @@ const SalesOrderPage = () => {
         });
       }
     } catch (err) {
-      console.error('Failed to save sales order', err);
+      setLoadError(`Sales Order was not saved in PostgreSQL: ${err.message}`);
     }
   };
 
@@ -540,6 +502,8 @@ const SalesOrderPage = () => {
                   termsAndConditions: ''
                 });
                 setItems([{ ...emptyItem }]);
+                setEditingOrderVersion(null);
+                createToken.current = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
                 setMode('create');
               }}
             >
@@ -557,6 +521,7 @@ const SalesOrderPage = () => {
       )}
 
       <div className="content-block">
+        {loadError && <div role="alert" className="error-message">{loadError}</div>}
         {mode === 'list' && (
           <>
             <div className="tab-nav report-tabs">
@@ -600,7 +565,9 @@ const SalesOrderPage = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {history.length === 0 ? (
+                  {historyLoading ? (
+                    <tr><td colSpan="6" className="no-history-row">Loading Sales Orders from PostgreSQL…</td></tr>
+                  ) : history.length === 0 ? (
                     <tr>
                       <td colSpan="6" className="no-history-row">No Sales Orders yet. Convert a Quotation or click "+ Create Sales Order".</td>
                     </tr>
@@ -622,6 +589,7 @@ const SalesOrderPage = () => {
                               className="button-small"
                               onClick={() => {
                                 setSelectedOrder(so.payload);
+                                setSelectedOrderVersion(so.version);
                                 setMode('view');
                               }}
                             >
@@ -638,6 +606,7 @@ const SalesOrderPage = () => {
                                   setCustomerDetails(p.customerDetails);
                                   setCompanyDetails(p.companyDetails);
                                   setItems(p.items);
+                                  setEditingOrderVersion(so.version);
                                   setMode('create');
                                 } else if (act === 'production') {
                                   handleSendToProduction(so.payload);
@@ -649,6 +618,12 @@ const SalesOrderPage = () => {
                                   handleGenerateExportInvoice(so.payload);
                                 } else if (act === 'po') {
                                   handlePurchaseRawMaterial(so.payload);
+                                } else if (act === 'delete') {
+                                  if (isAdmin() && window.confirm(`Move Sales Order ${so.reference} to the Recycle Bin?`)) {
+                                    deleteSalesOrder(so.reference, so.version, 'Admin soft-deleted Sales Order')
+                                      .then(() => setHistory((current) => current.filter((row) => row.reference !== so.reference)))
+                                      .catch((error) => setLoadError(`Sales Order was not deleted: ${error.message}`));
+                                  }
                                 }
                                 e.target.value = '';
                               }}
@@ -660,6 +635,7 @@ const SalesOrderPage = () => {
                               <option value="export_invoice">🌐 Generate Export Invoice</option>
                               <option value="po">Buy Raw Materials (PO)</option>
                               <option value="edit">Edit Order</option>
+                              {isAdmin() && <option value="delete">Delete Order</option>}
                             </select>
                           </div>
                         </td>
@@ -1081,6 +1057,7 @@ const SalesOrderPage = () => {
                   setCustomerDetails(selectedOrder.customerDetails);
                   setCompanyDetails(selectedOrder.companyDetails);
                   setItems(selectedOrder.items);
+                  setEditingOrderVersion(selectedOrderVersion);
                   setMode('create');
                 }}
               >

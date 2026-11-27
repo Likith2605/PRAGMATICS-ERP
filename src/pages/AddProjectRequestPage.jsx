@@ -4,8 +4,6 @@ import { UserRound, Eye, ExternalLink } from 'lucide-react';
 import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBranding.js';
 import { useCompanyBranding } from '../utils/companyBranding.js';
 import { viewDrawingFile, getBlobUrlFromDataUrl } from '../utils/fileViewer';
-import { formatFYProjectId } from '../utils/financialYear';
-import legacyCustomers from '../constants/legacyCustomers.json';
 import { enrichCustomerDetails } from '../utils/customerMaster.js';
 import { isAdmin } from '../utils/auth.js';
 import AddableSelect from '../components/AddableSelect.jsx';
@@ -13,34 +11,17 @@ import { addCustomUnit, DEFAULT_UNITS, getCustomUnits } from '../utils/addableMa
 import { saveAllDrawings, getDrawing, deleteAllDrawings } from '../utils/drawingStorage.js';
 import CustomerSearchSelect from '../components/CustomerSearchSelect.jsx';
 import CustomerRegistrationModal from '../components/CustomerRegistrationModal.jsx';
-import { readCustomerDirectory } from '../utils/customerDirectory.js';
-
-const getNextSequenceNumber = () => {
-  let maxSeq = Number(localStorage.getItem('projectRequestSequence') || 0);
-  try {
-    const stored = JSON.parse(localStorage.getItem('projectRequests') || '[]');
-    if (Array.isArray(stored)) {
-      stored.forEach((p) => {
-        const match = String(p.projectId || '').match(/(\d+)$/);
-        if (match) {
-          const n = parseInt(match[1], 10);
-          if (n > maxSeq) maxSeq = n;
-        }
-      });
-    }
-  } catch {}
-  return maxSeq + 1;
-};
-
-const formatProjectId = (seq) => {
-  return formatFYProjectId(seq);
-};
+import { loadCustomerDirectory } from '../utils/customerDirectory.js';
+import { createEnquiry, listEnquiries, updateEnquiry } from '../services/enquiryApi.js';
+import { listQuotations } from '../services/quotationApi.js';
 
 const createEmptyItem = () => ({
   itemName: '',
   drawingNo: '',
+  drawingFileId: '',
   drawingFileName: '',
   drawingDataUrl: '',
+  drawingSource: 'none',
   materialSpec: '',
   quantity: 1,
   unit: 'Nos',
@@ -54,12 +35,9 @@ const AddProjectRequestPage = () => {
   const isEdit = Boolean(location.state?.edit && location.state?.project);
   const editProject = location.state?.project || null;
 
-  const projectId = useMemo(() => {
-    if (isEdit && editProject?.projectId) {
-      return editProject.projectId;
-    }
-    return formatProjectId(getNextSequenceNumber());
-  }, [isEdit, editProject]);
+  const projectId = isEdit ? editProject?.projectId : '';
+  const [createToken, setCreateToken] = useState(() => globalThis.crypto?.randomUUID?.() || `enquiry-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const [editVersion, setEditVersion] = useState(Number(editProject?.version || 1));
 
   const [form, setForm] = useState(() => {
     if (isEdit && editProject) {
@@ -73,7 +51,9 @@ const AddProjectRequestPage = () => {
         targetDeliveryDate: editProject.targetDeliveryDate || '',
         address: editProject.address || '',
         engineeringNotes: editProject.engineeringNotes || '',
-        items: editProject.items && editProject.items.length > 0 ? editProject.items : [createEmptyItem()]
+        items: editProject.items && editProject.items.length > 0
+          ? editProject.items.map((item) => ({ ...item, drawingDataUrl: '', drawingSource: 'server' }))
+          : [createEmptyItem()]
       };
     }
     return {
@@ -92,10 +72,17 @@ const AddProjectRequestPage = () => {
   const [error, setError] = useState('');
   const [previewDrawing, setPreviewDrawing] = useState(null);
 
-  const handlePreviewDrawing = (dataUrl, fileName) => {
-    if (!dataUrl) return;
-    const blobUrl = getBlobUrlFromDataUrl(dataUrl);
-    setPreviewDrawing({ fileName: fileName || 'drawing.pdf', dataUrl, blobUrl });
+  const handlePreviewDrawing = async (item) => {
+    try {
+      const dataUrl = item.drawingSource === 'local-new'
+        ? item.drawingDataUrl
+        : (isEdit && item.drawingNo ? await getDrawing(projectId, item.drawingNo, item.drawingFileId) : '');
+      if (!dataUrl) throw new Error(`No PostgreSQL attachment exists for ${item.drawingNo || 'this drawing'}.`);
+      const blobUrl = getBlobUrlFromDataUrl(dataUrl);
+      setPreviewDrawing({ fileName: item.drawingFileName || 'drawing.pdf', dataUrl, blobUrl });
+    } catch (previewError) {
+      setError(`Drawing preview failed: ${previewError.message}`);
+    }
   };
 
   const [existingCustomers, setExistingCustomers] = useState([]);
@@ -106,19 +93,18 @@ const AddProjectRequestPage = () => {
   const [lockedCustomerFields, setLockedCustomerFields] = useState({});
   const [showCustomerModal, setShowCustomerModal] = useState(false);
 
-  // Load existing customers from master catalog + storage + legacy list
+  // Load customer masters and historical customer details from PostgreSQL.
   useEffect(() => {
-    try {
+    (async () => { try {
       const customersMap = new Map();
 
-      // Customer master records come only from the central customer directory.
-      readCustomerDirectory().forEach((customer) => {
+      const customerRecords = await loadCustomerDirectory();
+      customerRecords.forEach((customer) => {
         const key = (customer.companyName || customer.customerName || '').trim().toLowerCase();
         if (key && !customersMap.has(key)) customersMap.set(key, { key, customerName: customer.customerName || '', companyName: customer.companyName || '', phone: customer.phone || '', email: customer.email || '', gstin: customer.gstin || '', address: customer.address || customer.billingAddress || '' });
       });
 
-      // 2. From project requests
-      const projects = JSON.parse(localStorage.getItem('projectRequests') || '[]');
+      const projects = await listEnquiries();
       projects.forEach((p) => {
         if (p.companyName || p.customerName) {
           const key = (p.companyName || p.customerName).trim().toLowerCase();
@@ -137,8 +123,7 @@ const AddProjectRequestPage = () => {
         }
       });
 
-      // 3. From quotations
-      const quotations = JSON.parse(localStorage.getItem('quotationHistory') || '[]');
+      const quotations = await listQuotations();
       quotations.forEach((q) => {
         const c = q.payload?.customerDetails;
         if (c && (c.companyName || c.customerName)) {
@@ -158,27 +143,6 @@ const AddProjectRequestPage = () => {
         }
       });
 
-      // 4. From legacy historical customer archives
-      if (Array.isArray(legacyCustomers)) {
-        legacyCustomers.forEach((custName) => {
-          if (custName && custName.trim()) {
-            const key = custName.trim().toLowerCase();
-            if (!customersMap.has(key)) {
-              const enriched = enrichCustomerDetails(custName);
-              customersMap.set(key, {
-                key,
-                customerName: enriched.customerName || custName.trim(),
-                companyName: enriched.companyName || custName.trim(),
-                phone: enriched.phone || '',
-                email: enriched.email || '',
-                gstin: enriched.gstin || '',
-                address: enriched.address || ''
-              });
-            }
-          }
-        });
-      }
-
       // Sort alphabetically by company/customer name
       const sortedCustomers = Array.from(customersMap.values()).sort((a, b) =>
         (a.companyName || a.customerName || '').localeCompare(b.companyName || b.customerName || '')
@@ -186,8 +150,8 @@ const AddProjectRequestPage = () => {
 
       setExistingCustomers(sortedCustomers);
     } catch (err) {
-      console.error('Failed to load existing customers', err);
-    }
+      setError(`Customer data could not be loaded from PostgreSQL: ${err.message}`);
+    } })();
   }, []);
 
   useEffect(() => {
@@ -196,15 +160,18 @@ const AddProjectRequestPage = () => {
       try {
         const itemsWithDrawings = await Promise.all(
           editProject.items.map(async (item) => {
-            if (item.drawingDataUrl) return item;
-            if (!item.drawingNo) return item;
+            if (!item.drawingNo) return { ...item, drawingDataUrl: '', drawingSource: 'none' };
             const dataUrl = await getDrawing(editProject.projectId, item.drawingNo);
-            return dataUrl ? { ...item, drawingDataUrl: dataUrl } : item;
+            return dataUrl
+              ? { ...item, drawingDataUrl: dataUrl, drawingSource: 'server' }
+              : { ...item, drawingDataUrl: '', drawingSource: 'missing' };
           })
         );
         setForm((prev) => ({ ...prev, items: itemsWithDrawings }));
+        const missingDrawing = itemsWithDrawings.find((item) => item.drawingSource === 'missing');
+        if (missingDrawing) setError(`The saved PostgreSQL attachment for ${missingDrawing.drawingNo} could not be found.`);
       } catch (err) {
-        console.error('Failed to load drawings from IndexedDB', err);
+        setError(`Failed to load and verify drawing from PostgreSQL: ${err.message}`);
       }
     })();
   }, [isEdit, editProject]);
@@ -263,7 +230,9 @@ const AddProjectRequestPage = () => {
     setForm((current) => ({
       ...current,
       items: current.items.map((item, itemIndex) =>
-        itemIndex === index ? { ...item, [field]: value } : item
+        itemIndex === index
+          ? { ...item, [field]: value, ...(field === 'drawingNo' && value !== item.drawingNo ? { drawingFileId: '' } : {}) }
+          : item
       )
     }));
   };
@@ -302,8 +271,10 @@ const AddProjectRequestPage = () => {
           return {
             ...item,
             drawingNo: autoDwgNo, // Auto-fetches extracted drawing number (remains fully editable)
+            drawingFileId: '',
             drawingFileName: file.name,
-            drawingDataUrl: reader.result
+            drawingDataUrl: reader.result,
+            drawingSource: 'local-new'
           };
         })
       }));
@@ -352,6 +323,7 @@ const AddProjectRequestPage = () => {
     const sanitizedItems = validItems.map((item) => ({
       itemName: item.itemName.trim(),
       drawingNo: item.drawingNo.trim(),
+      drawingFileId: item.drawingFileId || '',
       drawingFileName: item.drawingFileName || '',
       materialSpec: item.materialSpec.trim(),
       quantity: Number(item.quantity),
@@ -360,7 +332,6 @@ const AddProjectRequestPage = () => {
     }));
 
     const project = {
-      projectId,
       customerName: form.customerName.trim(),
       companyName: form.companyName.trim(),
       phone: form.phone.trim(),
@@ -374,14 +345,41 @@ const AddProjectRequestPage = () => {
       createdAt: new Date().toISOString()
     };
 
+    let recordConfirmed = false;
     try {
       const drawItems = validItems.map((item, i) => ({
         ...sanitizedItems[i],
         drawingDataUrl: item.drawingDataUrl || ''
       }));
-      await saveAllDrawings(projectId, drawItems);
+      let savedProject;
+      if (isEdit) {
+        const nextProject = { ...project, projectId, createdAt: editProject?.createdAt || project.createdAt };
+        const result = await updateEnquiry(projectId, nextProject, editVersion);
+        savedProject = result.record;
+        setEditVersion(savedProject.version);
+        recordConfirmed = true;
+      } else {
+        const result = await createEnquiry(project, { createToken, sequenceHint: 0 });
+        savedProject = result.record;
+        recordConfirmed = true;
+      }
 
-      const stored = JSON.parse(localStorage.getItem('projectRequests') || '[]');
+      // Refresh the cache only from PostgreSQL-confirmed records.
+      const verifiedDrawings = await saveAllDrawings(savedProject.projectId, drawItems);
+      if (verifiedDrawings.length > 0) {
+        const verifiedByDrawing = new Map(verifiedDrawings.map((attachment) => [attachment.drawingNo, attachment]));
+        const linkedItems = project.items.map((item) => {
+          const attachment = verifiedByDrawing.get(item.drawingNo);
+          return attachment ? { ...item, drawingFileId: attachment.id } : item;
+        });
+        const linked = await updateEnquiry(
+          savedProject.projectId,
+          { ...project, items: linkedItems },
+          savedProject.version
+        );
+        savedProject = linked.record;
+        if (isEdit) setEditVersion(savedProject.version);
+      }
 
       if (isEdit) {
         const oldItems = editProject?.items || [];
@@ -389,28 +387,18 @@ const AddProjectRequestPage = () => {
           (old) => !sanitizedItems.some((s) => s.drawingNo === old.drawingNo)
         );
         if (removedItems.length > 0) {
-          await deleteAllDrawings(projectId, removedItems);
+          await deleteAllDrawings(savedProject.projectId, removedItems);
         }
-        const updated = stored.map((p) =>
-          p.projectId === projectId
-            ? { ...project, projectId, createdAt: editProject?.createdAt || project.createdAt }
-            : p
-        );
-        localStorage.setItem('projectRequests', JSON.stringify(updated));
       } else {
-        const finalSeq = getNextSequenceNumber();
-        const finalProjectId = formatProjectId(finalSeq);
-        localStorage.setItem('projectRequestSequence', String(finalSeq));
-
-        await saveAllDrawings(finalProjectId, drawItems);
-        const finalProject = { ...project, projectId: finalProjectId };
-        localStorage.setItem('projectRequests', JSON.stringify([finalProject, ...stored]));
+        setCreateToken(globalThis.crypto?.randomUUID?.() || `enquiry-${Date.now()}-${Math.random().toString(36).slice(2)}`);
       }
 
       navigate('/project-request');
     } catch (storageError) {
       console.error('Unable to save project request', storageError);
-      setError('Unable to save the project request. Please try again.');
+      setError(recordConfirmed
+        ? `The enquiry was saved in PostgreSQL, but a drawing operation failed: ${storageError.message}`
+        : `Unable to save the enquiry in PostgreSQL: ${storageError.message}`);
     }
   };
 
@@ -432,7 +420,7 @@ const AddProjectRequestPage = () => {
         <div className="project-id-card">
           <div>
             <span className="field-label">Enquiry ID</span>
-            <strong className="project-id-value">{projectId}</strong>
+            <strong className="project-id-value">{projectId || 'Assigned when saved'}</strong>
           </div>
         </div>
 
@@ -677,10 +665,10 @@ const AddProjectRequestPage = () => {
                           gap: '3px'
                         }}
                       >
-                        {item.drawingDataUrl && (
+                        {(item.drawingDataUrl || (isEdit && item.drawingSource === 'server' && item.drawingFileName)) && (
                           <button
                             type="button"
-                            onClick={() => handlePreviewDrawing(item.drawingDataUrl, item.drawingFileName)}
+                            onClick={() => handlePreviewDrawing(item)}
                             title={`Preview ${item.drawingFileName}`}
                             style={{
                               fontSize: '11px',

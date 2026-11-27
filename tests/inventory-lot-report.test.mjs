@@ -17,13 +17,18 @@ save('stockTransactions', [
 ]);
 
 const reports = await import('../src/utils/inventoryReportData.js');
-const availability = reports.getLotAvailabilityRows();
+const reportData = {
+  items: JSON.parse(localStorage.getItem('inventoryItems')),
+  batches: JSON.parse(localStorage.getItem('inventoryBatches')),
+  transactions: JSON.parse(localStorage.getItem('stockTransactions'))
+};
+const availability = reports.getLotAvailabilityRows(reportData);
 assert.equal(availability.length, 1);
 assert.equal(availability[0].internalBatchId, 'IRB-0001');
 assert.equal(availability[0].usableQty, 4, 'usable quantity excludes reservations, blocked and rejected stock');
 assert.equal(availability[0].reservedQty, 1);
 assert.equal(availability[0].dimensions.thickness, 4);
-const ledger = reports.getLocationLotLedgerRows();
+const ledger = reports.getLocationLotLedgerRows(reportData);
 assert.equal(ledger.length, 2, 'receiptBatchId links movements via batch record id');
 assert.equal(ledger[1].closingQty, 7);
 console.log('Inventory lot report linkage and quantity checks passed.');

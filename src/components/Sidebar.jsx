@@ -28,6 +28,7 @@ const ICONS = {
   'Debit Notes': ReceiptText,
   'Store Issues': PackageOpen, 'HT Outsource': Factory,
   'Material Returns': ArrowLeftRight, 'Inventory Transactions': Layers3,
+  'Stock Transfers & Verification': ArrowLeftRight,
   'Shelf Life / Expiry': FileClock, 'Ballooning Dashboard': ClipboardCheck,
   'New Inspection Project': FilePlus2, 'Production Home': HardHat,
   'Item Requirements': ClipboardList, 'Quality Checks': ShieldCheck,
@@ -51,6 +52,7 @@ const STORE_TOP_LINKS = [
   { label: 'HT Outsource', path: '/ht-outsource', perm: 'ht_outsource.view' },
   { label: 'Material Returns', path: '/store/returns', perm: 'material_return.view' },
   { label: 'Inventory Transactions', path: '/store/transactions', perm: 'inventory.transaction.view' },
+  { label: 'Stock Transfers & Verification', path: '/store/inventory-workflows', perm: ['inventory.view', 'inventory.transaction.view', 'inventory.adjust', 'store.module'] },
   { label: 'Shelf Life / Expiry', path: '/store/expiry', perm: 'inventory.adjust' }
 ];
 
@@ -75,6 +77,7 @@ const GROUPS = [
     { label: 'HT Outsource', path: '/ht-outsource', perm: 'ht_outsource.view' },
     { label: 'Material Returns', path: '/store/returns', perm: 'material_return.view' },
     { label: 'Inventory Transactions', path: '/store/transactions', perm: 'inventory.transaction.view' },
+    { label: 'Stock Transfers & Verification', path: '/store/inventory-workflows', perm: ['inventory.view', 'inventory.transaction.view', 'inventory.adjust', 'store.module'] },
     { label: 'Shelf Life / Expiry', path: '/store/expiry', perm: 'inventory.adjust' },
     { label: 'Workflow Dashboard', path: '/workflow', perm: 'store.module' }
   ] },
@@ -107,8 +110,10 @@ const GROUPS = [
     { label: 'Customers', path: '/customers', perm: 'sales_order.view' },
     { label: 'Employees', path: '/employees', perm: 'employee.view' },
     { label: 'Machine Master', path: '/machines', perm: 'settings.view' },
+    { label: 'Material & UOM Master', path: '/master-data', perm: ['inventory.view', 'settings.view'] },
     { label: 'Company Settings', path: '/settings', perm: 'settings.view' },
-    { label: 'Backup & Export', path: '/backup-export', perm: 'backup.view' }
+    { label: 'Backup & Export', path: '/backup-export', perm: 'backup.view' },
+    { label: 'Recycle Bin', path: '/recycle-bin', perm: ['settings.view', 'store.module', 'purchase.order', 'purchase_request.view', 'production.view', 'sales_order.view', 'invoice.view'] }
   ] }
 ];
 
@@ -228,7 +233,7 @@ const Sidebar = ({ onLogout, mobileOpen = false, onMobileClose }) => {
         </div>
       </div>
       <nav className="sidebar-nav" aria-label="Main navigation">
-        {isStoreDept ? STORE_TOP_LINKS.filter((item) => !item.perm || hasPermission(item.perm)).map((item) => <MenuItem key={item.path} {...item} />) : <>
+        {isStoreDept ? STORE_TOP_LINKS.filter((item) => !item.perm || hasAnyPermission(item.perm)).map((item) => <MenuItem key={item.path} {...item} />) : <>
           {topMenuItems.map((item) => <MenuItem key={item.path} {...item} />)}
           {filteredGroups.map((group) => <CollapsibleGroup key={group.label} group={group} isOpen={!!openGroups[group.label]} isProdDept={isProdDept} onToggle={() => setOpenGroups((prev) => ({ ...prev, [group.label]: !prev[group.label] }))} />)}
           {bottomMenuItems.map((item) => <MenuItem key={item.path} {...item} />)}

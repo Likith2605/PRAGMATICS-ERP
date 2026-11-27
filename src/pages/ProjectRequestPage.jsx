@@ -1,40 +1,168 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Eye } from 'lucide-react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { Eye, ExternalLink, FileText, Pencil } from 'lucide-react';
 import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBranding.js';
 import { useCompanyBranding } from '../utils/companyBranding.js';
-import { viewDrawingFile, getBlobUrlFromDataUrl } from '../utils/fileViewer';
+import { getBlobUrlFromDataUrl } from '../utils/fileViewer';
 import { isAdmin } from '../utils/auth.js';
-import { getDrawing, deleteAllDrawings } from '../utils/drawingStorage.js';
+import FileChecksumReviewPanel from '../components/FileChecksumReviewPanel.jsx';
+import { getDrawing, getDrawingFileId, deleteAllDrawings, findEmbeddedLegacyDrawing, migrateLegacyDrawing, migrateLegacyEmbeddedDrawing, previewLegacyDrawings } from '../utils/drawingStorage.js';
 import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterProjectRequests } from '../utils/historySearch.js';
+import { deleteEnquiry, getEnquiry, getEnquiryMigrationPreview, importMissingEnquiries, listEnquiries, updateEnquiry } from '../services/enquiryApi.js';
 
 const ProjectRequestPage = () => {
   const { logoUrl, companyName: brandName, company: brandCompany } = useCompanyBranding(defaultLogoUrl);
   const navigate = useNavigate();
+  const { projectId: routeProjectId } = useParams();
   const [projects, setProjects] = useState([]);
   const [search, setSearch] = useState('');
   const [selectedProject, setSelectedProject] = useState(null);
   const [previewDrawing, setPreviewDrawing] = useState(null);
-
-  const handlePreviewDrawing = async (dataUrl, fileName, projectId, drawingNo) => {
-    let url = dataUrl;
-    if (!url && projectId && drawingNo) {
-      try { url = await getDrawing(projectId, drawingNo); } catch (e) { /* ignore */ }
-    }
-    if (!url) return;
-    const blobUrl = getBlobUrlFromDataUrl(url);
-    setPreviewDrawing({ fileName: fileName || 'drawing.pdf', dataUrl: url, blobUrl });
+  const [loadError, setLoadError] = useState('');
+  const [detailError, setDetailError] = useState('');
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [migration, setMigration] = useState({ missing: [], conflicts: [], deleted: [], existing: [] });
+  const [migrationBusy, setMigrationBusy] = useState(false);
+  const [drawingMigrationStatus, setDrawingMigrationStatus] = useState({});
+  const [legacyDrawingSources, setLegacyDrawingSources] = useState([]);
+  const [tombstonedEnquiryIds, setTombstonedEnquiryIds] = useState(() => new Set());
+  const persistDrawingReference = async (project, item, attachment) => {
+    const fileId = attachment.fileId || getDrawingFileId(project.projectId, item.drawingNo);
+    if (item.drawingFileId === fileId) return project;
+    const nextItems = (project.items || []).map((entry) =>
+      String(entry.drawingNo || '').trim() === String(item.drawingNo || '').trim()
+        ? { ...entry, drawingFileId: fileId, drawingFileName: attachment.fileName || entry.drawingFileName || '' }
+        : entry
+    );
+    const { projectId, version, updatedAt, ...data } = project;
+    const result = await updateEnquiry(projectId, { ...data, items: nextItems }, version);
+    setProjects((current) => current.map((entry) => entry.projectId === projectId ? result.record : entry));
+    setSelectedProject(result.record);
+    return result.record;
   };
 
   useEffect(() => {
-    const loadProjects = () => {
+    const blobUrl = previewDrawing?.blobUrl;
+    return () => {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [previewDrawing?.blobUrl]);
+
+  const inspectOrMigrateLegacyDrawing = async (project, item) => {
+    const key = `${project.projectId}:${item.drawingNo}`;
+    try {
+      const [preview] = await previewLegacyDrawings(project.projectId, [item]);
+      setDrawingMigrationStatus((current) => ({ ...current, [key]: preview.status }));
+      if (!isAdmin()) {
+        window.alert('Administrator access is required to migrate a local-only drawing to PostgreSQL.');
+        return;
+      }
+      if (tombstonedEnquiryIds.has(String(project.projectId))) {
+        throw new Error('This enquiry ID is blocked by a deletion tombstone. Resolve the record history before migrating an attachment.');
+      }
+      const embedded = findEmbeddedLegacyDrawing(legacyDrawingSources, project.projectId, item.drawingNo);
+      if (preview.status === 'missing-both' && embedded.status === 'ambiguous') {
+        throw new Error('Conflicting browser-local drawing copies were found. No copy was uploaded; resolve the local conflict first.');
+      }
+      if (preview.status === 'missing-both' && embedded.status === 'missing') {
+        window.alert(`No PostgreSQL attachment or browser-local PDF bytes were found for ${item.drawingNo}. Upload the original drawing again.`);
+        return;
+      }
+      let result = preview;
+      if (preview.status === 'legacy-local-only') {
+        if (!window.confirm(`A local-only drawing copy was found for ${item.drawingNo}. Copy its actual bytes to PostgreSQL without replacing any server copy? The local copy will be retained.`)) return;
+        result = await migrateLegacyDrawing(project.projectId, item.drawingNo, item.drawingFileName);
+      } else if (preview.status === 'missing-both' && embedded.status === 'available') {
+        if (!window.confirm(`An embedded browser-local drawing copy was found for ${item.drawingNo}. Copy its actual bytes to PostgreSQL without replacing any server copy? The local copy will be retained.`)) return;
+        result = await migrateLegacyEmbeddedDrawing(project.projectId, item.drawingNo, embedded.dataUrl, embedded.fileName || item.drawingFileName);
+      }
+      if (!result.fileId || !result.checksumSha256 || !result.sizeBytes) {
+        throw new Error('The PostgreSQL drawing bytes could not be verified; the enquiry reference was not changed.');
+      }
+      await persistDrawingReference(project, item, result);
+      setDrawingMigrationStatus((current) => ({ ...current, [key]: `${result.status}; PostgreSQL attachment linked (SHA-256 ${result.checksumSha256})` }));
+    } catch (error) {
+      setDrawingMigrationStatus((current) => ({ ...current, [key]: `failed: ${error.message}` }));
+      window.alert(`Drawing migration was not confirmed: ${error.message}`);
+    }
+  };
+
+  const recoverEmbeddedLegacyDrawing = async (project, item) => {
+    if (!isAdmin() || !item.drawingDataUrl || !item.drawingNo) return;
+    if (!window.confirm(`Recover embedded legacy drawing ${item.drawingNo} to PostgreSQL? An existing server attachment will not be overwritten, and this Enquiry/local copy will remain unchanged.`)) return;
+    try {
+      const result = await migrateLegacyEmbeddedDrawing(project.projectId, item.drawingNo, item.drawingDataUrl, item.drawingFileName);
+      if (!result.fileId || !result.checksumSha256 || !result.sizeBytes) throw new Error('The PostgreSQL drawing bytes could not be verified; the enquiry reference was not changed.');
+      await persistDrawingReference(project, item, result);
+      window.alert(`Drawing recovery result: ${result.status}; linked and verified (${result.checksumSha256}).`);
+    } catch (error) { window.alert(`Legacy drawing recovery failed: ${error.message}`); }
+  };
+
+  const handlePreviewDrawing = async (item, projectId) => {
+    let url;
+    try {
+      url = await getDrawing(projectId, item.drawingNo, item.drawingFileId);
+      if (!url) throw new Error(`No PostgreSQL attachment exists for ${item.drawingNo || 'this drawing'}.`);
+    } catch (error) {
+      window.alert(`Drawing could not be verified from PostgreSQL: ${error.message}`);
+      return;
+    }
+    const blobUrl = getBlobUrlFromDataUrl(url);
+    setPreviewDrawing({ fileName: item.drawingFileName || 'drawing.pdf', dataUrl: url, blobUrl });
+  };
+
+  useEffect(() => {
+    let requestSequence = 0;
+    let disposed = false;
+    const loadProjects = async () => {
+      const sequence = ++requestSequence;
       try {
-        const stored = localStorage.getItem('projectRequests');
-        setProjects(stored ? JSON.parse(stored) : []);
+        setLoadError('');
+        const preview = await getEnquiryMigrationPreview();
+        if (disposed || sequence !== requestSequence) return;
+        const authoritative = Array.isArray(preview.records) ? preview.records : [];
+        setProjects(authoritative);
+        const serverById = new Map(authoritative.map((record) => [String(record.projectId), record]));
+        const candidates = new Map();
+        const conflicts = new Set((preview.conflicts || []).map((item) => String(item.id)));
+        const existing = new Set();
+        const deletedMatches = new Set();
+        const deleted = new Set((preview.deleted || []).map((item) => String(item.record_id)));
+        setTombstonedEnquiryIds(deleted);
+        const local = (() => { try { return JSON.parse(localStorage.getItem('projectRequests') || '[]'); } catch { return []; } })();
+        const archived = (() => { try { return JSON.parse(localStorage.getItem('projectRequests_localConflictArchive') || '[]').map((entry) => entry.record).filter(Boolean); } catch { return []; } })();
+        const legacySources = [...(preview.legacyRecords || []), ...(Array.isArray(local) ? local : []), ...(Array.isArray(archived) ? archived : [])];
+        setLegacyDrawingSources(legacySources);
+        for (const record of legacySources) {
+          const id = String(record?.projectId || record?.id || '').trim();
+          if (!id) continue;
+          if (deleted.has(id)) {
+            deletedMatches.add(id);
+            continue;
+          }
+          const serverRecord = serverById.get(id);
+          if (serverRecord) {
+            const legacy = { ...record }; delete legacy.version; delete legacy.updatedAt;
+            const current = { ...serverRecord }; delete current.version; delete current.updatedAt;
+            if (JSON.stringify(legacy) !== JSON.stringify(current)) conflicts.add(id);
+            else existing.add(id);
+            continue;
+          }
+          if (!candidates.has(id)) candidates.set(id, record);
+          else if (JSON.stringify(candidates.get(id)) !== JSON.stringify(record)) conflicts.add(id);
+        }
+        for (const id of conflicts) candidates.delete(id);
+        setMigration({
+          missing: [...candidates.values()],
+          existing: [...existing],
+          conflicts: [...conflicts],
+          deleted: (preview.deleted || []).filter((item) => deletedMatches.has(String(item.record_id)))
+        });
       } catch (error) {
-        console.error('Unable to load project requests', error);
-        setProjects([]);
+        if (disposed || sequence !== requestSequence) return;
+        console.error('Unable to load enquiries from PostgreSQL', error);
+        setLoadError(error.message || 'Unable to load enquiries from PostgreSQL.');
       }
     };
     const onERPStateChange = (event) => {
@@ -48,13 +176,60 @@ const ProjectRequestPage = () => {
     window.addEventListener('erp-state-change', onERPStateChange);
     window.addEventListener('storage', onStorage);
     window.addEventListener('focus', loadProjects);
+    const refreshTimer = window.setInterval(loadProjects, 10000);
     return () => {
+      disposed = true;
       window.removeEventListener('erp-state-hydrated', loadProjects);
       window.removeEventListener('erp-state-change', onERPStateChange);
       window.removeEventListener('storage', onStorage);
       window.removeEventListener('focus', loadProjects);
+      window.clearInterval(refreshTimer);
     };
   }, []);
+
+  useEffect(() => {
+    if (!routeProjectId) {
+      setSelectedProject(null);
+      setDetailError('');
+      setDetailLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setSelectedProject(null);
+    setDetailError('');
+    setDetailLoading(true);
+    getEnquiry(routeProjectId)
+      .then((record) => { if (active) setSelectedProject(record); })
+      .catch((error) => {
+        if (!active) return;
+        const setError = () => setDetailError(error.status === 404
+          ? `Enquiry '${routeProjectId}' was not found in PostgreSQL.`
+          : `Unable to load enquiry '${routeProjectId}' from PostgreSQL: ${error.message}`);
+        if (error.status !== 404) {
+          setError();
+          return;
+        }
+        getEnquiryMigrationPreview()
+          .then((preview) => {
+            if (!active) return;
+            setProjects(Array.isArray(preview.records) ? preview.records : []);
+            setTombstonedEnquiryIds(new Set((preview.deleted || []).map((item) => String(item.record_id))));
+            setError();
+          })
+          .catch((refreshError) => {
+            if (!active) return;
+            setLoadError(`The enquiry lookup returned not found, and the PostgreSQL list could not be refreshed: ${refreshError.message}`);
+            setError();
+          });
+      })
+      .finally(() => { if (active) setDetailLoading(false); });
+    return () => { active = false; };
+  }, [routeProjectId]);
+
+  const closeDetails = () => {
+    setSelectedProject(null);
+    if (routeProjectId) navigate('/project-request', { replace: true });
+  };
 
   const filteredProjects = useMemo(() => {
     return filterProjectRequests(projects, search);
@@ -78,11 +253,39 @@ const ProjectRequestPage = () => {
   }, []);
 
   const deleteProject = async (id) => {
-    if (window.confirm(`Delete project request ${id}?`)) {
-      const updated = projects.filter((project) => project.projectId !== id);
+    const project = projects.find((entry) => entry.projectId === id);
+    if (!project) return;
+    const reason = window.prompt(`Reason for deleting enquiry ${id}:`)?.trim();
+    if (!reason) return;
+    try {
+      await deleteEnquiry(id, project.version, reason);
+      const updated = await listEnquiries();
       setProjects(updated);
-      localStorage.setItem('projectRequests', JSON.stringify(updated));
-      try { const proj = projects.find((p) => p.projectId === id); if (proj?.items) await deleteAllDrawings(id, proj.items); } catch (e) { /* ignore */ }
+    } catch (error) {
+      window.alert(error.message || 'Enquiry deletion failed.');
+      return;
+    }
+    try {
+      if (project.items) await deleteAllDrawings(id, project.items);
+    } catch (error) {
+      window.alert(`Enquiry ${id} was deleted in PostgreSQL, but drawing cleanup failed: ${error.message}`);
+    }
+  };
+
+  const importMissing = async () => {
+    if (!migration.missing.length || migrationBusy) return;
+    setMigrationBusy(true);
+    try {
+      const result = await importMissingEnquiries(migration.missing);
+      const authoritative = await listEnquiries();
+      setProjects(authoritative);
+      const remainingConflicts = [...new Set([...migration.conflicts, ...(result.conflicts || []).map((item) => item.id)])];
+      setMigration({ missing: [], existing: [...migration.existing, ...(result.alreadyPresent || [])], conflicts: remainingConflicts, deleted: result.deleted || migration.deleted || [] });
+      window.alert(`Imported ${result.imported.length}; already existing ${result.alreadyPresent?.length || 0}; conflicts ${result.conflicts?.length || 0}; tombstone-blocked ${result.deleted?.length || 0}.`);
+    } catch (error) {
+      window.alert(error.message || 'Enquiry migration failed.');
+    } finally {
+      setMigrationBusy(false);
     }
   };
 
@@ -145,7 +348,39 @@ const ProjectRequestPage = () => {
           label="Search customer enquiries"
         />
 
-        {projects.length === 0 ? (
+        {loadError && <div className="form-error" role="alert">PostgreSQL enquiry load failed: {loadError}</div>}
+        {routeProjectId && detailLoading && <div className="empty-state" role="status">Loading enquiry details from PostgreSQL…</div>}
+        {routeProjectId && detailError && (
+          <div className="empty-state" role="alert">
+            <h3>Enquiry details unavailable</h3>
+            <p>{detailError}</p>
+            <button type="button" className="button-secondary" onClick={closeDetails}>Back to enquiries</button>
+          </div>
+        )}
+
+        {(migration.missing.length > 0 || migration.conflicts.length > 0 || migration.deleted?.length > 0) && (
+          <section className="content-block" aria-label="Enquiry migration preview" style={{ marginTop: 16, border: '1px solid #f59e0b' }}>
+            <h3>Existing browser enquiries need review</h3>
+            <p>
+              PostgreSQL has {projects.length} active records. Preview: {migration.missing.length} eligible new, {migration.existing.length} already existing, {migration.conflicts.length} conflicts, {(migration.deleted || []).length} previously deleted and blocked. Existing database records remain unchanged.
+            </p>
+            {migration.missing.length > 0 && (
+              <details>
+                <summary>Preview missing records ({migration.missing.length})</summary>
+                <ul>{migration.missing.slice(0, 30).map((record) => <li key={record.projectId}>{record.projectId} — {record.companyName || record.customerName || 'Customer not set'}</li>)}</ul>
+                {migration.missing.length > 30 && <p>Showing first 30. All {migration.missing.length} will be included.</p>}
+              </details>
+            )}
+            {migration.conflicts.length > 0 && <p>Conflicting IDs retained without import: {migration.conflicts.slice(0, 20).join(', ')}{migration.conflicts.length > 20 ? '…' : ''}</p>}
+            {isAdmin() ? <button className="button-secondary" type="button" disabled={migrationBusy || !migration.missing.length} onClick={importMissing}>
+              {migrationBusy ? 'Importing…' : `Import ${migration.missing.length} eligible record(s)`}
+            </button> : <p>Only an Administrator can approve legacy record import.</p>}
+          </section>
+        )}
+
+        {loadError ? (
+          <div className="empty-state"><h3>Enquiries could not be loaded</h3><p>Reconnect to the ERP server and refresh. Cached records are not shown as authoritative.</p></div>
+        ) : projects.length === 0 ? (
           <div className="empty-state">
             <div className="empty-state-icon">+</div>
             <h3>No enquiries yet</h3>
@@ -191,28 +426,19 @@ const ProjectRequestPage = () => {
                         {firstItem.drawingNo && (
                           <div style={{ fontSize: '11px', color: '#2563eb', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '5px', marginTop: '2px', flexWrap: 'wrap' }}>
                             <span style={{ wordBreak: 'break-all' }}>📐 {firstItem.drawingNo}</span>
-                            {firstItem.drawingFileName && (
+                            {(firstItem.drawingFileName || firstItem.drawingFileId) && (
                               <button
-                                type="button"
-                                onClick={() => handlePreviewDrawing(firstItem.drawingDataUrl, firstItem.drawingFileName, project.projectId, firstItem.drawingNo)}
-                                title={`View Drawing: ${firstItem.drawingFileName || 'Drawing'}`}
-                                style={{
-                                  fontSize: '10px',
-                                  background: '#e0f2fe',
-                                  color: '#0369a1',
-                                  padding: '1px 6px',
-                                  borderRadius: '4px',
-                                  border: '1px solid #bae6fd',
-                                  fontWeight: 'bold',
-                                  cursor: 'pointer',
-                                  display: 'inline-flex',
-                                  alignItems: 'center',
-                                  gap: '3px'
-                                }}
-                              >
-                                PDF <Eye size={14} aria-hidden="true" />
+                                  type="button"
+                                  onClick={() => handlePreviewDrawing(firstItem, project.projectId)}
+                                  title={`View Drawing: ${firstItem.drawingFileName || 'Drawing'}`}
+                                  style={{ fontSize: '10px', background: '#e0f2fe', color: '#0369a1', padding: '1px 6px', borderRadius: '4px', border: '1px solid #bae6fd', fontWeight: 'bold', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '3px' }}
+                                >
+                                  PDF <Eye size={14} aria-hidden="true" />
                               </button>
                             )}
+                            {isAdmin() && <button type="button" className="button-small" onClick={() => inspectOrMigrateLegacyDrawing(project, firstItem)}>Check/migrate local copy</button>}
+                            {isAdmin() && firstItem.drawingDataUrl && <button type="button" className="button-small" onClick={() => recoverEmbeddedLegacyDrawing(project, firstItem)}>Recover embedded legacy copy</button>}
+                            {drawingMigrationStatus[`${project.projectId}:${firstItem.drawingNo}`] && <small>{drawingMigrationStatus[`${project.projectId}:${firstItem.drawingNo}`]}</small>}
                           </div>
                         )}
                       </td>
@@ -246,7 +472,7 @@ const ProjectRequestPage = () => {
                           )}
                           <button
                             className="button-small"
-                            onClick={() => setSelectedProject(project)}
+                            onClick={() => navigate(`/project-request/${encodeURIComponent(project.projectId)}`)}
                           >
                             View
                           </button>
@@ -279,16 +505,18 @@ const ProjectRequestPage = () => {
         )}
       </div>
 
+      <FileChecksumReviewPanel />
+
       {/* Project Details Modal */}
       {selectedProject && (
-        <div className="template-modal-backdrop no-print" onMouseDown={() => setSelectedProject(null)}>
+        <div className="template-modal-backdrop no-print" onMouseDown={closeDetails}>
           <div className="template-modal" style={{ maxWidth: '650px' }} onMouseDown={(e) => e.stopPropagation()}>
             <div className="template-modal-header">
               <div>
                 <h3>Project Request Details ({selectedProject.projectId})</h3>
                 <p>{selectedProject.companyName}</p>
               </div>
-              <button type="button" className="template-modal-close" onClick={() => setSelectedProject(null)}>×</button>
+              <button type="button" className="template-modal-close" onClick={closeDetails}>×</button>
             </div>
 
             <div style={{ padding: '16px 0', fontSize: '13px', lineHeight: '1.6' }}>
@@ -298,6 +526,7 @@ const ProjectRequestPage = () => {
                 <div><strong>Phone:</strong> {selectedProject.phone || '-'}</div>
                 <div><strong>Email:</strong> {selectedProject.email || '-'}</div>
                 <div><strong>GSTIN:</strong> {selectedProject.gstin || '-'}</div>
+                <div><strong>Requested Date:</strong> {selectedProject.requestedDate || '-'}</div>
                 <div><strong>Target Delivery:</strong> {selectedProject.targetDeliveryDate || '-'}</div>
                 <div style={{ gridColumn: 'span 2' }}><strong>Address:</strong> {selectedProject.address}</div>
               </div>
@@ -321,11 +550,14 @@ const ProjectRequestPage = () => {
                         <td><strong>{it.itemName}</strong></td>
                         <td>
                           <span style={{ color: '#2563eb', fontWeight: 'bold' }}>{it.drawingNo || '-'}</span>
-                          {it.drawingFileName && (
+                          <div style={{ marginTop: '3px', color: '#475569' }}>
+                            <strong>PDF:</strong> {it.drawingFileName || (it.drawingFileId ? 'Stored drawing attachment' : 'No attachment')}
+                          </div>
+                          {it.drawingNo && (
                             <div style={{ marginTop: '4px' }}>
-                              <button
+                              {(it.drawingFileName || it.drawingFileId) && <button
                                 type="button"
-                                onClick={() => handlePreviewDrawing(it.drawingDataUrl, it.drawingFileName, selectedProject.projectId, it.drawingNo)}
+                                onClick={() => handlePreviewDrawing(it, selectedProject.projectId)}
                                 title={`View ${it.drawingFileName || 'Drawing'}`}
                                 style={{
                                   fontSize: '10.5px',
@@ -339,7 +571,14 @@ const ProjectRequestPage = () => {
                                 }}
                               >
                                 <FileText size={14} aria-hidden="true" /> Open PDF
-                              </button>
+                              </button>}
+                              {isAdmin() && <button type="button" className="button-small" style={{ marginLeft: 6 }} onClick={() => inspectOrMigrateLegacyDrawing(selectedProject, it)}>
+                                Check/migrate local copy
+                              </button>}
+                              {isAdmin() && it.drawingDataUrl && <button type="button" className="button-small" style={{ marginLeft: 6 }} onClick={() => recoverEmbeddedLegacyDrawing(selectedProject, it)}>
+                                Recover embedded legacy copy
+                              </button>}
+                              {drawingMigrationStatus[`${selectedProject.projectId}:${it.drawingNo}`] && <small style={{ display: 'block' }}>{drawingMigrationStatus[`${selectedProject.projectId}:${it.drawingNo}`]}</small>}
                             </div>
                           )}
                         </td>
@@ -360,7 +599,7 @@ const ProjectRequestPage = () => {
             </div>
 
             <div className="template-modal-actions">
-              <button className="button-secondary" onClick={() => setSelectedProject(null)}>Close</button>
+              <button className="button-secondary" onClick={closeDetails}>Close</button>
               <button
                 className="button-secondary"
                 style={{ color: '#0369a1', borderColor: '#bae6fd', background: '#f0f9ff', fontWeight: '600' }}
@@ -401,14 +640,23 @@ const ProjectRequestPage = () => {
                 </h3>
               </div>
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <button
-                  type="button"
+                <a
+                  href={previewDrawing.blobUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
                   className="button-secondary"
-                  onClick={() => viewDrawingFile(previewDrawing.dataUrl, previewDrawing.fileName)}
                   style={{ fontSize: '12px', padding: '6px 14px', borderRadius: '6px' }}
                 >
                   <ExternalLink size={14} aria-hidden="true" /> Open in New Tab
-                </button>
+                </a>
+                <a
+                  className="button-secondary"
+                  href={previewDrawing.blobUrl}
+                  download={previewDrawing.fileName}
+                  style={{ fontSize: '12px', padding: '6px 14px', borderRadius: '6px', textDecoration: 'none' }}
+                >
+                  Download
+                </a>
                 <button
                   type="button"
                   className="template-modal-close"

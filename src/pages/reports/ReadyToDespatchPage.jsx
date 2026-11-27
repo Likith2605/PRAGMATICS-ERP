@@ -1,17 +1,56 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getJobCards } from '../../utils/storeService.js';
-import { readLocalStorageList } from '../../utils/reportData.js';
+import { listJobCards } from '../../services/productionApi.js';
+import { listSalesOrders } from '../../services/salesOrderApi.js';
+import { listDeliveryChallans } from '../../services/deliveryChallanApi.js';
 
 const list = (v) => Array.isArray(v) ? v : [];
 const num = (v) => Number.isFinite(Number(v)) ? Number(v) : 0;
 const clean = (v) => String(v || '').trim();
 const norm = (v) => clean(v).toLocaleLowerCase().replace(/\s+/g, ' ');
+// PostgreSQL job-card rows expose acceptedQuantity; legacy browser rows kept
+// qualityControl.finalQC.acceptedQty. Both shapes are read, neither is written.
+const acceptedQty = (jc) => num(jc?.qualityControl?.finalQC?.acceptedQty ?? jc?.acceptedQuantity);
 const ReadyToDespatchPage = () => {
+  const [orders, setOrders] = useState([]);
+  const [challans, setChallans] = useState([]);
+  const [jobCards, setJobCards] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    Promise.all([
+      listSalesOrders().catch((err) => {
+        console.warn('Failed to load sales orders for ready-to-despatch report:', err);
+        throw err;
+      }),
+      listDeliveryChallans().catch((err) => {
+        console.warn('Failed to load delivery challans for ready-to-despatch report:', err);
+        throw err;
+      }),
+      listJobCards().catch((err) => {
+        console.warn('Failed to load job cards for ready-to-despatch report:', err);
+        throw err;
+      })
+    ]).then(([soList, dcList, jcList]) => {
+      if (!active) return;
+      setOrders(Array.isArray(soList) ? soList : []);
+      setChallans(Array.isArray(dcList) ? dcList : []);
+      setJobCards(Array.isArray(jcList) ? jcList : []);
+      setError('');
+    }).catch((err) => {
+      if (active) setError(err.message || 'Unable to load report data from PostgreSQL.');
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const { rows, projects, customers, statuses } = useMemo(() => {
-    const orders = readLocalStorageList('salesOrderHistory');
-    const challans = readLocalStorageList('deliveryChallanHistory');
-    const jobCards = getJobCards();
     const output = [];
     const consumedJC = new Set();
 
@@ -47,16 +86,16 @@ const ReadyToDespatchPage = () => {
             if (itemCode && dcCode) return dcCode === itemCode;
             return itemName && norm(line.itemName || line.materialName) === norm(itemName);
           }));
-        const acceptedQty = matchingJCs.reduce((sum, jc) => sum + num(jc.qualityControl?.finalQC?.acceptedQty), 0);
+        const totalAcceptedQty = matchingJCs.reduce((sum, jc) => sum + acceptedQty(jc), 0);
         const dispatchedQty = matchingDCItems.reduce((sum, line) => sum + num(line.quantity), 0);
         const linkAvailable = matchingJCs.length > 0;
-        const readyQty = linkAvailable ? Math.max(0, acceptedQty - dispatchedQty) : null;
-        const overDispatch = linkAvailable ? Math.max(0, dispatchedQty - acceptedQty) : null;
+        const readyQty = linkAvailable ? Math.max(0, totalAcceptedQty - dispatchedQty) : null;
+        const overDispatch = linkAvailable ? Math.max(0, dispatchedQty - totalAcceptedQty) : null;
         output.push({
           date: details.soDate || order.date || '', salesOrder: soNumber, customer, projectId,
           jobCards: matchingJCs.map((jc) => jc.jobCardNumber).filter(Boolean).join(', '),
           itemCode, itemName, unit: itemUnit,
-          acceptedQty: matchingJCs.length ? acceptedQty : null, dispatchedQty,
+          acceptedQty: matchingJCs.length ? totalAcceptedQty : null, dispatchedQty,
           hasExactJobCardLink: linkAvailable && !duplicateOrderLine,
           dispatchStatus: duplicateOrderLine ? 'Repeated order line; allocation ambiguous' : !matchingJCs.length ? 'No exact Job Card link' : overDispatch > 0 ? 'Over-dispatched; review' :
             readyQty > 0 ? (dispatchedQty > 0 ? 'Partially dispatched' : 'Ready to dispatch') : 'No remaining QC-cleared qty',
@@ -66,12 +105,12 @@ const ReadyToDespatchPage = () => {
     });
 
     // Keep unlinked Job Cards visible as exceptions; no order, customer or dispatch is inferred.
-    jobCards.filter((jc) => jc.jobCardNumber && !consumedJC.has(jc.jobCardNumber) && num(jc.qualityControl?.finalQC?.acceptedQty) > 0)
+    jobCards.filter((jc) => jc.jobCardNumber && !consumedJC.has(jc.jobCardNumber) && acceptedQty(jc) > 0)
       .forEach((jc) => output.push({
         date: jc.startDate || jc.poDate || '', salesOrder: '', customer: jc.customerName || '', projectId: jc.projectId || '',
         jobCards: jc.jobCardNumber, itemCode: jc.itemCode || jc.partCode || '', itemName: jc.partName || '',
         unit: jc.unit || 'Unit not recorded',
-        acceptedQty: num(jc.qualityControl?.finalQC?.acceptedQty), dispatchedQty: null,
+        acceptedQty: acceptedQty(jc), dispatchedQty: null,
         hasExactJobCardLink: false,
         dispatchStatus: 'Unlinked Job Card; dispatch not attributed'
       }));
@@ -82,13 +121,14 @@ const ReadyToDespatchPage = () => {
       customers: [...new Set(output.map((r) => r.customer).filter(Boolean))].sort(),
       statuses: [...new Set(output.map((r) => r.dispatchStatus).filter(Boolean))].sort()
     };
-  }, []);
+  }, [orders, challans, jobCards]);
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
       <div className="content-block" style={{ marginBottom: 14, color: '#475569', fontSize: 13 }}>
-        Tracks Sales Order items, QC-accepted quantities, dispatches, and Job Card link exceptions.
+        {loading ? 'Loading sales orders, delivery challans and job cards from PostgreSQL...' : 'Tracks Sales Order items, QC-accepted quantities, dispatches, and Job Card link exceptions.'}
       </div>
+      {error && <div role="alert" className="form-error">{error}</div>}
       <ReportRegister
         title="Ready to Dispatch Status"
         subTitle="Sales Order lines - QC and dispatch status"

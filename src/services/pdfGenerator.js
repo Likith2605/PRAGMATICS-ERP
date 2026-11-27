@@ -208,12 +208,7 @@ export const generateRFQPDF = async ({
   remarks = '',
   requestedBy = ''
 }) => {
-  let company = {};
-  try {
-    company = JSON.parse(localStorage.getItem('companySettings') || '{}');
-  } catch {
-    company = {};
-  }
+  const company = getReportCompanyProfile();
   const cname = company.companyName || getCompanyLegalName();
   const caddr = company.address || '';
   const cphone = company.phone || '';
@@ -1377,12 +1372,7 @@ export const generatePurchaseIndentPDF = async (indent, options = {}) => {
 
 export const generateMaterialReceiptPDF = async (receipt, options = {}) => {
   try {
-    let company = {};
-    try {
-      company = JSON.parse(localStorage.getItem('companySettings') || '{}');
-    } catch {
-      company = {};
-    }
+    const company = getReportCompanyProfile();
     const cname = company.companyName || getCompanyLegalName();
     const caddr = company.address || '';
     const cphone = company.phone || '';
@@ -1714,14 +1704,9 @@ export const generatePurchaseOrderPDF = async (payload, options = {}) => {
     const po = payload?.poDetails || {};
     const vendor = payload?.vendorDetails || {};
     const items = Array.isArray(payload?.items) ? payload.items : [];
-    let company = payload?.companyDetails && Object.keys(payload.companyDetails).length ? payload.companyDetails : {};
-    if (!Object.keys(company).length) {
-      try {
-        company = JSON.parse(localStorage.getItem('companySettings') || '{}');
-      } catch {
-        company = {};
-      }
-    }
+    const company = payload?.companyDetails && Object.keys(payload.companyDetails).length
+      ? payload.companyDetails
+      : getReportCompanyProfile();
     const cname = company.companyName || getCompanyLegalName();
     const caddr = company.address || '';
     const cgstin = company.gstin || getReportCompanyProfile().gstin || '';

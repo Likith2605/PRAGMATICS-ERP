@@ -1,16 +1,33 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { getEmployees } from '../utils/storeService.js';
+import { getEmployeeDirectory } from '../services/employeeApi.js';
 
 const EmployeeSearchSelect = ({ value = null, onChange, placeholder = 'Search employee by name or ID...', portalMenu = false, compact = false }) => {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [pos, setPos] = useState(null);
+  const [employees, setEmployees] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const wrapRef = useRef(null);
   const inputRef = useRef(null);
   const listRef = useRef(null);
-  const employees = getEmployees();
+
+  useEffect(() => {
+    let active = true;
+    getEmployeeDirectory()
+      .then((records) => {
+        if (active) setEmployees(records);
+      })
+      .catch((error) => {
+        if (active) setLoadError(error.message || 'Employee directory could not be loaded.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, []);
 
   const filtered = useMemo(() => {
     const q = query.toLowerCase().trim();
@@ -180,7 +197,11 @@ const EmployeeSearchSelect = ({ value = null, onChange, placeholder = 'Search em
             }
       }
     >
-      {filtered.length === 0 ? (
+      {loading ? (
+        <div className="employee-search-empty">Loading employees…</div>
+      ) : loadError ? (
+        <div className="employee-search-empty" role="alert">{loadError}</div>
+      ) : filtered.length === 0 ? (
         <div className="employee-search-empty">No matching employee found.</div>
       ) : (
         filtered.map((emp, idx) => (

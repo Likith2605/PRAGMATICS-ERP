@@ -1,17 +1,20 @@
 import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { readLocalStorageList } from '../utils/reportData.js';
-import { invTotalINR, invBalanceINR } from '../utils/invoiceValues.js';
+import { invTotalINR, invReceivedINR, invReceivableINR } from '../utils/invoiceValues.js';
 import { generateRegisterPDF } from '../services/pdfGenerator.js';
-import CustomerRegistrationModal from '../components/CustomerRegistrationModal.jsx';
-import { readCustomerDirectory } from '../utils/customerDirectory.js';
 import { matchesCustomerSearch } from '../utils/customerSearch.js';
 import ExcelImportDialog, { downloadImportTemplate } from '../components/ExcelImportDialog.jsx';
 import { Download, Upload, Trash2 } from 'lucide-react';
-import { saveCustomerToDirectory } from '../utils/customerDirectory.js';
-import { appendAuditLog } from '../utils/storeService.js';
-import { saveERPRecord, getERPRecord, deleteCustomerDirectoryRecord, resetERPStateSyncBaseline } from '../services/erpStateSync.js';
+import { listMasters, createMaster, updateMaster, deleteMaster } from '../services/masterApi.js';
 import { isAdmin } from '../utils/auth.js';
+import { hasPermission } from '../utils/permissions.js';
+import { listQuotations } from '../services/quotationApi.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { listDeliveryChallans } from '../services/deliveryChallanApi.js';
+import { listCustomerInvoices } from '../services/customerInvoiceApi.js';
+import { listExportInvoicesApi } from '../services/exportInvoiceApi.js';
+import { listAdvances } from '../services/advanceApi.js';
+import { validateContactField } from '../../shared/fieldValidation.js';
 import { CUSTOMER_EXCEL_COLUMNS, mapCustomerExcelRow, validateCustomerExcelRow } from '../utils/customerExcelImport.js';
 
 /**
@@ -24,8 +27,7 @@ import { CUSTOMER_EXCEL_COLUMNS, mapCustomerExcelRow, validateCustomerExcelRow }
  *    transaction ledger grouped by month, with a Download Ledger PDF
  *    (statement of account) button.
  *
- * Data is read from quotationHistory, salesOrderHistory,
- * deliveryChallanHistory, customerInvoiceHistory and exportInvoiceHistory.
+ * Customer transaction data is loaded from the corresponding PostgreSQL APIs.
  *
  * Same safeguard rules as List of Customers (reports/CustomerListPage):
  * links between master records and transactions use EXACT normalized-name
@@ -43,7 +45,8 @@ const DOC = {
   SO: { label: 'Sales Order', color: '#1d4ed8', bg: '#dbeafe' },
   DC: { label: 'Delivery Challan', color: '#b45309', bg: '#fef3c7' },
   INV: { label: 'Tax Invoice', color: '#166534', bg: '#dcfce7' },
-  EINV: { label: 'Export Invoice', color: '#7c3aed', bg: '#ede9fe' }
+  EINV: { label: 'Export Invoice', color: '#7c3aed', bg: '#ede9fe' },
+  PAY: { label: 'Payment Received', color: '#047857', bg: '#d1fae5' }
 };
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -55,6 +58,8 @@ const CUSTOMER_IMPORT_INSTRUCTIONS = [
   'Exact duplicate customer rows are shown as warnings; the administrator chooses whether to import them.',
   'Heading matching is case-insensitive and tolerates minor spacing/punctuation differences.'
 ];
+
+const EMPTY_CUSTOMER_FORM = { companyName: '', customerName: '', gstin: '', phone: '', email: '', address: '' };
 
 const relDate = (d) => {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(d || ''));
@@ -137,16 +142,15 @@ const CustomersPage = () => {
   const [deleteCustomerBusy, setDeleteCustomerBusy] = useState(false);
   const [customerActionMessage, setCustomerActionMessage] = useState(null);
   const deleteCustomerInFlight = useRef(false);
-  const lastRemoteDirectory = useRef(null);
   const adminUser = isAdmin();
   const customerImportColumns = CUSTOMER_EXCEL_COLUMNS;
   const importCustomers = async (rows) => {
-    const before = localStorage.getItem('customerDirectory');
     let added = 0;
+    let skipped = 0;
     try {
       for (const row of rows) {
         const mapped = mapCustomerExcelRow(row);
-        saveCustomerToDirectory({
+        const payload = {
           slNo: mapped['Sl No'],
           companyName: mapped['Customer Name'],
           address: mapped['Address'],
@@ -154,34 +158,30 @@ const CustomersPage = () => {
           gstin: mapped['GST No'],
           gstNumber: mapped['GST No'],
           phone: mapped['Tel No.'],
-          customerName: mapped['Contact Person'],
-          contactPerson: mapped['Contact Person'],
+          customerName: mapped['Contact Person'] || mapped['Customer Name'],
+          contactPerson: mapped['Contact Person'] || mapped['Customer Name'],
           contactPersonPhone: mapped['Contact Person No'],
           contactNo: mapped['Contact Person No'],
           email: mapped['E-Mail'],
           customerCode: mapped['Vendor Code'],
           vendorCode: mapped['Vendor Code']
-        }, { silent: true });
+        };
+        const exactDuplicate = masterRecords.some((record) =>
+          norm(record.companyName) === norm(payload.companyName) &&
+          norm(record.gstin) === norm(payload.gstin) &&
+          norm(record.phone) === norm(payload.phone) &&
+          norm(record.email) === norm(payload.email)
+        );
+        if (exactDuplicate) { skipped += 1; continue; }
+        await createMaster('customers', payload);
         added += 1;
       }
+      await refreshMasters();
+      return { success: added, skipped, persisted: true };
     } catch (error) {
-      if (before == null) localStorage.removeItem('customerDirectory'); else localStorage.setItem('customerDirectory', before);
+      await refreshMasters().catch(() => {});
       throw error;
     }
-
-    // Explicitly confirm the whole directory in PostgreSQL before reporting
-    // success. The background mirror may also write this key; the write is an
-    // idempotent whole-record upsert, so no customer is inserted twice.
-    const persisted = await saveERPRecord('customerDirectory', readCustomerDirectory(), { withError: true });
-    if (!persisted.ok) {
-      if (before == null) localStorage.removeItem('customerDirectory'); else localStorage.setItem('customerDirectory', before);
-      try { await saveERPRecord('customerDirectory', before == null ? [] : JSON.parse(before)); } catch { /* best effort rollback */ }
-      throw new Error(persisted.error || 'Database save failed. Customers were not saved.');
-    }
-
-    window.dispatchEvent(new CustomEvent('customer-directory-updated'));
-    appendAuditLog({ action: 'CUSTOMERS IMPORTED', reference: `${added} customer(s)`, details: `${added} customer records imported from Excel and confirmed in PostgreSQL.` });
-    return { success: added, skipped: 0, persisted: true };
   };
 
   const confirmDeleteCustomer = async () => {
@@ -191,83 +191,143 @@ const CustomersPage = () => {
     setDeleteCustomerBusy(true);
     setCustomerActionMessage(null);
     try {
-      const current = readCustomerDirectory();
-      if (!current.some((customer) => String(customer?.id || '') === String(target.id))) {
-        setCustomerActionMessage({ type: 'error', text: 'This customer is no longer in the directory. Refresh the page and try again.' });
+      const current = await listMasters('customers');
+      const found = current.find((customer) => String(customer?.id || '') === String(target.id));
+      if (!found) {
+        setCustomerActionMessage({ type: 'error', text: 'This customer is no longer in PostgreSQL. Refresh the page and try again.' });
         return;
       }
-      const result = await deleteCustomerDirectoryRecord(target.id);
-      if (!result.ok) {
-        const linked = result.status === 409 || /transaction|business history|referenced/i.test(result.error || '');
-        setCustomerActionMessage({
-          type: 'error',
-          text: linked
-            ? 'This customer has transaction history and cannot be permanently deleted. Keep the customer record to preserve its linked history.'
-            : result.error || 'Customer deletion failed. Please try again.'
-        });
-        return;
-      }
-      const latest = readCustomerDirectory();
-      localStorage.setItem('customerDirectory', JSON.stringify(latest.filter((customer) => String(customer?.id || '') !== String(target.id))));
-      resetERPStateSyncBaseline();
-      window.dispatchEvent(new CustomEvent('customer-directory-updated'));
+      await deleteMaster('customers', found.id, Number(found.version) || 1, 'Deleted customer master record');
+      await refreshMasters();
       setSelectedKey('');
       setCustomerActionMessage({ type: 'success', text: 'Customer deleted successfully.' });
       setDeleteCustomerTarget(null);
     } catch (error) {
-      setCustomerActionMessage({ type: 'error', text: error?.message || 'Customer deletion failed. Please try again.' });
+      const linked = error.status === 409 || /transaction|business history|referenced/i.test(error.message || '');
+      setCustomerActionMessage({
+        type: 'error',
+        text: linked
+          ? 'This customer has transaction history and cannot be permanently deleted. Keep the customer record to preserve its linked history.'
+          : error.message || 'Customer deletion failed. Please try again.'
+      });
+      if (error.status === 409) refreshMasters().catch(() => {});
     } finally {
       deleteCustomerInFlight.current = false;
       setDeleteCustomerBusy(false);
     }
   };
-  const [customerRevision, setCustomerRevision] = useState(0);
+  const [masterRecords, setMasterRecords] = useState([]);
+  const [masterLoading, setMasterLoading] = useState(true);
+  const [masterError, setMasterError] = useState('');
+  const [businessRecords, setBusinessRecords] = useState({
+    quotations: [], salesOrders: [], deliveryChallans: [], customerInvoices: [], exportInvoices: [], advances: []
+  });
+  const [transactionsLoading, setTransactionsLoading] = useState(true);
+  const [transactionsMessage, setTransactionsMessage] = useState('');
+  const [masterBusy, setMasterBusy] = useState(false);
+  const [customerForm, setCustomerForm] = useState(EMPTY_CUSTOMER_FORM);
+  const [customerEditId, setCustomerEditId] = useState('');
+  const [customerFormError, setCustomerFormError] = useState('');
+  const [customerEditVersion, setCustomerEditVersion] = useState(0);
+
+  const refreshMasters = async () => {
+    const records = await listMasters('customers');
+    setMasterRecords(records);
+    setMasterError('');
+    return records;
+  };
+
   useEffect(() => {
-    const refresh = () => setCustomerRevision((value) => value + 1);
-    window.addEventListener('customer-directory-updated', refresh);
-    window.addEventListener('erp-state-hydrated', refresh);
-    window.addEventListener('storage', refresh);
-    return () => {
-      window.removeEventListener('customer-directory-updated', refresh);
-      window.removeEventListener('erp-state-hydrated', refresh);
-      window.removeEventListener('storage', refresh);
-    };
+    let active = true;
+    setMasterLoading(true);
+    refreshMasters()
+      .catch((error) => { if (active) setMasterError(error.message || 'Customers could not be loaded from PostgreSQL.'); })
+      .finally(() => { if (active) setMasterLoading(false); });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
-    let mounted = true;
-    let polling = false;
-    const syncDirectory = async () => {
-      if (polling) return;
-      polling = true;
+    let active = true;
+    const sources = [
+      { key: 'quotations', label: 'Quotations', permission: 'sales.quotation', load: listQuotations },
+      { key: 'salesOrders', label: 'Sales Orders', permission: 'sales_order.view', load: listSalesOrders },
+      { key: 'deliveryChallans', label: 'Delivery Challans', permission: 'delivery.view', load: listDeliveryChallans },
+      { key: 'customerInvoices', label: 'Customer Invoices', permission: 'invoice.view', load: listCustomerInvoices },
+      { key: 'exportInvoices', label: 'Export Invoices', permission: 'invoice.view', load: listExportInvoicesApi },
+      { key: 'advances', label: 'Customer Payments', permission: 'invoice.view', load: () => listAdvances('customer') }
+    ];
+    setTransactionsLoading(true);
+    Promise.all(sources.map(async (source) => {
+      if (!isAdmin() && !hasPermission(source.permission)) return { ...source, records: [], restricted: true };
       try {
-        const remoteValue = await getERPRecord('customerDirectory');
-        if (!mounted || !Array.isArray(remoteValue)) return;
-        const previous = lastRemoteDirectory.current;
-        const current = readCustomerDirectory();
-        const identity = (record) => record?.id ? `id:${record.id}` : `legacy:${JSON.stringify(record)}`;
-        const previousIds = new Set((previous || []).map(identity));
-        const localOnly = previous ? current.filter((record) => !previousIds.has(identity(record))) : [];
-        const next = previous ? [...remoteValue, ...localOnly] : remoteValue;
-        lastRemoteDirectory.current = remoteValue;
-        if (JSON.stringify(current) !== JSON.stringify(next)) {
-          localStorage.setItem('customerDirectory', JSON.stringify(next));
-          resetERPStateSyncBaseline();
-          window.dispatchEvent(new CustomEvent('customer-directory-updated'));
-          if (localOnly.length) await saveERPRecord('customerDirectory', next);
-        }
-      } catch { /* A transient sync failure must not interrupt customer work. */ }
-      finally { polling = false; }
-    };
-    syncDirectory();
-    const interval = window.setInterval(syncDirectory, 5000);
-    window.addEventListener('focus', syncDirectory);
-    return () => {
-      mounted = false;
-      window.clearInterval(interval);
-      window.removeEventListener('focus', syncDirectory);
-    };
+        return { ...source, records: await source.load(), restricted: false };
+      } catch (error) {
+        return { ...source, records: [], error: error.message || 'Request failed.' };
+      }
+    })).then((results) => {
+      if (!active) return;
+      setBusinessRecords(Object.fromEntries(results.map(({ key, records }) => [key, records])));
+      const failures = results.filter((result) => result.error).map((result) => `${result.label}: ${result.error}`);
+      const restricted = results.filter((result) => result.restricted).map((result) => result.label);
+      setTransactionsMessage([
+        failures.length ? `PostgreSQL transaction data could not be loaded: ${failures.join('; ')}` : '',
+        restricted.length ? `Not shown for this role: ${restricted.join(', ')}.` : ''
+      ].filter(Boolean).join(' '));
+    }).finally(() => { if (active) setTransactionsLoading(false); });
+    return () => { active = false; };
   }, []);
+
+  const openCustomerForm = (customer = null) => {
+    setCustomerFormError('');
+    setCustomerEditId(customer ? String(customer.id || '') : '');
+    setCustomerEditVersion(customer ? Number(customer.version) || 1 : 0);
+    setCustomerForm(customer ? {
+      companyName: customer.companyName || '',
+      customerName: customer.customerName || customer.contactPerson || '',
+      gstin: customer.gstin || '',
+      phone: customer.phone || '',
+      email: customer.email || '',
+      address: customer.address || ''
+    } : EMPTY_CUSTOMER_FORM);
+    setShowCustomerModal(true);
+  };
+
+  const submitCustomerForm = async (event) => {
+    event.preventDefault();
+    setCustomerFormError('');
+    if (!customerForm.companyName.trim() || !customerForm.customerName.trim()) {
+      return setCustomerFormError('Customer / Company Name and Contact Person are required.');
+    }
+    const issues = [['phone', 'phone'], ['email', 'email'], ['gstin', 'gstin']]
+      .map(([field, type]) => validateContactField(type, customerForm[field]))
+      .filter(Boolean);
+    if (issues.length) return setCustomerFormError(issues[0]);
+    const payload = {
+      companyName: customerForm.companyName.trim(),
+      customerName: customerForm.customerName.trim(),
+      contactPerson: customerForm.customerName.trim(),
+      gstin: customerForm.gstin.trim().toUpperCase(),
+      phone: customerForm.phone.trim(),
+      email: customerForm.email.trim(),
+      address: customerForm.address.trim()
+    };
+    setMasterBusy(true);
+    try {
+      if (customerEditVersion) {
+        const current = masterRecords.find((record) => String(record.id) === customerEditId);
+        if (!current) throw new Error('Customer record is no longer available. Refresh and try again.');
+        await updateMaster('customers', current.id, payload, customerEditVersion);
+      } else {
+        await createMaster('customers', payload);
+      }
+      await refreshMasters();
+      setShowCustomerModal(false);
+      setSelectedKey('');
+    } catch (error) {
+      setCustomerFormError(error.message || 'Customer could not be saved. Please try again.');
+      if (error.status === 409) refreshMasters().catch(() => {});
+    } finally { setMasterBusy(false); }
+  };
 
   // Vyapar behaviour: side-by-side panes on wide screens; on narrow screens
   // the party list and the details screen are separate views (tap to open,
@@ -292,24 +352,30 @@ const CustomersPage = () => {
       rec.tx.push(doc);
     };
 
-    readLocalStorageList('quotationHistory').forEach((qt) =>
+    businessRecords.quotations.forEach((qt) =>
       addTx(qt.company || qt.payload?.customerDetails?.companyName || qt.payload?.customerDetails?.customerName, { kind: 'QT', raw: qt })
     );
-    readLocalStorageList('salesOrderHistory').forEach((so) =>
+    businessRecords.salesOrders.forEach((so) =>
       addTx(so.company || so.payload?.customerDetails?.companyName || so.payload?.customerDetails?.customerName, { kind: 'SO', raw: so })
     );
-    readLocalStorageList('deliveryChallanHistory').forEach((dc) =>
+    businessRecords.deliveryChallans.forEach((dc) =>
       addTx(dc.company || dc.payload?.customerDetails?.companyName || dc.payload?.customerDetails?.customerName, { kind: 'DC', raw: dc })
     );
-    readLocalStorageList('customerInvoiceHistory').forEach((inv) =>
+    businessRecords.customerInvoices.forEach((inv) =>
       addTx(inv.company || inv.payload?.customerDetails?.companyName || inv.payload?.customerDetails?.customerName, { kind: 'INV', raw: inv })
     );
-    readLocalStorageList('exportInvoiceHistory').forEach((einv) =>
+    businessRecords.exportInvoices.forEach((einv) =>
       addTx(einv.buyer || einv.payload?.buyer?.name || einv.payload?.buyerName, { kind: 'EINV', raw: einv })
+    );
+    businessRecords.advances.forEach((advance) =>
+      addTx(advance.party, {
+        kind: 'PAY',
+        raw: { ...advance, reference: advance.advanceNumber, total: advance.amount, status: 'Received' }
+      })
     );
 
     const countFor = (rec) => {
-      const out = { quotations: 0, orders: 0, challans: 0, invoices: 0, exports: 0, invoiced: 0, outstanding: 0, txCount: 0 };
+      const out = { quotations: 0, orders: 0, challans: 0, invoices: 0, exports: 0, invoiced: 0, received: 0, outstanding: 0, txCount: 0 };
       (rec?.tx || []).forEach((t) => {
         out.txCount += 1;
         if (t.kind === 'QT') out.quotations += 1;
@@ -318,18 +384,20 @@ const CustomersPage = () => {
         if (t.kind === 'INV') {
           out.invoices += 1;
           out.invoiced += invTotalINR(t.raw);
-          out.outstanding += invBalanceINR(t.raw);
+          out.received += invReceivedINR(t.raw);
+          out.outstanding += invReceivableINR(t.raw);
         }
         if (t.kind === 'EINV') out.exports += 1;
+        if (t.kind === 'PAY') out.received += Number(t.raw?.amountINR) || 0;
       });
       return out;
     };
 
-    // Only customer master records saved in the central customerDirectory are
-    // shown. Transaction histories are indexed above solely for each customer's
-    // ledger; they never create master rows on their own.
+    // Only PostgreSQL-confirmed customer master records are shown. Transaction
+    // histories are indexed above solely for each customer's ledger; they never
+    // create master rows on their own.
     const list = [];
-    readCustomerDirectory().forEach((m, i) => {
+    masterRecords.forEach((m, i) => {
       const keys = [norm(m.companyName), norm(m.customerName)].filter(Boolean);
       const name = m.companyName || m.customerName || '';
       const ownKey = m.id || `${keys[0] || 'customer'}-${i}`;
@@ -340,7 +408,7 @@ const CustomersPage = () => {
 
     list.sort((a, b) => a.name.localeCompare(b.name));
     return { customers: list };
-  }, [customerRevision]);
+  }, [masterRecords, businessRecords]);
 
   // Search by party name OR phone number (Vyapar-style). Substring matching is
   // allowed here — search only changes what is visible, never merges records.
@@ -378,6 +446,8 @@ const CustomersPage = () => {
                 ? t.raw?.salesOrderRef && t.raw.salesOrderRef !== '-'
                   ? `SO ${t.raw.salesOrderRef}`
                   : '-'
+                : t.kind === 'PAY'
+                  ? t.raw?.againstRef || 'Customer advance'
                 : t.raw?.quotationRef && t.raw.quotationRef !== '-'
                   ? `Qt ${t.raw.quotationRef}`
                   : '-'
@@ -400,7 +470,7 @@ const CustomersPage = () => {
   const downloadLedger = () => {
     if (!active) return;
     const rows = ledgerGroups.flatMap((g) =>
-      g.items.map((t) => [t.date, t.type, t.reference, t.against, String(t.raw?.total ?? ''), String(t.raw?.status || '-')])
+      g.items.map((t) => [t.date, t.type, t.reference, t.against, String(t.raw?.total ?? t.raw?.amount ?? ''), String(t.raw?.status || '-')])
     );
     generateRegisterPDF({
       title: `Statement of Account — ${active.name}`,
@@ -427,7 +497,7 @@ const CustomersPage = () => {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
         <h2 className="page-title">Customers</h2>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <button type="button" className="button-primary" onClick={() => setShowCustomerModal(true)} style={{ whiteSpace: 'nowrap' }}>＋ Add New Customer</button>
+          <button type="button" className="button-primary" onClick={() => openCustomerForm()} style={{ whiteSpace: 'nowrap' }} disabled={masterLoading || masterBusy}>＋ Add New Customer</button>
           <button type="button" className="button-secondary" onClick={() => setShowExcelImport(true)} style={{ whiteSpace: 'nowrap' }}><Upload size={16}/> Import Excel</button>
           <button type="button" className="button-secondary" onClick={() => downloadImportTemplate('Customers', customerImportColumns, CUSTOMER_IMPORT_EXAMPLE, CUSTOMER_IMPORT_INSTRUCTIONS)} style={{ whiteSpace: 'nowrap' }}><Download size={16}/> Download Template</button>
           <div style={{ position: 'relative' }}>
@@ -465,7 +535,50 @@ const CustomersPage = () => {
         </div>
       </div>
       {customerActionMessage && !deleteCustomerTarget && <div role="status" style={{ margin: '12px 0', padding: '10px 12px', borderRadius: 8, color: customerActionMessage.type === 'success' ? '#166534' : '#991b1b', background: customerActionMessage.type === 'success' ? '#f0fdf4' : '#fef2f2', border: `1px solid ${customerActionMessage.type === 'success' ? '#bbf7d0' : '#fecaca'}` }}>{customerActionMessage.text}</div>}
-      {showCustomerModal && <CustomerRegistrationModal onClose={() => setShowCustomerModal(false)} onSaved={() => { setQuery(''); setListFilter('ALL'); setSelectedKey(''); }} />}
+      {masterError && (
+        <div role="alert" style={{ margin: '12px 0', padding: '10px 12px', borderRadius: 8, color: '#991b1b', background: '#fef2f2', border: '1px solid #fecaca' }}>
+          {masterError}{' '}
+          <button type="button" className="button-secondary button-small" onClick={() => refreshMasters().catch((err) => setMasterError(err.message))}>Retry</button>
+        </div>
+      )}
+      {masterLoading && <div role="status" style={{ margin: '12px 0', color: '#475569' }}>Loading customers from PostgreSQL…</div>}
+      {transactionsLoading && <div role="status" style={{ margin: '12px 0', color: '#475569' }}>Loading customer transactions from PostgreSQL…</div>}
+      {transactionsMessage && <div role="alert" style={{ margin: '12px 0', padding: '10px 12px', borderRadius: 8, color: '#991b1b', background: '#fef2f2', border: '1px solid #fecaca' }}>{transactionsMessage}</div>}
+      {showCustomerModal && (
+        <div role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !masterBusy) setShowCustomerModal(false); }} style={{ position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15,23,42,.48)', display: 'grid', placeItems: 'center', padding: 16 }}>
+          <form role="dialog" aria-modal="true" aria-labelledby="customer-form-title" onSubmit={submitCustomerForm} className="content-block" style={{ width: 'min(680px, 100%)', maxHeight: '90vh', overflow: 'auto', padding: 24 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+              <h2 id="customer-form-title" style={{ margin: 0 }}>{customerEditId ? 'Edit Customer' : 'Add New Customer'}</h2>
+              <button type="button" className="button-secondary" onClick={() => setShowCustomerModal(false)} disabled={masterBusy}>×</button>
+            </div>
+            <div className="form-grid" style={{ marginTop: 18 }}>
+              {[
+                ['companyName', 'Customer / Company Name *'], ['customerName', 'Contact Person *'], ['gstin', 'GSTIN'],
+                ['phone', 'Phone / Mobile'], ['email', 'Email Address'], ['address', 'Address']
+              ].map(([field, label]) => (
+                <label key={field} className={`form-field ${field === 'address' ? 'full-width' : ''}`}>
+                  <span>{label}</span>
+                  {field === 'address' ? (
+                    <textarea rows="3" value={customerForm[field]} onChange={(e) => setCustomerForm({ ...customerForm, [field]: e.target.value })} />
+                  ) : (
+                    <input
+                      type={field === 'email' ? 'email' : field === 'phone' ? 'tel' : 'text'}
+                      value={customerForm[field]}
+                      maxLength={field === 'phone' ? 10 : field === 'gstin' ? 15 : undefined}
+                      onChange={(e) => setCustomerForm({ ...customerForm, [field]: field === 'gstin' ? e.target.value.toUpperCase() : e.target.value })}
+                    />
+                  )}
+                </label>
+              ))}
+            </div>
+            {customerFormError && <div role="alert" style={{ color: '#b91c1c', marginTop: 12 }}>{customerFormError}</div>}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}>
+              <button type="button" className="button-secondary" onClick={() => setShowCustomerModal(false)} disabled={masterBusy}>Cancel</button>
+              <button type="submit" className="button-primary" disabled={masterBusy}>{masterBusy ? 'Saving…' : 'Save Customer'}</button>
+            </div>
+          </form>
+        </div>
+      )}
       {showExcelImport && <ExcelImportDialog
         title="Customers"
         columns={customerImportColumns}
@@ -531,7 +644,11 @@ const CustomersPage = () => {
           <div style={{ maxHeight: '66vh', overflowY: 'auto' }}>
             {filtered.length === 0 ? (
               <div style={{ padding: '40px 16px', textAlign: 'center', color: '#94a3b8', fontSize: '13px' }}>
-                No parties match your search.
+                {masterLoading
+                  ? 'Loading customers from PostgreSQL…'
+                  : masterRecords.length === 0
+                    ? 'No customers on record. Add the first customer.'
+                    : 'No parties match your search.'}
               </div>
             ) : (
               filtered.map((c) => (
@@ -633,7 +750,7 @@ const CustomersPage = () => {
                     </span>
                   </div>
                   <div style={{ fontSize: '11px', color: '#94a3b8', marginTop: '2px' }}>
-                    {active.txCount} transaction(s) · {inr(active.invoiced)} invoiced · {active.source}
+                    {active.txCount} transaction(s) · {inr(active.invoiced)} invoiced · {inr(active.received)} received · {active.source}
                   </div>
                 </div>
                 <div style={{ flex: 2, minWidth: '240px', textAlign: 'left' }}>
@@ -670,6 +787,7 @@ const CustomersPage = () => {
                 <ActionBtn icon="＋" label="Delivery Challan" onClick={() => navigate('/delivery-challan')} />
                 <ActionBtn icon="＋" label="Tax Invoice" onClick={() => navigate('/customer-invoice')} />
                 <span style={{ flex: 1 }} />
+                {active.id && <button type="button" className="button-secondary button-small" title="Edit Customer" onClick={() => openCustomerForm(masterRecords.find((record) => String(record.id) === String(active.id)) || active)} disabled={masterBusy}>Edit</button>}
                 {adminUser && active.id && <button type="button" className="button-secondary button-small" title="Delete Customer" onClick={() => { setCustomerActionMessage(null); setDeleteCustomerTarget(active); }} style={{ color: '#b91c1c', borderColor: '#fecaca' }}><Trash2 size={14} aria-hidden="true" /> Delete</button>}
                 <button type="button" className="button-secondary button-small" onClick={downloadLedger} title="Download ledger as PDF (statement of account)">
                   ⬇ Download Ledger PDF
@@ -717,7 +835,8 @@ const CustomersPage = () => {
                       {g.items.map((t, idx) => {
                         const d = DOC[t.kind];
                         const st = statusColor(t.raw?.status);
-                        const due = t.kind === 'INV' ? invBalanceINR(t.raw) : 0;
+                        const due = t.kind === 'INV' ? invReceivableINR(t.raw) : 0;
+                        const received = t.kind === 'INV' ? invReceivedINR(t.raw) : 0;
                         const amt = amountCell(t);
                         return (
                           <div
@@ -759,6 +878,9 @@ const CustomersPage = () => {
                               {amt}
                               {t.kind === 'INV' && due > 0 && (
                                 <div style={{ fontSize: '10px', fontWeight: 700, color: '#e11d48' }}>Due {inr(due)}</div>
+                              )}
+                              {t.kind === 'INV' && received > 0 && (
+                                <div style={{ fontSize: '10px', fontWeight: 700, color: '#047857' }}>Received {inr(received)}</div>
                               )}
                               <span
                                 style={{

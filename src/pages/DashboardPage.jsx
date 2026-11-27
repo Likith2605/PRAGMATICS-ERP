@@ -6,9 +6,18 @@ import {
   ShoppingCart, Truck, Users, Wrench, Trash2
 } from 'lucide-react';
 import { hasPermission } from '../utils/permissions.js';
-import { deletePurchaseIndent, INDENT_STATUS } from '../utils/workflowService.js';
+import { INDENT_STATUS } from '../utils/workflowService.js';
 import { convertToINR } from '../utils/currency.js';
 import { invReceivableINR } from '../utils/invoiceValues.js';
+import { deleteProcurementRecord, listProcurementRecords, listSupplierInvoicesApi } from '../services/procurementIntakeApi.js';
+import { listQuotations } from '../services/quotationApi.js';
+import { getCustomerPurchaseOrders } from '../services/customerPurchaseOrderApi.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { listDeliveryChallans } from '../services/deliveryChallanApi.js';
+import { listCustomerInvoices } from '../services/customerInvoiceApi.js';
+import { listInventoryItems, listAllStockLedger } from '../services/inventoryApi.js';
+import { getMaterialRequests, getStoreIssues, getMaterialReturns } from '../services/storeApi.js';
+import { getEmployeeCount } from '../services/authApi.js';
 import './dashboard.css';
 
 const payloadINR = (payload) => {
@@ -76,16 +85,19 @@ const InvoiceMonthlySummary = ({ invoices }) => {
   );
 };
 
-const getEmployeeCount = () => {
-  try {
-    const raw = localStorage.getItem('employees');
-    if (!raw) return 0;
-    const list = JSON.parse(raw);
-    return Array.isArray(list) ? list.filter((e) => e.active !== false).length : 0;
-  } catch {
-    return 0;
-  }
-};
+/* The Inventory API returns normalized PostgreSQL rows; map them to the field
+ * names used by the existing dashboard calculations. */
+const mapInventoryItem = (row) => ({
+  id: row.item_code,
+  itemCode: row.item_code,
+  itemName: row.material_name,
+  materialName: row.material_name,
+  currentQty: Number(row.current_qty) || 0,
+  unitCost: Number(row.unit_price) || 0,
+  minReorderLevel: Number(row.reorder_level) || 0,
+  category: row.category,
+  unit: row.unit
+});
 
 const DashboardPage = () => {
   const navigate = useNavigate();
@@ -103,48 +115,57 @@ const DashboardPage = () => {
   const [materialReturns, setMaterialReturns] = useState([]);
   const [stockTransactions, setStockTransactions] = useState([]);
   const [purchaseIndents, setPurchaseIndents] = useState([]);
+  const [employees, setEmployees] = useState(0);
+  const [dashboardError, setDashboardError] = useState('');
+  const [dashboardLoading, setDashboardLoading] = useState(true);
 
-  // Load all module data from localStorage
+  // Keep the dashboard hidden until every authoritative source has loaded.
   useEffect(() => {
-    try {
-      const q = localStorage.getItem('quotationHistory');
-      if (q) setQuotations(JSON.parse(q));
-
-      const cpo = localStorage.getItem('customerPOHistory');
-      if (cpo) setCustomerPOs(JSON.parse(cpo));
-
-      const so = localStorage.getItem('salesOrderHistory');
-      if (so) setSalesOrders(JSON.parse(so));
-
-      const inv = localStorage.getItem('inventoryItems');
-      if (inv) setInventoryItems(JSON.parse(inv));
-
-      const sinv = localStorage.getItem('supplierInvoiceHistory');
-      if (sinv) setSupplierInvoices(JSON.parse(sinv));
-
-      const dc = localStorage.getItem('deliveryChallanHistory');
-      if (dc) setDeliveryChallans(JSON.parse(dc));
-
-      const cinv = localStorage.getItem('customerInvoiceHistory');
-      if (cinv) setCustomerInvoices(JSON.parse(cinv));
-
-      const mrs = localStorage.getItem('materialRequests');
-      if (mrs) setMaterialRequests(JSON.parse(mrs));
-
-      const sis = localStorage.getItem('storeIssueHistory');
-      if (sis) setStoreIssues(JSON.parse(sis));
-
-      const mrsRet = localStorage.getItem('materialReturnHistory');
-      if (mrsRet) setMaterialReturns(JSON.parse(mrsRet));
-
-      const stx = localStorage.getItem('stockTransactions');
-      if (stx) setStockTransactions(JSON.parse(stx));
-
-      const pins = localStorage.getItem('purchaseIndents');
-      if (pins) setPurchaseIndents(JSON.parse(pins));
-    } catch (err) {
-      console.warn('Error loading dashboard stats', err);
-    }
+    let active = true;
+    const load = async () => {
+      setDashboardLoading(true);
+      setDashboardError('');
+      try {
+        const [
+          qList, poList, soList, dcList, invList, invRows, ledgerRows,
+          mrRows, issueRows, returnRows, employeeCount, indents, supplierInvoices
+        ] = await Promise.all([
+          listQuotations(),
+          getCustomerPurchaseOrders(),
+          listSalesOrders(),
+          listDeliveryChallans(),
+          listCustomerInvoices(),
+          listInventoryItems(),
+          listAllStockLedger(),
+          getMaterialRequests(),
+          getStoreIssues(),
+          getMaterialReturns(),
+          getEmployeeCount(),
+          listProcurementRecords('purchaseIndent'),
+          listSupplierInvoicesApi()
+        ]);
+        if (!active) return;
+        setQuotations(qList);
+        setCustomerPOs(poList);
+        setSalesOrders(soList);
+        setDeliveryChallans(dcList);
+        setCustomerInvoices(invList);
+        setInventoryItems(invRows.map(mapInventoryItem));
+        setStockTransactions(ledgerRows);
+        setMaterialRequests(mrRows);
+        setStoreIssues(issueRows);
+        setMaterialReturns(returnRows);
+        setEmployees(employeeCount);
+        setPurchaseIndents(indents);
+        setSupplierInvoices(supplierInvoices);
+      } catch (error) {
+        if (active) setDashboardError(error.message);
+      } finally {
+        if (active) setDashboardLoading(false);
+      }
+    };
+    load();
+    return () => { active = false; };
   }, []);
 
   // Aggregated Financial & Operational KPIs
@@ -213,7 +234,7 @@ const DashboardPage = () => {
     const issuesToday = storeIssues.filter((i) => i.issueDate === today).length;
     const returnsToday = materialReturns.filter((r) => r.returnDate === today).length;
     const totalIssuedTodayUnits = stockTransactions
-      .filter((t) => t.type === 'OUT' && t.transactionNumber && t.date === today)
+      .filter((t) => t.entry_date === today && t.source_doc_type === 'Store Issue' && ['OUT', 'ISSUE'].includes(t.movement_type))
       .reduce((a, t) => a + (Number(t.quantity) || 0), 0);
     return { pending, partial, issuesToday, returnsToday, totalIssuedTodayUnits };
   }, [materialRequests, storeIssues, materialReturns, stockTransactions]);
@@ -267,14 +288,19 @@ const DashboardPage = () => {
   return (
     <div className="page-section dashboard-page">
       <div className="page-header dashboard-page-header"><div><h1>Executive Dashboard</h1></div></div>
+      {dashboardLoading ? <div role="status" className="content-block">Loading dashboard data from PostgreSQL...</div>
+        : dashboardError ? <div role="alert" className="form-error">Dashboard data could not be loaded from PostgreSQL: {dashboardError}</div>
+          : <>
       {canApproveIndent && <section className="content-block dashboard-approval" aria-labelledby="dashboard-approval-title">
         <div className="block-header dashboard-section-header"><div className="dashboard-section-title"><ClipboardCheck size={18} strokeWidth={1.75} aria-hidden="true" /><h2 id="dashboard-approval-title">Purchase indents awaiting approval</h2></div><span className="dashboard-count">{indentsAwaitingApproval.length} pending</span></div>
         {indentsAwaitingApproval.length === 0 ? <p className="dashboard-empty">No purchase indents are waiting for your approval.</p> : <div className="history-table-wrapper"><table className="history-table">
           <thead><tr><th>Indent no</th><th>Date</th><th>Sales order</th><th>Project ID</th><th>Customer</th><th>Materials</th><th>Shared by</th><th>Action</th></tr></thead>
-          <tbody>{indentsAwaitingApproval.map((indent) => <tr key={indent.indentNumber}><td><strong>{indent.indentNumber}</strong></td><td>{indent.indentDate || '—'}</td><td>{indent.soNumber || '—'}</td><td>{indent.projectId || '—'}</td><td>{indent.customer || '—'}</td><td>{(indent.items || []).length}</td><td>{indent.createdBy || '—'}{indent.createdByDept ? ` (${indent.createdByDept})` : ''}</td><td><div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}><button className="button-primary button-small" onClick={() => navigate('/purchase-indents', { state: { openIndent: indent.indentNumber } })}>Open &amp; approve</button>{canDeleteIndent && <button className="button-secondary button-small button-delete" onClick={() => {
+          <tbody>{indentsAwaitingApproval.map((indent) => <tr key={indent.indentNumber}><td><strong>{indent.indentNumber}</strong></td><td>{indent.indentDate || '—'}</td><td>{indent.soNumber || '—'}</td><td>{indent.projectId || '—'}</td><td>{indent.customer || '—'}</td><td>{(indent.items || []).length}</td><td>{indent.createdBy || '—'}{indent.createdByDept ? ` (${indent.createdByDept})` : ''}</td><td><div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}><button className="button-primary button-small" onClick={() => navigate('/purchase-indents', { state: { openIndent: indent.indentNumber } })}>Open &amp; approve</button>{canDeleteIndent && <button className="button-secondary button-small button-delete" onClick={async () => {
             if (!window.confirm(`Delete Purchase Indent ${indent.indentNumber}? This cannot be undone.`)) return;
             try {
-              deletePurchaseIndent(indent.indentNumber);
+              const reason = window.prompt(`Reason for deleting ${indent.indentNumber}?`);
+              if (!reason?.trim()) return;
+              await deleteProcurementRecord('purchaseIndent', indent.indentNumber, indent.version, reason);
               setPurchaseIndents((current) => current.filter((record) => String(record.indentNumber) !== String(indent.indentNumber)));
             } catch (error) {
               window.alert(error.message || 'Unable to delete this Purchase Indent.');
@@ -305,7 +331,7 @@ const DashboardPage = () => {
           <DashboardMetric icon={PackageOpen} label="Material requests pending" value={`${storeKPIs.pending} requests`} note={`${storeKPIs.partial} partially issued`} tone={storeKPIs.pending > 0 ? 'attention' : 'default'} onClick={() => navigate('/store/material-requests')} />
           <DashboardMetric icon={PackageCheck} label="Store issues today" value={`${storeKPIs.issuesToday} slips`} note={`${storeKPIs.totalIssuedTodayUnits} units issued today`} onClick={() => navigate('/store/issues')} />
           <DashboardMetric icon={ArrowLeftRight} label="Material returns today" value={`${storeKPIs.returnsToday} returns`} note="Auto re-added to stock" onClick={() => navigate('/store/returns')} />
-          <DashboardMetric icon={Users} label="Employees on roll" value={`${getEmployeeCount()} people`} note="Verified issue recipients" onClick={() => navigate('/employees')} />
+          <DashboardMetric icon={Users} label="Employees on roll" value={`${employees} people`} note="Verified issue recipients" onClick={() => navigate('/employees')} />
         </div>
       </section>
 
@@ -331,6 +357,7 @@ const DashboardPage = () => {
           <tbody>{recentOrders.filter((order) => order.type === 'Quotation' && order.status === 'Pending').length > 0 ? recentOrders.filter((order) => order.type === 'Quotation' && order.status === 'Pending').map((order, index) => <tr key={`${order.reference}-${index}`} tabIndex={0} onClick={() => navigate(order.path)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); navigate(order.path); } }}><td><span className="dashboard-type-tag">{order.type}</span></td><td><strong>{order.reference}</strong></td><td>{order.party}</td><td>{order.amount}</td><td><span className="dashboard-pending-status">{order.status}</span></td></tr>) : <tr><td colSpan="5" className="dashboard-empty-cell">No active quotations found.</td></tr>}</tbody>
         </table></div>
       </section>}
+          </>}
     </div>
   );
 };

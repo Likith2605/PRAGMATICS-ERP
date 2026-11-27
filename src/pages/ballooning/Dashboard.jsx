@@ -29,6 +29,7 @@ export default function Dashboard() {
   const [projects, setProjects] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [actionLoading, setActionLoading] = useState(null);
 
   /* Expandable per-drawing status: { [projectId]: { drawings, balloons, loading } } */
@@ -41,6 +42,7 @@ export default function Dashboard() {
   const loadProjects = async () => {
     try {
       setLoading(true);
+      setLoadError('');
 
       const data = await api.get('/projects');
 
@@ -48,6 +50,7 @@ export default function Dashboard() {
     } catch (error) {
       console.error('Failed to load projects:', error);
       setProjects([]);
+      setLoadError(`Ballooning projects could not be loaded from PostgreSQL: ${error.message}`);
     } finally {
       setLoading(false);
     }
@@ -86,8 +89,8 @@ export default function Dashboard() {
 
     try {
       const [drawings, balloons] = await Promise.all([
-        api.get(`/projects/${projectId}/drawings`).catch(() => []),
-        api.get(`/projects/${projectId}/balloons`).catch(() => [])
+        api.get(`/projects/${projectId}/drawings`),
+        api.get(`/projects/${projectId}/balloons`)
       ]);
 
       setDrawingDetails((prev) => ({
@@ -95,14 +98,15 @@ export default function Dashboard() {
         [projectId]: {
           drawings: Array.isArray(drawings) ? drawings : [],
           balloons: Array.isArray(balloons) ? balloons : [],
-          loading: false
+          loading: false,
+          error: ''
         }
       }));
     } catch (error) {
       console.error('Failed to load drawing status:', error);
       setDrawingDetails((prev) => ({
         ...prev,
-        [projectId]: { drawings: [], balloons: [], loading: false }
+        [projectId]: { drawings: [], balloons: [], loading: false, error: error.message }
       }));
     }
   };
@@ -233,22 +237,22 @@ export default function Dashboard() {
   const cards = [
     {
       label: 'Total Projects',
-      value: projects.length,
+      value: loading || loadError ? '—' : projects.length,
       icon: FolderKanban
     },
     {
       label: 'Draft Projects',
-      value: projects.filter((p) => p.status === 'Draft').length,
+      value: loading || loadError ? '—' : projects.filter((p) => p.status === 'Draft').length,
       icon: FileCheck2
     },
     {
       label: 'Under Review',
-      value: projects.filter((p) => p.status === 'Under Review').length,
+      value: loading || loadError ? '—' : projects.filter((p) => p.status === 'Under Review').length,
       icon: Eye
     },
     {
       label: 'Approved Projects',
-      value: projects.filter((p) => p.status === 'Approved').length,
+      value: loading || loadError ? '—' : projects.filter((p) => p.status === 'Approved').length,
       icon: CheckCircle2
     }
   ];
@@ -377,6 +381,8 @@ export default function Dashboard() {
                   </td>
                 </tr>
 
+              ) : loadError ? (
+                <tr><td colSpan="9" role="alert" className="px-4 py-8 text-center text-red-700">{loadError}</td></tr>
               ) : projects.length === 0 ? (
 
                 <tr>
@@ -538,6 +544,8 @@ export default function Dashboard() {
                           <div className="text-sm text-slate-500">
                             Loading drawings...
                           </div>
+                        ) : details?.error ? (
+                          <div role="alert" className="text-sm text-red-700">Drawing status could not be loaded from PostgreSQL: {details.error}</div>
                         ) : !details || details.drawings.length === 0 ? (
                           <div className="text-sm text-slate-500">
                             No drawings uploaded for this project yet.

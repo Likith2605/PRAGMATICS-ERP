@@ -3,20 +3,20 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import {
   REQUIREMENT_STATUS,
-  getRequirements,
-  getRequirement,
   computeRequirementLines,
   getRequirementIndents,
-  saveStoreReview,
-  createIndentFromRequirement,
-  markPurchaseCompleted,
-  markMaterialAvailable,
-  completeRequirement,
-  cancelRequirement,
-  deleteRequirement
+  createIndentFromRequirement
 } from '../utils/productionRequirementService.js';
+import {
+  listRequirements,
+  getRequirement as getRequirementApi,
+  deleteRequirement as deleteRequirementApi,
+  requirementAction
+} from '../services/productionApi.js';
 import { hasPermission, isAdmin } from '../utils/permissions.js';
-import { getAvailabilityChecks } from '../utils/workflowService.js';
+import { getAvailabilityChecks, hydrateAvailabilityChecks } from '../utils/workflowService.js';
+import { listProcurementRecords } from '../services/procurementIntakeApi.js';
+import { importLegacyAvailabilityChecks, previewLegacyAvailabilityChecks } from '../services/availabilityCheckApi.js';
 
 const badgeClass = (status) =>
   `status-badge st-${String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
@@ -33,6 +33,13 @@ const StoreItemRequirementsPage = () => {
   const [statusFilter, setStatusFilter] = useState('All');
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
+  const [indentSyncReady, setIndentSyncReady] = useState(false);
+  const [availabilityPreview, setAvailabilityPreview] = useState(null);
+  const [selectedLegacyChecks, setSelectedLegacyChecks] = useState([]);
+  const [availabilityImportBusy, setAvailabilityImportBusy] = useState(false);
+  const [requirements, setRequirements] = useState([]);
+  const [requirementsLoading, setRequirementsLoading] = useState(true);
+  const [requirementsError, setRequirementsError] = useState('');
 
   // review state
   const [reviewRemarks, setReviewRemarks] = useState('');
@@ -44,9 +51,59 @@ const StoreItemRequirementsPage = () => {
   const [indentRemarks, setIndentRemarks] = useState('');
   const [indentRequiredDate, setIndentRequiredDate] = useState('');
 
-  const requirements = useMemo(
-    () => getRequirements().filter((r) => r.status !== REQUIREMENT_STATUS.DRAFT),
-    [tick]
+  useEffect(() => {
+    let active = true;
+    setRequirementsLoading(true);
+    setRequirementsError('');
+    Promise.all([listProcurementRecords('purchaseIndent'), hydrateAvailabilityChecks(), listRequirements()]).then(([, , requirementRows]) => {
+        if (!active) return;
+        setRequirements(requirementRows);
+        setIndentSyncReady(true);
+        setTick((value) => value + 1);
+      }).catch((error) => {
+        if (!active) return;
+        setRequirements([]);
+        setRequirementsError(error.message || 'Could not load Production Requirements from PostgreSQL.');
+        setMessage({ type: 'err', text: `PostgreSQL workflow data could not be refreshed: ${error.message}` });
+      }).finally(() => { if (active) setRequirementsLoading(false); });
+    return () => { active = false; };
+  }, []);
+
+  const loadAvailabilityPreview = async () => {
+    try {
+      const preview = await previewLegacyAvailabilityChecks();
+      setAvailabilityPreview(preview);
+      setSelectedLegacyChecks([]);
+    } catch (error) {
+      setMessage({ type: 'err', text: `Legacy availability preview failed: ${error.message}` });
+    }
+  };
+
+  const importSelectedAvailabilityChecks = async () => {
+    if (!selectedLegacyChecks.length || !window.confirm(`Import ${selectedLegacyChecks.length} selected availability check(s) into PostgreSQL? Legacy records will be preserved.`)) return;
+    setAvailabilityImportBusy(true);
+    try {
+      const result = await importLegacyAvailabilityChecks(selectedLegacyChecks);
+      setAvailabilityPreview(null);
+      setSelectedLegacyChecks([]);
+      setMessage({ type: 'ok', text: `${result.imported.length} selected availability check(s) imported. Legacy data was preserved.` });
+      await hydrateAvailabilityChecks();
+      setTick((value) => value + 1);
+      try {
+        setAvailabilityPreview(await previewLegacyAvailabilityChecks());
+      } catch (previewError) {
+        setMessage({ type: 'err', text: `${result.imported.length} check(s) were imported, but the preview could not be refreshed: ${previewError.message}` });
+      }
+    } catch (error) {
+      setMessage({ type: 'err', text: `Availability check import failed: ${error.message}` });
+    } finally {
+      setAvailabilityImportBusy(false);
+    }
+  };
+
+  const authoritativeRequirements = useMemo(
+    () => requirements.filter((r) => r.status !== REQUIREMENT_STATUS.DRAFT),
+    [requirements]
   );
   const legacyChecks = useMemo(() => getAvailabilityChecks(), [tick]);
 
@@ -54,7 +111,7 @@ const StoreItemRequirementsPage = () => {
   useEffect(() => {
     const wanted =
       searchParams.get('req') || location.state?.openRequirement || location.state?.requirementNumber;
-    if (wanted && getRequirement(wanted)) {
+    if (wanted && requirements.some((r) => r.requirementNumber === wanted)) {
       openRequirement(wanted);
       if (searchParams.get('req')) setSearchParams({}, { replace: true });
     }
@@ -67,14 +124,14 @@ const StoreItemRequirementsPage = () => {
     setTimeout(() => setMessage(null), 6000);
   };
 
-  const requirement = viewNo ? getRequirement(viewNo) : null;
+  const requirement = viewNo ? requirements.find((r) => r.requirementNumber === viewNo) || null : null;
   const lines = requirement ? computeRequirementLines(requirement) : [];
   const indents = requirement ? getRequirementIndents(requirement.requirementNumber) : [];
   const shortageLines = lines.filter((l) => l.remainingShortageQty > 0);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
-    return requirements.filter((r) => {
+    return authoritativeRequirements.filter((r) => {
       if (statusFilter !== 'All' && r.status !== statusFilter) return false;
       if (!q) return true;
       return [r.requirementNumber, r.projectId, r.productionJob, r.soNumber, r.customer]
@@ -82,10 +139,10 @@ const StoreItemRequirementsPage = () => {
         .toLowerCase()
         .includes(q);
     });
-  }, [requirements, search, statusFilter]);
+  }, [authoritativeRequirements, search, statusFilter]);
 
   const openRequirement = (no) => {
-    const rec = getRequirement(no);
+    const rec = requirements.find((r) => r.requirementNumber === no);
     if (!rec) return;
     setViewNo(no);
     setMessage(null);
@@ -123,12 +180,12 @@ const StoreItemRequirementsPage = () => {
     navigate(`/production/item-requirements?edit=${encodeURIComponent(no)}`);
   };
 
-  const handleDelete = (no) => {
+  const handleDelete = async (no) => {
     if (!canManageRequirements) {
       flash('err', 'Only the Production Manager (or an Admin) can delete an Item Requirement.');
       return;
     }
-    const rec = getRequirement(no);
+    const rec = requirements.find((r) => r.requirementNumber === no);
     if (!rec) return;
     if (rec.status === REQUIREMENT_STATUS.COMPLETED) {
       flash('err', `${no} is Completed and cannot be deleted.`);
@@ -146,8 +203,15 @@ const StoreItemRequirementsPage = () => {
       : `${no} is "${rec.status}".\n\nThe requirement will be cancelled and then deleted.\n\nContinue?`;
     if (!window.confirm(confirmMsg)) return;
     try {
-      if (!editable) cancelRequirement(no, 'Cancelled before deletion');
-      deleteRequirement(no);
+      const rec = requirements.find((row) => row.requirementNumber === no);
+      let version = Number(rec?.version) || 1;
+      if (!editable) {
+        const cancelled = await requirementAction(no, 'cancel', version, { reason: 'Cancelled before deletion' });
+        version = Number(cancelled.record.version) || version + 1;
+      }
+      await deleteRequirementApi(no, version, 'Deleted by Admin from Store Item Requirements');
+      const rows = await listRequirements();
+      setRequirements(rows);
       flash('ok', `Item Requirement ${no} deleted.`);
       setTick((t) => t + 1);
     } catch (e) {
@@ -156,12 +220,22 @@ const StoreItemRequirementsPage = () => {
     }
   };
 
-  const handleSaveReview = () => {
+  const handleSaveReview = async () => {
     try {
-      const { lines: reviewed } = saveStoreReview(requirement.requirementNumber, {
-        remarks: reviewRemarks,
-        lineRemarks
+      const shortageCount = lines.filter((l) => l.shortageQty > 0).length;
+      const status = shortageCount > 0 ? REQUIREMENT_STATUS.SHORTAGE_IDENTIFIED : REQUIREMENT_STATUS.STOCK_AVAILABLE;
+      const result = await requirementAction(requirement.requirementNumber, 'review', Number(requirement.version) || 1, {
+        status,
+        storeReview: { remarks: reviewRemarks, lines: Object.fromEntries(lines.map((line) => [line.lineId, {
+          availableQty: line.availableQty,
+          shortageQty: line.shortageQty,
+          status: line.lineStatus,
+          remarks: lineRemarks[line.lineId] || ''
+        }])) }
       });
+      const reviewedRecord = result.record;
+      setRequirements((rows) => rows.map((row) => row.requirementNumber === reviewedRecord.requirementNumber ? reviewedRecord : row));
+      const reviewed = lines;
       const shortage = reviewed.filter((l) => l.shortageQty > 0).length;
       flash(
         'ok',
@@ -184,9 +258,10 @@ const StoreItemRequirementsPage = () => {
     }
   };
 
-  const handleCreateIndent = () => {
+  const handleCreateIndent = async () => {
+    if (!indentSyncReady) { flash('err', 'Purchase Indents are not refreshed from PostgreSQL yet. Retry after the server connection is restored.'); return; }
     try {
-      const indent = createIndentFromRequirement({
+      const indent = await createIndentFromRequirement({
         requirementNumber: requirement.requirementNumber,
         lineIds: selectedLineIds.length ? selectedLineIds : null,
         quantities: qtyInputs,
@@ -194,6 +269,14 @@ const StoreItemRequirementsPage = () => {
         remarks: indentRemarks,
         requiredDate: indentRequiredDate
       });
+      let refreshedRequirements;
+      try {
+        refreshedRequirements = await listRequirements();
+      } catch (refreshError) {
+        flash('err', `Purchase Indent ${indent.indentNumber} was created, but the requirement list could not be refreshed: ${refreshError.message}`);
+        return;
+      }
+      setRequirements(refreshedRequirements);
       setSelectedLineIds([]);
       setIndentRemarks('');
       flash('ok', `Purchase Indent ${indent.indentNumber} created.`);
@@ -204,9 +287,13 @@ const StoreItemRequirementsPage = () => {
     }
   };
 
-  const runStatusAction = (fn, label) => {
+  const runStatusAction = async (action, label) => {
     try {
-      fn(requirement.requirementNumber);
+      const actionName = action === 'purchaseCompleted' ? 'purchase-completed'
+        : action === 'materialAvailable' ? 'material-available'
+          : action === 'complete' ? 'complete' : action;
+      const result = await requirementAction(requirement.requirementNumber, actionName, Number(requirement.version) || 1);
+      setRequirements((rows) => rows.map((row) => row.requirementNumber === result.record.requirementNumber ? result.record : row));
       flash('ok', `${label} updated for ${requirement.requirementNumber}.`);
     } catch (e) {
       flash('err', e.message);
@@ -458,7 +545,7 @@ const StoreItemRequirementsPage = () => {
             </div>
 
             <div className="form-actions" style={{ justifyContent: 'flex-start' }}>
-              <button className="button-primary" onClick={handleCreateIndent}>
+              <button className="button-primary" onClick={handleCreateIndent} disabled={!indentSyncReady}>
                 Create Purchase Indent ({selectedLineIds.length} item(s))
               </button>
             </div>
@@ -519,7 +606,7 @@ const StoreItemRequirementsPage = () => {
               {requirement.status === REQUIREMENT_STATUS.PURCHASE_REQUIRED && (
                 <button
                   className="button-primary"
-                  onClick={() => runStatusAction(markPurchaseCompleted, 'Purchase completed')}
+                  onClick={() => runStatusAction('purchaseCompleted', 'Purchase completed')}
                 >
                   Mark Purchase Completed
                 </button>
@@ -532,7 +619,7 @@ const StoreItemRequirementsPage = () => {
               ].includes(requirement.status) && (
                 <button
                   className="button-primary"
-                  onClick={() => runStatusAction(markMaterialAvailable, 'Material available')}
+                  onClick={() => runStatusAction('materialAvailable', 'Material available')}
                 >
                   Mark Material Available
                 </button>
@@ -540,7 +627,7 @@ const StoreItemRequirementsPage = () => {
               {requirement.status === REQUIREMENT_STATUS.MATERIAL_AVAILABLE && (
                 <button
                   className="button-primary"
-                  onClick={() => runStatusAction(completeRequirement, 'Requirement completed')}
+                  onClick={() => runStatusAction('complete', 'Requirement completed')}
                 >
                   Mark Completed (hand over to Production)
                 </button>
@@ -685,6 +772,45 @@ const StoreItemRequirementsPage = () => {
           </table>
         </div>
       </div>
+
+      {isAdmin() && (
+        <div className="content-block">
+          <div className="block-header">
+            <h3 className="block-title">Availability check legacy reconciliation</h3>
+            <button type="button" className="button-secondary" onClick={loadAvailabilityPreview}>Preview legacy records</button>
+          </div>
+          <p className="muted-text">Preview and selectively import eligible legacy checks. Conflicts are not imported, and the legacy snapshot is preserved.</p>
+          {availabilityPreview && (
+            <>
+              <p className="muted-text">
+                Eligible: {availabilityPreview.counts?.eligible || 0} · Already present: {availabilityPreview.counts?.existing || 0} · Conflicts: {availabilityPreview.counts?.conflicts || 0}
+              </p>
+              <div className="history-table-wrapper">
+                <table className="history-table">
+                  <thead><tr><th>Select</th><th>Sales Order</th><th>Checked By</th><th>Checked At</th><th>Remarks</th></tr></thead>
+                  <tbody>
+                    {(availabilityPreview.eligible || []).map(({ soNumber, record }) => (
+                      <tr key={soNumber}>
+                        <td><input aria-label={`Select ${soNumber}`} type="checkbox" checked={selectedLegacyChecks.includes(soNumber)} onChange={(event) => setSelectedLegacyChecks((items) => event.target.checked ? [...items, soNumber] : items.filter((item) => item !== soNumber))} /></td>
+                        <td><strong>{soNumber}</strong></td><td>{record.checkedBy || '—'}</td><td>{record.checkedDate || record.checkedAt || '—'}</td><td>{record.remarks || '—'}</td>
+                      </tr>
+                    ))}
+                    {(availabilityPreview.conflicts || []).map((item, index) => (
+                      <tr key={`conflict-${item.soNumber}-${index}`}><td>—</td><td>{item.soNumber || '—'}</td><td colSpan="3">{item.reason}</td></tr>
+                    ))}
+                    {!(availabilityPreview.eligible || []).length && !(availabilityPreview.conflicts || []).length && (
+                      <tr><td colSpan="5" className="no-history-row">No legacy availability checks need reconciliation.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <button type="button" className="button-primary" disabled={!selectedLegacyChecks.length || availabilityImportBusy} onClick={importSelectedAvailabilityChecks}>
+                {availabilityImportBusy ? 'Importing…' : `Import selected (${selectedLegacyChecks.length})`}
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="content-block">
         <div className="block-header">

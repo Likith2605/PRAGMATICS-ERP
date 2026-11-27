@@ -5,8 +5,8 @@ import { filterQuotationHistory } from '../utils/historySearch.js';
 import QuotationForm from '../components/QuotationForm.jsx';
 import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBranding.js';
 import { useCompanyBranding } from '../utils/companyBranding.js';
-import { getNextQuotationNumber } from '../utils/sequenceGenerator.js';
 import { isAdmin } from '../utils/auth.js';
+import { deleteQuotation, getQuotationMigrationPreview, importMissingQuotations, listQuotations } from '../services/quotationApi.js';
 
 const QuotationPage = () => {
   const { logoUrl, companyName: brandName, company: brandCompany } = useCompanyBranding(defaultLogoUrl);
@@ -16,32 +16,32 @@ const QuotationPage = () => {
   const [editingQuotation, setEditingQuotation] = useState(null);
   const [history, setHistory] = useState([]);
   const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [migrationPreview, setMigrationPreview] = useState(null);
+  const [selectedMigration, setSelectedMigration] = useState(new Set());
+  const [migrationBusy, setMigrationBusy] = useState(false);
 
   useEffect(() => {
-    const loadHistory = () => {
+    let active = true;
+    const loadHistory = async () => {
+      setLoading(true);
       try {
-        const stored = localStorage.getItem('quotationHistory');
-        setHistory(stored ? JSON.parse(stored) : []);
+        const records = await listQuotations();
+        if (!active) return;
+        setHistory(records);
+        setLoadError('');
       } catch (error) {
-        console.error('Unable to load quotation history', error);
-        setHistory([]);
+        if (!active) return;
+        setLoadError(`Could not load current quotations from PostgreSQL: ${error.message}`);
+      } finally {
+        if (active) setLoading(false);
       }
     };
-    const onERPStateChange = (event) => {
-      if (!event.detail?.key || event.detail.key === 'quotationHistory') loadHistory();
-    };
-    const onStorage = (event) => {
-      if (event.key === 'quotationHistory') loadHistory();
-    };
     loadHistory();
-    window.addEventListener('erp-state-hydrated', loadHistory);
-    window.addEventListener('erp-state-change', onERPStateChange);
-    window.addEventListener('storage', onStorage);
     window.addEventListener('focus', loadHistory);
     return () => {
-      window.removeEventListener('erp-state-hydrated', loadHistory);
-      window.removeEventListener('erp-state-change', onERPStateChange);
-      window.removeEventListener('storage', onStorage);
+      active = false;
       window.removeEventListener('focus', loadHistory);
     };
   }, []);
@@ -68,7 +68,7 @@ const QuotationPage = () => {
         },
         quotationDetails: {
           projectId: prj.projectId || '',
-          quotationNumber: getNextQuotationNumber(),
+          quotationNumber: '',
           quotationDate: new Date().toISOString().slice(0, 10),
           validity: '30 Days'
         },
@@ -87,11 +87,10 @@ const QuotationPage = () => {
     setEditingQuotation(null);
   };
 
-  const handleActionChange = (transaction, action) => {
+  const handleActionChange = async (transaction, action) => {
     if (!action) return;
     if (action === 'viewPreview' && transaction.payload) {
-      localStorage.setItem('currentQuotation', JSON.stringify(transaction.payload));
-      navigate('/quotation/preview', { state: { quotation: transaction.payload } });
+      navigate(`/quotation/preview?quotationNumber=${encodeURIComponent(transaction.reference)}`, { state: { quotation: transaction.payload } });
     } else if (action === 'editQuotation' && transaction.payload) {
       setEditingQuotation(transaction.payload);
       setCreating(true);
@@ -111,32 +110,10 @@ const QuotationPage = () => {
         }
       });
     } else if (action === 'convertSaleOrder' && transaction.payload) {
-      const now = new Date();
-      const year = now.getFullYear().toString().slice(-2);
-      const month = String(now.getMonth() + 1).padStart(2, '0');
-      const day = String(now.getDate()).padStart(2, '0');
-      const serial = Math.floor(100 + Math.random() * 900);
-      const invNum = `INV-${year}${month}${day}-${serial}`;
-
-      // Update quotation status in history
-      try {
-        const stored = localStorage.getItem('quotationHistory');
-        let currentHistory = stored ? JSON.parse(stored) : [];
-        const index = currentHistory.findIndex((h) => h.reference === transaction.reference);
-        if (index !== -1) {
-          currentHistory[index].balanceStatus = `Invoiced (${invNum})`;
-          localStorage.setItem('quotationHistory', JSON.stringify(currentHistory));
-          setHistory(currentHistory);
-        }
-      } catch (err) {
-        console.error('Failed to update quotation status', err);
-      }
-
       navigate('/customer-invoice', {
         state: {
           fromQuotation: true,
-          quotation: transaction.payload,
-          invoiceNumber: invNum
+          quotation: transaction.payload
         }
       });
     } else if (action === 'convertToCustomerPO' && transaction.payload) {
@@ -148,19 +125,56 @@ const QuotationPage = () => {
       });
     } else if (action === 'deleteQuotation') {
       if (window.confirm(`Delete quotation ${transaction.reference}?`)) {
-        const updated = history.filter((h) => h.reference !== transaction.reference);
-        setHistory(updated);
-        localStorage.setItem('quotationHistory', JSON.stringify(updated));
+        try {
+          await deleteQuotation(transaction.reference, transaction.version, 'Deleted by Admin from Quotation History');
+          setHistory((current) => current.filter((h) => h.reference !== transaction.reference));
+          setLoadError('');
+        } catch (error) {
+          setLoadError(`Could not delete quotation from PostgreSQL: ${error.message}`);
+        }
       }
     }
   };
 
-  const handleClearAllQuotations = () => {
+  const handleClearAllQuotations = async () => {
     if (window.confirm('Delete all quotation records?')) {
-      setHistory([]);
-      localStorage.removeItem('quotationHistory');
-      localStorage.removeItem('currentQuotation');
+      try {
+        for (const record of history) await deleteQuotation(record.reference, record.version, 'Admin cleared quotation history');
+        setHistory([]);
+        setLoadError('');
+      } catch (error) {
+        setLoadError(`Quotation clear stopped after a server error: ${error.message}`);
+        try { setHistory(await listQuotations()); } catch { /* retain the last confirmed display */ }
+      }
     }
+  };
+
+  const previewLegacyQuotations = async () => {
+    setMigrationBusy(true);
+    try {
+      const preview = await getQuotationMigrationPreview();
+      setMigrationPreview(preview);
+      setSelectedMigration(new Set());
+      setLoadError('');
+    } catch (error) {
+      setLoadError(`Could not preview legacy quotation records: ${error.message}`);
+    } finally { setMigrationBusy(false); }
+  };
+
+  const confirmLegacyImport = async () => {
+    const selected = migrationPreview?.eligible?.filter((record) => selectedMigration.has(record.quotationNumber)) || [];
+    if (!selected.length || !window.confirm(`Import ${selected.length} reviewed quotation(s) into PostgreSQL? Existing, conflicting, and deleted records will not be overwritten.`)) return;
+    setMigrationBusy(true);
+    try {
+      const result = await importMissingQuotations(selected.map((record) => record.payload));
+      const preview = await getQuotationMigrationPreview();
+      setMigrationPreview(preview);
+      setSelectedMigration(new Set());
+      setHistory(await listQuotations());
+      setLoadError(`Imported ${result.imported.length} quotation(s); ${result.conflicts.length} were skipped because they already exist or are protected.`);
+    } catch (error) {
+      setLoadError(`Legacy quotation import was not confirmed: ${error.message}`);
+    } finally { setMigrationBusy(false); }
   };
 
   return (
@@ -177,7 +191,7 @@ const QuotationPage = () => {
             </button>
           ) : (
             <div style={{ display: 'flex', gap: '8px' }}>
-              {history.length > 0 && (
+              {isAdmin() && history.length > 0 && (
                 <button
                   className="button-secondary"
                   style={{ color: '#dc2626', borderColor: '#fecaca' }}
@@ -186,6 +200,7 @@ const QuotationPage = () => {
                   Clear History
                 </button>
               )}
+              {isAdmin() && <button className="button-secondary" onClick={previewLegacyQuotations} disabled={migrationBusy}>Review Legacy Data</button>}
               <button className="button-primary" onClick={handleCreateNew}>
                 Create Quotation
               </button>
@@ -195,6 +210,28 @@ const QuotationPage = () => {
       </div>
 
       <div className="content-block">
+        {loadError && <div role="alert" className="error-message">{loadError}</div>}
+        {migrationPreview && isAdmin() && (
+          <section className="content-block" aria-label="Legacy quotation migration preview">
+            <h2>Legacy Quotation Migration Preview</h2>
+            <p>New eligible: {migrationPreview.counts.eligible}; already existing: {migrationPreview.counts.existing}; conflicting: {migrationPreview.counts.conflicts}; previously deleted and blocked: {migrationPreview.counts.deleted}.</p>
+            {migrationPreview.eligible.map((record) => (
+              <label key={record.quotationNumber} style={{ display: 'block', padding: '4px 0' }}>
+                <input type="checkbox" checked={selectedMigration.has(record.quotationNumber)} onChange={(event) => setSelectedMigration((current) => {
+                  const next = new Set(current);
+                  if (event.target.checked) next.add(record.quotationNumber); else next.delete(record.quotationNumber);
+                  return next;
+                })} />{' '}
+                {record.quotationNumber} · {record.payload?.customerDetails?.companyName || record.payload?.customerDetails?.customerName || 'Customer not named'}
+              </label>
+            ))}
+            {[...migrationPreview.conflicts, ...migrationPreview.deleted].map((record, index) => <p key={`${record.quotationNumber}-${index}`}>{record.quotationNumber}: {record.reason || 'Import blocked.'}</p>)}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              <button className="button-primary" disabled={migrationBusy || selectedMigration.size === 0} onClick={confirmLegacyImport}>Import Selected</button>
+              <button className="button-secondary" onClick={() => setMigrationPreview(null)}>Close Preview</button>
+            </div>
+          </section>
+        )}
         {creating ? (
           <QuotationForm initialData={editingQuotation} onCancel={handleBackToHistory} />
         ) : (
@@ -229,7 +266,9 @@ const QuotationPage = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {history.length === 0 ? (
+                  {loading ? (
+                    <tr><td colSpan="6" className="no-history-row">Loading quotations from PostgreSQL…</td></tr>
+                  ) : history.length === 0 ? (
                     <tr>
                       <td colSpan="6" className="no-history-row">
                         No quotations yet. Click Create Quotation to add a new entry.

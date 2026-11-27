@@ -1,7 +1,9 @@
 const RULES = [
   [/^employees$/i, { adminOnly: true }],
+  [/^(companySettings|customerDirectory|customerMaster|vendorMaster|vendorMasterSequence|supplierMaster|machines)$/i, { adminOnly: true }],
   [/^rolePermissions$/i, { adminOnly: true }],
   [/^(erpSession|erpUsers|event_tracker_.*|qc_server_settings|erp_record_delete_reasons|erp_state_action_reasons)$/i, { adminOnly: true }],
+  [/^(customerAdvanceHistory|supplierAdvanceHistory|soMaterialAvailabilityChecks)$/i, { adminOnly: true }],
   [/^(companySettings|companyProfile)$/i, { read: ['project.view'], write: ['settings.view'] }],
   [/^(notifications|notificationsSeq)$/i, { read: ['project.view'], write: ['project.view'] }],
   [/^customQuotationTemplates$/i, { read: ['sales.quotation'], write: ['sales.quotation'] }],

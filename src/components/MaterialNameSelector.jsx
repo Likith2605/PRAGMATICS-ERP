@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { getInventoryItems } from '../utils/storeService.js';
+import { listInventoryItems } from '../services/inventoryApi.js';
 
 const availableOf = (it) => Math.max(0, (Number(it.currentQty) || 0) - (Number(it.reservedQty) || 0));
 
@@ -18,8 +18,7 @@ const iconBtnStyle = {
 };
 
 /**
- * Searchable "Material Name" combobox backed by the shared Inventory / Item
- * Master (localStorage key `inventoryItems`, via getInventoryItems()).
+ * Searchable "Material Name" combobox backed by the PostgreSQL Inventory API.
  *
  * - Lists EVERY registered master item regardless of stock quantity.
  * - Search matches item name, code, description, specification, category, HSN.
@@ -35,7 +34,8 @@ const MaterialNameSelector = ({
   onClear,
   placeholder = 'Search material / item from Inventory...',
   disabled = false,
-  showAvailability = true
+  showAvailability = true,
+  items: suppliedItems = null
 }) => {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState(value || '');
@@ -44,14 +44,42 @@ const MaterialNameSelector = ({
   const wrapRef = useRef(null);
   const inputRef = useRef(null);
   const listRef = useRef(null);
+  const [serverItems, setServerItems] = useState([]);
+  const [loadError, setLoadError] = useState('');
 
   const items = useMemo(() => {
-    try {
-      return getInventoryItems() || [];
-    } catch {
-      return [];
-    }
-  }, []);
+    const source = Array.isArray(suppliedItems) ? suppliedItems : serverItems;
+    return (source || []).map((row) => ({
+      ...(row.payload || {}),
+      id: row.item_code || row.itemCode || row.payload?.id || '',
+      itemCode: row.item_code || row.itemCode || row.payload?.itemCode || '',
+      itemName: row.material_name || row.itemName || row.payload?.itemName || '',
+      description: row.description || row.payload?.description || row.payload?.itemDescription || '',
+      category: row.category || row.payload?.category || '',
+      unit: row.unit || row.payload?.unit || 'Nos',
+      specification: row.specification || row.spec || row.payload?.specification || row.payload?.spec || '',
+      spec: row.spec || row.payload?.spec || row.payload?.specification || '',
+      hsnSac: row.hsn_code || row.hsnSac || row.payload?.hsnSac || '',
+      currentQty: Number(row.current_qty ?? row.currentQty ?? row.payload?.currentQty) || 0,
+      reservedQty: Number(row.reservedQty ?? row.payload?.reservedQty) || 0
+    })).filter((row) => row.itemName || row.itemCode);
+  }, [serverItems, suppliedItems]);
+
+  useEffect(() => {
+    if (Array.isArray(suppliedItems)) return undefined;
+    let active = true;
+    const load = () => {
+      listInventoryItems()
+        .then((rows) => { if (active) { setServerItems(rows); setLoadError(''); } })
+        .catch((error) => { if (active) { setServerItems([]); setLoadError(error.message || 'Could not load Inventory items.'); } });
+    };
+    load();
+    window.addEventListener('inventory-authority-updated', load);
+    return () => {
+      active = false;
+      window.removeEventListener('inventory-authority-updated', load);
+    };
+  }, [suppliedItems]);
 
   /* Keep the visible text in sync when the parent clears / reloads the row. */
   useEffect(() => {
@@ -271,14 +299,16 @@ const MaterialNameSelector = ({
             }}
           >
             <span>
-              Inventory Item Master ({matches.length} item{matches.length === 1 ? '' : 's'})
+              Inventory ({matches.length} item{matches.length === 1 ? '' : 's'})
             </span>
             <span style={{ fontSize: '10px', color: '#94a3b8' }}>Click or press Enter to select</span>
           </div>
           <div ref={listRef}>
             {matches.length === 0 ? (
               <div style={{ padding: '14px 10px', textAlign: 'center', fontSize: '12px', color: '#64748b' }}>
-                No inventory items match “{query}”. Search by item name, code, category or HSN.
+                {loadError
+                  ? `Inventory could not be loaded: ${loadError}`
+                  : `No inventory items match “${query}”. Search by item name, code, category or HSN.`}
               </div>
             ) : (
               matches.map((x, idx) => {

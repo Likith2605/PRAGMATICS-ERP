@@ -4,12 +4,6 @@ import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBrandin
 import { useCompanyBranding } from '../utils/companyBranding.js';
 import { generateExportInvoicePDF } from '../services/pdfGenerator.js';
 import {
-  listExportInvoices,
-  getExportInvoice,
-  createExportInvoice,
-  updateExportInvoice,
-  cancelExportInvoice,
-  previewExportInvoiceNumber,
   getExportProfile,
   saveExportProfile,
   computeExportTotals,
@@ -17,6 +11,7 @@ import {
   DEFAULT_DECLARATION
 } from '../utils/exportInvoiceService.js';
 import { isAdmin } from '../utils/auth.js';
+import { listExportInvoicesApi, getExportInvoiceApi, reserveExportInvoiceNumber, createExportInvoiceApi, updateExportInvoiceApi, cancelExportInvoiceApi, getExportInvoiceMigrationPreview, importMissingExportInvoices } from '../services/exportInvoiceApi.js';
 
 const money = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(2) : '0.00');
 const emptyItem = { packages: '', description: '', quantity: '', unit: '', rate: '' };
@@ -24,7 +19,7 @@ const emptyItem = { packages: '', description: '', quantity: '', unit: '', rate:
 const blankForm = () => {
   const profile = getExportProfile();
   return {
-    invoiceNumber: previewExportInvoiceNumber(),
+    invoiceNumber: '',
     invoiceDate: new Date().toISOString().slice(0, 10),
     exporterRef: '',
     buyersOrderNo: '',
@@ -108,10 +103,26 @@ const ExportInvoicePage = () => {
   const [editingRef, setEditingRef] = useState(null);
   const [profile, setProfile] = useState(() => getExportProfile());
   const [form, setForm] = useState(blankForm);
+  const [versions, setVersions] = useState({});
+  const [loadError, setLoadError] = useState('');
+  const [migrationPreview, setMigrationPreview] = useState(null);
+  const [migrationSelection, setMigrationSelection] = useState(new Set());
+  const [migrationBusy, setMigrationBusy] = useState(false);
 
   useEffect(() => {
-    setList(listExportInvoices());
+    let active = true;
+    listExportInvoicesApi().then((rows) => { if (active) { setList(rows); setVersions(Object.fromEntries(rows.map((row) => [row.reference, row.version]))); setLoadError(''); } })
+      .catch((error) => { if (active) setLoadError(`Could not load Export Invoices from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
   }, []);
+  useEffect(() => {
+    if (mode !== 'create' || editingRef || form.invoiceNumber) return;
+    let active = true;
+    reserveExportInvoiceNumber(new Date().toISOString().slice(0, 10))
+      .then((invoiceNumber) => { if (active) setForm((previous) => previous.invoiceNumber ? previous : { ...previous, invoiceNumber }); })
+      .catch((error) => { if (active) setLoadError(`Could not reserve Export Invoice number from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
+  }, [mode, editingRef, location.state]);
 
   /* ------------------------------------------------------------------
    * Sales Order → Export Invoice (same connection pattern as Sales Order
@@ -183,11 +194,8 @@ const ExportInvoicePage = () => {
   };
 
   const openView = (reference) => {
-    const entry = getExportInvoice(reference);
-    if (!entry) return;
-    setSelected(entry);
-    setForm(payloadToForm(entry.payload));
-    setMode('view');
+    getExportInvoiceApi(reference).then((entry) => { setSelected(entry); setForm(payloadToForm(entry.payload)); setMode('view'); setLoadError(''); })
+      .catch((error) => setLoadError(`Could not retrieve Export Invoice from PostgreSQL: ${error.message}`));
   };
 
   const openEdit = () => {
@@ -198,30 +206,50 @@ const ExportInvoicePage = () => {
     setMode('create');
   };
 
-  const handleSave = (e) => {
+  const handleSave = async (e) => {
     e.preventDefault();
     try {
       saveExportProfile(profile);
       const data = { ...form, swiftCode: profile.swiftCode };
-      const entry = editingRef ? updateExportInvoice(editingRef, data) : createExportInvoice(data);
-      setList(listExportInvoices());
+      const result = editingRef
+        ? await updateExportInvoiceApi(editingRef, data, versions[editingRef])
+        : await createExportInvoiceApi(data, globalThis.crypto?.randomUUID?.() || `export-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const entry = result.record;
+      const rows = await listExportInvoicesApi(); setList(rows); setVersions(Object.fromEntries(rows.map((row) => [row.reference, row.version])));
       setSelected(entry);
       setForm(payloadToForm(entry.payload));
       setEditingRef(null);
       setMode('view');
     } catch (err) {
-      alert(err.message);
+      setLoadError(err.message); alert(err.message);
     }
   };
 
-  const handleCancel = (reference) => {
+  const handleCancel = async (reference) => {
     if (!isAdmin() || !window.confirm(`Cancel Export Invoice ${reference}? Its record will be retained.`)) return;
     const reason = window.prompt(`Reason for cancelling Export Invoice ${reference}:`)?.trim();
     if (!reason) return;
-    try { cancelExportInvoice(reference, reason); } catch (error) { alert(error.message); return; }
-    setList(listExportInvoices());
-    setSelected(getExportInvoice(reference));
-    setMode('view');
+    try {
+      const result = await cancelExportInvoiceApi(reference, versions[reference], reason);
+      setSelected(result.record); const rows = await listExportInvoicesApi(); setList(rows); setVersions(Object.fromEntries(rows.map((row) => [row.reference, row.version]))); setMode('view');
+    } catch (error) { setLoadError(`Cancellation was not confirmed: ${error.message}`); alert(error.message); }
+  };
+
+  const previewLegacy = async () => {
+    setMigrationBusy(true);
+    try { setMigrationPreview(await getExportInvoiceMigrationPreview()); setMigrationSelection(new Set()); setLoadError(''); }
+    catch (error) { setLoadError(`Could not preview legacy Export Invoices: ${error.message}`); }
+    finally { setMigrationBusy(false); }
+  };
+  const importSelected = async () => {
+    setMigrationBusy(true);
+    try {
+      const records=migrationPreview.eligible.filter((row)=>migrationSelection.has(row.number));
+      const result=await importMissingExportInvoices(records.map((row)=>row.payload));
+      const refreshed=await listExportInvoicesApi();setList(refreshed);setVersions(Object.fromEntries(refreshed.map((row)=>[row.reference,row.version])));setMigrationPreview(null);
+      setLoadError(result.conflicts.length?`${result.imported.length} imported; ${result.conflicts.length} conflicts remain unchanged.`:`${result.imported.length} legacy invoices imported.`);
+    } catch(error) { setLoadError(`Import was not confirmed: ${error.message}`); }
+    finally { setMigrationBusy(false); }
   };
 
   const handleDownloadPDF = async () => {
@@ -332,12 +360,22 @@ const ExportInvoicePage = () => {
               Back to List
             </button>
           ) : (
+            <div style={{display:'flex',gap:8}}>
+            {isAdmin()&&<button type="button" className="button-secondary" onClick={previewLegacy} disabled={migrationBusy}>Review Legacy Data</button>}
             <button className="button-primary" onClick={openCreate}>
               + New Export Invoice
-            </button>
+            </button></div>
           )}
         </div>
       </div>
+      {loadError&&<div role="alert" className="alert alert-error">{loadError}</div>}
+      {migrationPreview&&isAdmin()&&mode==='list'&&<section className="form-section" aria-label="Legacy Export Invoice migration preview">
+        <h2>Legacy Export Invoice Migration Preview</h2>
+        <p>Eligible: {migrationPreview.counts.eligible}; existing: {migrationPreview.counts.existing}; conflicts: {migrationPreview.counts.conflicts}; deleted IDs blocked: {migrationPreview.counts.deleted}.</p>
+        {migrationPreview.eligible.map((row)=><label key={row.number} style={{display:'block',padding:4}}><input type="checkbox" checked={migrationSelection.has(row.number)} onChange={(event)=>setMigrationSelection((current)=>{const next=new Set(current);if(event.target.checked)next.add(row.number);else next.delete(row.number);return next;})}/> {row.number} · {row.payload?.buyer?.name||'Buyer not named'}</label>)}
+        {[...migrationPreview.conflicts,...migrationPreview.deleted].map((row,index)=><p key={`${row.number}-${index}`}>{row.number}: {row.reason||'Previously deleted; import blocked.'}</p>)}
+        <button type="button" className="button-primary" disabled={migrationBusy||!migrationSelection.size} onClick={importSelected}>Import Selected</button>{' '}<button type="button" className="button-secondary" onClick={()=>setMigrationPreview(null)}>Close Preview</button>
+      </section>}
 
       {/* ---------------------------------- list ---------------------------------- */}
       {mode === 'list' && (
@@ -354,7 +392,7 @@ const ExportInvoicePage = () => {
               </tr>
             </thead>
             <tbody>
-              {list.length === 0 && (
+              {list.length === 0 && !loadError && (
                 <tr>
                   <td colSpan={6} style={{ textAlign: 'center', padding: '18px', color: '#64748b' }}>
                     No export invoices yet. Click "New Export Invoice" to create one.

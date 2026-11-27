@@ -1,6 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getStoreIssues } from '../../utils/storeService.js';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { getStoreIssues } from '../../services/storeApi.js';
 
 /**
  * Material Issue Register (Phase 2).
@@ -35,12 +37,15 @@ const buildIssueGroupRows = (rows, groupBy) => {
   }, {})).sort((a, b) => b.qty - a.qty);
 };
 
+const loadStoreIssues = () => getStoreIssues();
+
 const MaterialIssueRegisterPage = () => {
   const [groupBy, setGroupBy] = useState('none');
+  const { data: storeIssues, loading, error } = useAuthoritativeData(loadStoreIssues);
 
   const { rows, employees, jobCards, items } = useMemo(() => {
     const flat = [];
-    getStoreIssues().forEach((si) => {
+    storeIssues.forEach((si) => {
       (si.items || []).forEach((it) => {
         flat.push({
           issueDate: si.issueDate || '',
@@ -71,7 +76,8 @@ const MaterialIssueRegisterPage = () => {
       jobCards: uniq(flat.map((r) => r.jobCardNumber)),
       items: uniq(flat.map((r) => r.materialId))
     };
-  }, []);
+  }, [storeIssues]);
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
 
   const sortedRows = useMemo(() => {
     if (groupBy === 'none') return [...rows].sort((a, b) => (b.issueDate || '').localeCompare(a.issueDate || ''));

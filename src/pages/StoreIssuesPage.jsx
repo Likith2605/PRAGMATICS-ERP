@@ -2,15 +2,15 @@ import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
   STATUS,
-  getStoreIssues,
-  getMaterialRequests,
-  getMaterialShortages,
-  getInventoryBatches,
-  decorateMR,
-  issueMaterial,
   todayStr,
   nowTimeStr
 } from '../utils/storeService.js';
+import {
+  getMaterialRequests as getMaterialRequestsApi,
+  getStoreIssues as getStoreIssuesApi,
+  issueMaterial as issueMaterialApi
+} from '../services/storeApi.js';
+import { listInventoryItems, listInventoryLots } from '../services/inventoryApi.js';
 import { getSalesOrders } from '../utils/workflowService.js';
 import { getAcknowledgement } from '../utils/materialAckService.js';
 import { hasPermission } from '../utils/permissions.js';
@@ -36,6 +36,61 @@ const StatusChip = ({ status }) => {
 /* Store acknowledgement chip — colours live in quotation.css. */
 const AckChip = ({ status }) => <StatusChip status={status} />;
 
+const mapInventoryItem = (row = {}) => ({
+  ...row.payload,
+  ...row,
+  itemCode: row.item_code || row.payload?.itemCode || '',
+  itemName: row.material_name || row.payload?.itemName || '',
+  unit: row.unit || row.payload?.unit || 'Nos',
+  currentQty: Number(row.current_qty ?? row.payload?.currentQty) || 0
+});
+
+const mapInventoryLot = (row = {}) => ({
+  ...row.payload,
+  ...row,
+  itemCode: row.item_code || row.payload?.itemCode || '',
+  batchNumber: row.batch_number || row.payload?.batchNumber || '',
+  availableQty: Number(row.available_qty ?? row.payload?.availableQty) || 0,
+  expiryDate: row.expiry_date || row.payload?.expiryDate || ''
+});
+
+const decorateStoreRequest = (request, inventory) => ({
+  ...request,
+  items: (request.items || []).map((line) => {
+    const item = inventory.find((entry) => entry.itemCode === line.materialId);
+    const requiredQty = Number(line.requiredQty ?? line.required_qty) || 0;
+    const issuedQty = Number(line.issuedQty ?? line.issued_qty) || 0;
+    return {
+      ...line,
+      requiredQty,
+      issuedQty,
+      balanceQty: Math.max(0, requiredQty - issuedQty),
+      unit: line.unit || item?.unit || 'Nos'
+    };
+  })
+});
+
+const getStoreShortages = (request, inventory) => (request.items || []).map((line) => {
+  const item = inventory.find((entry) => entry.itemCode === line.materialId);
+  const required = Number(line.requiredQty) || 0;
+  const issued = Number(line.issuedQty) || 0;
+  const balance = Math.max(0, required - issued);
+  const available = Number(item?.currentQty) || 0;
+  const shortage = Math.max(0, balance - available);
+  return {
+    materialId: line.materialId,
+    materialName: line.materialName,
+    unit: line.unit || item?.unit || 'Nos',
+    required,
+    issued,
+    balance,
+    available,
+    shortage,
+    hasShortage: shortage > 0,
+    canIssuePartially: balance > 0 && available > 0
+  };
+});
+
 /* Best-effort Customer PO for the issue form: an explicit poNumber wins, then
    a "PO: xxx" Sales Order reference, then the linked Sales Order record.
    The field stays editable so the store person can always correct it. */
@@ -56,6 +111,12 @@ const StoreIssuesPage = () => {
   const [search, setSearch] = useState('');
   const [projectFilter, setProjectFilter] = useState('All');
   const [refreshTick, setRefreshTick] = useState(0);
+  const [issues, setIssues] = useState([]);
+  const [materialRequests, setMaterialRequests] = useState([]);
+  const [inventory, setInventory] = useState([]);
+  const [inventoryBatches, setInventoryBatches] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
   /* -------- incoming Material Requests awaiting store issue -------- */
   const [pendingSearch, setPendingSearch] = useState('');
@@ -65,7 +126,39 @@ const StoreIssuesPage = () => {
   const [issueFlash, setIssueFlash] = useState('');
 
   const canIssue = hasPermission('material_issue.confirm');
-  const issues = getStoreIssues();
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        setLoading(true);
+        const [issueRows, requestRows, inventoryRows, lotRows] = await Promise.all([
+          getStoreIssuesApi(),
+          getMaterialRequestsApi(),
+          listInventoryItems(),
+          listInventoryLots()
+        ]);
+        if (!active) return;
+        setIssues(Array.isArray(issueRows) ? issueRows : []);
+        setMaterialRequests(Array.isArray(requestRows) ? requestRows : []);
+        setInventory((Array.isArray(inventoryRows) ? inventoryRows : []).map(mapInventoryItem));
+        setInventoryBatches((Array.isArray(lotRows) ? lotRows : []).map(mapInventoryLot));
+        setLoadError('');
+      } catch (error) {
+        if (active) {
+          setIssues([]);
+          setMaterialRequests([]);
+          setInventory([]);
+          setInventoryBatches([]);
+          setLoadError(error.message || 'Unable to load Store records from PostgreSQL.');
+        }
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    load();
+    return () => { active = false; };
+  }, [refreshTick]);
 
   useEffect(() => {
     if (location.state?.viewIssue) setViewIssueNumber(location.state.viewIssue);
@@ -101,13 +194,13 @@ const StoreIssuesPage = () => {
   /* Material Requests Production has sent to the Store that still have a
      balance to hand out — the queue shown on the "Pending Requests" tab. */
   const pendingMrs = useMemo(() => {
-    return getMaterialRequests()
-      .map((m) => decorateMR(m))
+    return materialRequests
+      .map((m) => decorateStoreRequest(m, inventory))
       .filter((m) => ISSUABLE_STATUSES.has(m.status))
-      .filter((m) => getMaterialShortages(m).some((s) => s.balance > 0))
+      .filter((m) => getStoreShortages(m, inventory).some((s) => s.balance > 0))
       .sort((a, b) => String(b.requestDate || '').localeCompare(String(a.requestDate || '')));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTick]);
+  }, [materialRequests, inventory, refreshTick]);
 
   const filteredPending = pendingMrs.filter((mr) => {
     const q = pendingSearch.toLowerCase().trim();
@@ -123,10 +216,9 @@ const StoreIssuesPage = () => {
     if (!issuingMrNumber) return null;
     const queued = pendingMrs.find((m) => m.mrNumber === issuingMrNumber);
     if (queued) return queued;
-    const raw = getMaterialRequests().find((m) => m.mrNumber === issuingMrNumber);
-    return raw ? decorateMR(raw) : null;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [issuingMrNumber, pendingMrs]);
+    const raw = materialRequests.find((m) => m.mrNumber === issuingMrNumber);
+    return raw ? decorateStoreRequest(raw, inventory) : null;
+  }, [issuingMrNumber, pendingMrs, materialRequests, inventory]);
 
   const startIssue = (mrNumber) => {
     setIssuingMrNumber(mrNumber);
@@ -134,11 +226,11 @@ const StoreIssuesPage = () => {
     setIssueFlash('');
   };
 
-  const handleIssue = ({ issueQtyById, receiver, remarks, batchInfo, issueRefs }) => {
+  const handleIssue = async ({ issueQtyById, receiver, remarks, batchInfo, issueRefs }) => {
     if (!issuingMrNumber) return;
     try {
       setIssueBusy(true);
-      const si = issueMaterial({ mrNumber: issuingMrNumber, issueQtyById, receiver, remarks, batchInfo, issueRefs });
+      const si = await issueMaterialApi({ mrNumber: issuingMrNumber, issueQtyById, receiver, remarks, batchInfo, issueRefs });
       setIssueBusy(false);
       setIssueFlash(`Store Issue ${si.issueNumber} created for ${issuingMrNumber} — Production has been notified.`);
       setIssuingMrNumber(null);
@@ -160,6 +252,9 @@ const StoreIssuesPage = () => {
         </div>
       </div>
 
+      {loading && <p className="muted" role="status">Loading Store records from PostgreSQL…</p>}
+      {loadError && <p className="shortage-banner" role="alert">{loadError}</p>}
+
       <div className="tab-nav">
         <button type="button" className={`tab-link ${tab === 'pending' ? 'active' : ''}`} onClick={() => { setTab('pending'); setIssuingMrNumber(null); }}>
           Pending Requests{pendingMrs.length ? ` (${pendingMrs.length})` : ''}
@@ -178,6 +273,8 @@ const StoreIssuesPage = () => {
         issuingMr ? (
           <IssueForm
             mr={issuingMr}
+            inventory={inventory}
+            inventoryBatches={inventoryBatches}
             busy={issueBusy}
             error={issueError}
             canSubmit={canIssue}
@@ -187,6 +284,7 @@ const StoreIssuesPage = () => {
         ) : (
           <PendingRequestsView
             mrs={filteredPending}
+            inventory={inventory}
             totalCount={pendingMrs.length}
             search={pendingSearch}
             onSearch={setPendingSearch}
@@ -385,7 +483,7 @@ export default StoreIssuesPage;
    took the material, the Job Card / PO / Customer it went against, and how
    much of each line is being issued.
 --------------------------------------------------------------------------- */
-const PendingRequestsView = ({ mrs, totalCount, search, onSearch, canIssue, flash, onIssue }) => (
+const PendingRequestsView = ({ mrs, inventory, totalCount, search, onSearch, canIssue, flash, onIssue }) => (
   <div className="content-block">
     <div className="block-header">
       <h3 className="block-title">Pending Material Requests</h3>
@@ -428,9 +526,9 @@ const PendingRequestsView = ({ mrs, totalCount, search, onSearch, canIssue, flas
             </tr>
           ) : (
             mrs.map((mr) => {
-              const rows = getMaterialShortages(mr);
+              const rows = getStoreShortages(mr, inventory);
               const pendingLines = rows.filter((r) => r.balance > 0);
-              const ack = getAcknowledgement(mr.mrNumber);
+              const ack = getAcknowledgement(mr);
               return (
                 <tr key={mr.mrNumber}>
                   <td><strong>{mr.mrNumber}</strong></td>
@@ -481,9 +579,8 @@ const PendingRequestsView = ({ mrs, totalCount, search, onSearch, canIssue, flas
    confirms at hand-over. Those three references are stamped onto the Store
    Issue slip and the stock transaction only — never back onto the MR.
 --------------------------------------------------------------------------- */
-const IssueForm = ({ mr, busy, error, canSubmit, onBack, onSubmit }) => {
-  const shortages = useMemo(() => getMaterialShortages(mr), [mr]);
-  const inventoryBatches = getInventoryBatches();
+const IssueForm = ({ mr, inventory, inventoryBatches, busy, error, canSubmit, onBack, onSubmit }) => {
+  const shortages = useMemo(() => getStoreShortages(mr, inventory), [mr, inventory]);
   const anyIssuable = shortages.some((s) => s.canIssuePartially);
 
   const [issueQty, setIssueQty] = useState({});

@@ -6,6 +6,7 @@ import { generateQuotationPDF } from '../services/pdfGenerator.js';
 import QuotationPreview from '../components/QuotationPreview.jsx';
 import WorkflowNavigator from '../components/WorkflowNavigator.jsx';
 import { money } from '../utils/currency.js';
+import { getQuotation } from '../services/quotationApi.js';
 
 const PdfDownloadIcon = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -52,21 +53,17 @@ const QuotationPreviewPage = () => {
   const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
+    let active = true;
     if (location.state?.quotation) {
       setQuotationData(location.state.quotation);
-      return;
+      return () => { active = false; };
     }
-
-    const localData = localStorage.getItem('currentQuotation');
-    if (localData) {
-      try {
-        setQuotationData(JSON.parse(localData));
-      } catch (error) {
-        console.error('Unable to parse saved quotation', error);
-        setQuotationData(null);
-      }
-    }
-  }, [location.state]);
+    const number = new URLSearchParams(location.search).get('quotationNumber');
+    if (!number) { setQuotationData(null); return () => { active = false; }; }
+    getQuotation(number).then((record) => { if (active) setQuotationData(record.payload); })
+      .catch((error) => { if (active) { setQuotationData(null); setMessage(`Could not retrieve quotation from PostgreSQL: ${error.message}`); } });
+    return () => { active = false; };
+  }, [location.state, location.search]);
 
   const getShareText = () => {
     if (!quotationData) return '';

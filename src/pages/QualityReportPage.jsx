@@ -1,19 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  DEFAULT_SERVER_URL,
   buildCheckReport,
   buildDispatchReport,
-  buildDrawingReport,
-  connect,
-  disconnect,
-  discoverServer,
-  getSession,
-  getSettings,
-  listChecks,
-  listDispatches,
-  listDrawings,
-  refreshSnapshot
+  buildDrawingReport
 } from '../quality/qualityApi.js';
+import {
+  getCheck,
+  getDrawing,
+  listChecks as listQualityChecksApi,
+  listDispatches as listQualityDispatchesApi,
+  listDrawings as listQualityDrawingsApi
+} from '../services/qualityApi.js';
+import { buildQualityReportSnapshot } from '../utils/qualityReportData.js';
 import { buildOverallReportHtml, buildReportHtml } from '../quality/report/pdf.js';
 import { QUALITY_REPORT_FOOTER } from '../quality/report/footer.js';
 import { buildDispatchQrSvg, buildStickerHtml } from '../quality/report/sticker.js';
@@ -48,110 +46,17 @@ const statusBadge = (value) => (
   <span className={`status-badge st-${String(value || '').toLowerCase()}`}>{value || '-'}</span>
 );
 
-/* ------------------------------------------------------------------ */
-/* Connection panel                                                    */
-/* ------------------------------------------------------------------ */
-
-const ConnectionPanel = ({ onConnected }) => {
-  const [settings, setSettings] = useState(() => getSettings());
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [health, setHealth] = useState('');
-
-  const update = (key) => (event) => setSettings((prev) => ({ ...prev, [key]: event.target.value }));
-
-  const testConnection = async () => {
-    setBusy(true);
-    setError('');
-    setHealth('');
-    try {
-      const found = await discoverServer(settings.url);
-      if (found) {
-        setHealth(
-          found === String(settings.url).trim().replace(/\/+$/, '')
-            ? 'Server reachable.'
-            : `Server reachable at ${found}.`
-        );
-      } else {
-        setError('Server is not connected');
-      }
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const submit = async (event) => {
-    event.preventDefault();
-    setBusy(true);
-    setError('');
-    try {
-      const result = await connect(settings);
-      onConnected(result);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <section className="page-section quality-report-connection">
-      <div className="page-header">
-        <h1 className="page-title">Quality Report</h1>
-      </div>
-
-      <form className="quotation-form-card" onSubmit={submit}>
-        <div className="form-grid">
-          <div className="field-group">
-            <label className="field-label" htmlFor="qc-user">Employee ID</label>
-            <input
-              id="qc-user"
-              className="search-input"
-              value={settings.employee_id}
-              onChange={update('employee_id')}
-              placeholder="QC001"
-            />
-          </div>
-          <div className="field-group">
-            <label className="field-label" htmlFor="qc-pass">Password</label>
-            <input
-              id="qc-pass"
-              type="password"
-              className="search-input"
-              value={settings.password}
-              onChange={update('password')}
-              placeholder="Password"
-            />
-          </div>
-          <div className="field-group">
-            <label className="field-label" htmlFor="qc-url">Server URL</label>
-            <input
-              id="qc-url"
-              className="search-input"
-              value={settings.url}
-              onChange={update('url')}
-              placeholder={DEFAULT_SERVER_URL}
-            />
-            <p className="field-hint">Where the QualityApp server is running (host and port).</p>
-          </div>
-        </div>
-
-        {error ? <p className="form-error">{error}</p> : null}
-        {health ? <p className="success-message">{health}</p> : null}
-
-        <div className="form-actions">
-          <button type="button" className="button-secondary" onClick={testConnection} disabled={busy}>
-            Test Connection
-          </button>
-          <button type="submit" className="button-primary" disabled={busy}>
-            {busy ? 'Logging in...' : 'Login'}
-          </button>
-        </div>
-      </form>
-    </section>
-  );
+const loadQualityReportSnapshot = async () => {
+  const [drawings, checks, dispatches] = await Promise.all([
+    listQualityDrawingsApi(),
+    listQualityChecksApi(),
+    listQualityDispatchesApi()
+  ]);
+  const [drawingDetails, checkDetails] = await Promise.all([
+    Promise.all(drawings.map((drawing) => getDrawing(drawing.id))),
+    Promise.all(checks.map((check) => getCheck(check.id)))
+  ]);
+  return buildQualityReportSnapshot({ drawings, checks, dispatches, drawingDetails, checkDetails });
 };
 
 /* ------------------------------------------------------------------ */
@@ -251,7 +156,6 @@ const ReportViewer = ({ report, onClose }) => {
 
 const QualityReportPage = () => {
   const { logoUrl, companyName: brandName, company: brandCompany } = useCompanyBranding(defaultLogoUrl);
-  const [session, setSession] = useState(() => getSession());
   const [tab, setTab] = useState('overall');
   const [search, setSearch] = useState('');
   const [fromDate, setFromDate] = useState('');
@@ -264,8 +168,10 @@ const QualityReportPage = () => {
   const [filterError, setFilterError] = useState('');
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [records, setRecords] = useState({ individual: [], overall: [], dispatch: [] });
+  const [reportData, setReportData] = useState(null);
   const [report, setReport] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -274,50 +180,69 @@ const QualityReportPage = () => {
   const [activeSuggestion, setActiveSuggestion] = useState(0);
   const generatedBy = getCurrentUserInfo().employee?.name || 'User';
 
-  const loadRecords = useCallback(() => {
+  const pullLatest = useCallback(loadQualityReportSnapshot, []);
+  const publishSnapshot = (snapshot) => {
+    setReportData(snapshot);
     setRecords({
-      individual: listChecks(),
-      overall: listDrawings(),
-      dispatch: listDispatches()
+      individual: snapshot.checks,
+      overall: snapshot.drawings,
+      dispatch: snapshot.dispatches
     });
-  }, []);
-
-  const pullLatest = useCallback(async () => {
-    await refreshSnapshot();
-    loadRecords();
-  }, [loadRecords]);
-
-  useEffect(() => {
-    if (session) loadRecords();
-  }, [session, loadRecords]);
+  };
+  const clearSnapshot = () => {
+    setReportData(null);
+    setRecords({ individual: [], overall: [], dispatch: [] });
+    setReport(null);
+  };
 
   useEffect(() => {
-    if (!session || !autoRefresh) return undefined;
+    let active = true;
+    pullLatest().then((snapshot) => {
+      if (!active) return;
+      publishSnapshot(snapshot);
+      setLastSync(new Date());
+    }).catch((err) => {
+      if (!active) return;
+      clearSnapshot();
+      setError(`Quality report data could not be loaded from PostgreSQL: ${err.message}`);
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => { active = false; };
+  }, [pullLatest]);
+
+  useEffect(() => {
+    if (!autoRefresh) return undefined;
     const tick = async () => {
       if (document.hidden) return;
       try {
-        await pullLatest();
+        const snapshot = await pullLatest();
+        publishSnapshot(snapshot);
+        setError('');
         setLastSync(new Date());
       } catch (err) {
-        if (err.status === 401 || err.status === 403) {
-          await disconnect();
-          setSession(null);
-          setRecords({ individual: [], overall: [], dispatch: [] });
-          setError('Server is not connected');
-        }
+        clearSnapshot();
+        setError(`Quality report data could not be loaded from PostgreSQL: ${err.message}`);
       }
     };
     const id = setInterval(tick, AUTO_REFRESH_MS);
     return () => clearInterval(id);
-  }, [session, autoRefresh, pullLatest]);
+  }, [autoRefresh, pullLatest]);
 
   useEffect(() => {
-    if (!session || !autoRefresh) return undefined;
+    if (!autoRefresh) return undefined;
     const onWake = () => {
       if (document.hidden) return;
       pullLatest()
-        .then(() => setLastSync(new Date()))
-        .catch(() => {});
+        .then((snapshot) => {
+          publishSnapshot(snapshot);
+          setError('');
+          setLastSync(new Date());
+        })
+        .catch((err) => {
+          clearSnapshot();
+          setError(`Quality report data could not be loaded from PostgreSQL: ${err.message}`);
+        });
     };
     document.addEventListener('visibilitychange', onWake);
     window.addEventListener('focus', onWake);
@@ -325,42 +250,27 @@ const QualityReportPage = () => {
       document.removeEventListener('visibilitychange', onWake);
       window.removeEventListener('focus', onWake);
     };
-  }, [session, autoRefresh, pullLatest]);
+  }, [autoRefresh, pullLatest]);
 
   const refresh = async () => {
     setBusy(true);
     setMessage('');
     setError('');
     try {
-      await pullLatest();
+      const snapshot = await pullLatest();
+      publishSnapshot(snapshot);
       setLastSync(new Date());
-      setMessage('Synced with the quality server.');
+      setMessage('Updated from PostgreSQL.');
     } catch (err) {
-      // A rejected token means the server forgot us - fall back to the login
-      // screen instead of leaving a dead session on screen.
-      if (err.status === 401 || err.status === 403) {
-        await disconnect();
-        setSession(null);
-        setRecords({ individual: [], overall: [], dispatch: [] });
-        setError('Server is not connected');
-        return;
-      }
-      setError(err.message);
+      clearSnapshot();
+      setError(`Quality report data could not be loaded from PostgreSQL: ${err.message}`);
     } finally {
       setBusy(false);
     }
   };
 
-  const signOut = async () => {
-    await disconnect();
-    setSession(null);
-    setRecords({ individual: [], overall: [], dispatch: [] });
-    setMessage('');
-    setError('');
-  };
-
   const viewIndividual = async (record) => {
-    const payload = buildCheckReport(record.id);
+    const payload = buildCheckReport(record.id, reportData);
     if (!payload) {
       setMessage('That report is no longer available. Refresh and try again.');
       return;
@@ -374,7 +284,7 @@ const QualityReportPage = () => {
   };
 
   const viewOverall = async (record) => {
-    const payload = buildDrawingReport(record.id);
+    const payload = buildDrawingReport(record.id, reportData);
     if (!payload) {
       setMessage('That report is no longer available. Refresh and try again.');
       return;
@@ -388,7 +298,7 @@ const QualityReportPage = () => {
   };
 
   const viewDispatch = async (record) => {
-    const payload = buildDispatchReport(record.id);
+    const payload = buildDispatchReport(record.id, reportData);
     if (!payload) {
       setMessage('That report is no longer available. Refresh and try again.');
       return;
@@ -500,17 +410,6 @@ const QualityReportPage = () => {
     }
   };
 
-  if (!session) {
-    return (
-      <ConnectionPanel
-        onConnected={({ session: next }) => {
-          setSession(next);
-          setMessage('');
-        }}
-      />
-    );
-  }
-
   return (
     <section className="page-section quality-report-page">
       <div className="page-header">
@@ -608,8 +507,8 @@ const QualityReportPage = () => {
             return <label className="report-filter-dropdown__select" key={filter.key}><span>{filter.label}</span><select className="action-select" aria-label={filter.label} value={value} onChange={(event) => setter(event.target.value)}><option value="">{filter.placeholder}</option>{filter.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>;
           })}
           {(qualityDimensions.some((filter) => filter.key === 'quality_customer') || qualityDimensions.some((filter) => filter.key === 'quality_employee')) && <label className="report-filter-dropdown__select"><span>Group By</span><select className="action-select" aria-label="Group by" value={groupBy} onChange={(event) => setGroupBy(event.target.value)}><option value="">No grouping</option>{qualityDimensions.filter((filter) => ['quality_customer', 'quality_employee'].includes(filter.key)).map((filter) => <option key={filter.key} value={filter.key}>Group by {filter.label}</option>)}</select></label>}
-        </ReportFilterPanel>        <button type="button" className="button-secondary button-small" onClick={exportQualityRows}>Download PDF</button>
-        <button type="button" className="button-secondary button-small" onClick={exportQualityExcel}>Download Excel</button>
+        </ReportFilterPanel>                <button type="button" className="button-secondary button-small" onClick={exportQualityRows} disabled={loading || Boolean(error)}>Download PDF</button>
+        <button type="button" className="button-secondary button-small" onClick={exportQualityExcel} disabled={loading || Boolean(error)}>Download Excel</button>
         <button type="button" className="button-secondary button-small" onClick={() => window.print()}>Print</button>
         <button type="button" className="button-secondary button-small" onClick={refresh} disabled={busy}>
           {busy ? 'Syncing...' : 'Refresh'}
@@ -623,19 +522,13 @@ const QualityReportPage = () => {
           Auto refresh ({AUTO_REFRESH_MS / 1000}s)
         </label>
         {lastSync ? <span className="field-hint">Updated {lastSync.toLocaleTimeString('en-IN')}</span> : null}
-        <button type="button" className="button-secondary button-small" onClick={signOut}>
-          Logout
-        </button>
       </div>
 
-      {session.employee ? (
-        <p className="field-hint">
-          Connected to {session.url} as {session.employee.name} ({session.employee.role})
-        </p>
-      ) : null}
+      {loading ? <p role="status" className="field-hint">Loading quality reports from PostgreSQL...</p> : null}
       {error ? <p className="form-error">{error}</p> : null}
       {message ? <p className="field-hint">{message}</p> : null}
       {filterError ? <p className="form-error" role="alert">{filterError}</p> : null}
+      {!loading && !error && <>
       {activeQualityCriteria.length > 0 ? <p className="field-hint">Filters: {activeQualityCriteria.join(' | ')}</p> : null}
       {excludedUndated.length > 0 ? <details className="content-block"><summary>{excludedUndated.length} records excluded because {dateField} is missing or invalid</summary><ul>{excludedUndated.map((record) => <li key={record.id}>{record.drawing_no || record.dispatch_no || record.id}: no valid {dateField}</li>)}</ul></details> : null}
       {qualityGroupSummary.length > 0 ? <div className="content-block"><h3 className="block-title">{activeGroup.label}-wise Summary</h3><table className="history-table report-table"><thead><tr><th>{activeGroup.label}</th><th>Records</th></tr></thead><tbody>{qualityGroupSummary.map((entry) => <tr key={entry.name}><td>{entry.name}</td><td>{entry.count}</td></tr>)}</tbody></table></div> : null}
@@ -720,6 +613,7 @@ const QualityReportPage = () => {
           </table>
         </div>
       )}
+      </>}
 
       {report ? <ReportViewer report={report} onClose={() => setReport(null)} /> : null}
     </section>

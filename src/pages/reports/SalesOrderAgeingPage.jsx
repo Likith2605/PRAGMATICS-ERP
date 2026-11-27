@@ -1,15 +1,44 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { readLocalStorageList } from '../../utils/reportData.js';
+import { listSalesOrders } from '../../services/salesOrderApi.js';
+import { listDeliveryChallans } from '../../services/deliveryChallanApi.js';
 import { calculateSalesOrderAgeing, formatMoneyByCurrency, formatQuantityMap, sumQuantityMaps } from '../../utils/salesOrderAgeing.js';
 
 const money = (value) => Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 
 const SalesOrderAgeingPage = () => {
+  const [orders, setOrders] = useState([]);
+  const [challans, setChallans] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    Promise.all([
+      listSalesOrders().catch((err) => {
+        console.warn('Failed to load sales orders for ageing report:', err);
+        return [];
+      }),
+      listDeliveryChallans().catch((err) => {
+        console.warn('Failed to load delivery challans for ageing report:', err);
+        return [];
+      })
+    ]).then(([soList, dcList]) => {
+      if (!active) return;
+      setOrders(Array.isArray(soList) ? soList : []);
+      setChallans(Array.isArray(dcList) ? dcList : []);
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const { rows, exceptions } = useMemo(() => calculateSalesOrderAgeing(
-    readLocalStorageList('salesOrderHistory'),
-    readLocalStorageList('deliveryChallanHistory')
-  ), []);
+    orders,
+    challans
+  ), [orders, challans]);
   const customers = [...new Set(rows.map((row) => row.customerName).filter((value) => value && value !== '-'))].sort();
   const statuses = [...new Set(rows.map((row) => row.orderStatus).filter(Boolean))].sort();
   const buckets = ['0–30 days', '31–60 days', '61–90 days', '90+ days'];
@@ -32,6 +61,7 @@ const SalesOrderAgeingPage = () => {
     <div className="page-container" style={{ padding: '20px 24px' }}>
       <ReportRegister
         title="Sales Order Status & Ageing"
+        subTitle={loading ? 'Loading sales orders and delivery challans from PostgreSQL...' : undefined}
         showPreparedBy={false}
         filename={`Sales-Order-Ageing-${new Date().toISOString().slice(0, 10)}`}
         dateField="orderDate"

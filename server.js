@@ -11,7 +11,30 @@ import moduleRecordsRouter from './server/moduleRecordsRoutes.js';
 import customerPurchaseOrderRouter from './server/customerPurchaseOrderRoutes.js';
 import qualityRouter from './server/qualityRoutes.js';
 import tallyExportRouter from './server/tallyExportRoutes.js';
-import { checkDatabase, closeDatabase, runMigrations, getMigrationStatus } from './server/database.js';
+import enquiryRouter from './server/enquiryRoutes.js';
+import quotationRouter from './server/quotationRoutes.js';
+import salesOrderRouter from './server/salesOrderRoutes.js';
+import deliveryChallanRouter from './server/deliveryChallanRoutes.js';
+import customerInvoiceRouter from './server/customerInvoiceRoutes.js';
+import exportInvoiceRouter from './server/exportInvoiceRoutes.js';
+import procurementIntakeRouter from './server/procurementIntakeRoutes.js';
+import materialReceiptRouter from './server/materialReceiptRoutes.js';
+import storeRouter from './server/storeRoutes.js';
+import inventoryRouter from './server/inventoryRoutes.js';
+import masterRouter from './server/masterRoutes.js';
+import debitNoteRouter from './server/debitNoteRoutes.js';
+import commercialReturnsRouter from './server/commercialReturnRoutes.js';
+import databaseBackupRouter from './server/databaseBackupRoutes.js';
+import bomRouter from './server/bomRoutes.js';
+import productionRouter from './server/productionRoutes.js';
+import routingRouter from './server/routingRoutes.js';
+import recycleBinRouter from './server/recycleBinRoutes.js';
+import purchaseRequestRouter from './server/purchaseRequestRoutes.js';
+import advanceRouter from './server/advanceRoutes.js';
+import availabilityCheckRouter from './server/availabilityCheckRoutes.js';
+import employeeRouter from './server/employeeRoutes.js';
+import departmentRoleCatalogRouter from './server/departmentRoleCatalogRoutes.js';
+import { checkDatabase, closeDatabase, runMigrations, getMigrationStatus, hasDatabaseConfiguration } from './server/database.js';
 import { startQualityPullSync } from './server/qualityPullSync.js';
 import { validateEmail } from './shared/fieldValidation.js';
 import { authRouter, authenticateRequest, requireDepartmentPermission } from './server/auth.js';
@@ -22,9 +45,14 @@ const __dirname = dirname(__filename);
 
 const app = express();
 app.use(cors());
+let databaseReady = !hasDatabaseConfiguration();
 // Base64 file payloads inflate ~33%; the limit must fit MAX_FILE_BYTES (50 MB)
 // uploads for /api/files alongside the existing ERP state records.
 app.use(express.json({ limit: '120mb' }));
+app.use('/api', (req, res, next) => {
+    if (req.path === '/health' || databaseReady) return next();
+    return res.status(503).json({ error: 'ERP database migrations are not ready yet. Retry shortly.' });
+});
 app.use('/api/auth', authRouter);
 
 let transporter = null;
@@ -105,7 +133,7 @@ app.post('/api/send-quotation-email', authenticateRequest, requireDepartmentPerm
 });
 
 app.get('/api/health', async (_req, res) => {
-    let database = { configured: Boolean(process.env.DATABASE_URL), connected: false };
+    let database = { configured: hasDatabaseConfiguration(), connected: false };
     if (database.configured) {
         try {
             database.connected = await checkDatabase();
@@ -119,6 +147,7 @@ app.get('/api/health', async (_req, res) => {
         status: degraded ? 'degraded' : 'ok',
         smtp: Boolean(process.env.SMTP_HOST),
         database,
+        ready: databaseReady && (!database.configured || database.connected),
         version: '1.1.0'
     });
 });
@@ -126,7 +155,30 @@ app.get('/api/health', async (_req, res) => {
 // All ERP data routes require a server issued identity. UI role checks are
 // only for presentation; sensitive mutations also use requireAdmin at routes.
 app.use('/api', authenticateRequest);
+app.use('/api/employees', employeeRouter);
+app.use('/api/organization-catalogs', departmentRoleCatalogRouter);
 app.use('/api/ballooning', requireDepartmentPermission('ballooning.view', 'ballooning.manage'), ballooningRouter);
+app.use('/api/enquiries', enquiryRouter);
+app.use('/api/quotations', requireDepartmentPermission('sales.quotation'), quotationRouter);
+app.use('/api/sales-orders', requireDepartmentPermission('sales_order.view'), salesOrderRouter);
+app.use('/api/delivery-challans', requireDepartmentPermission('delivery.view', 'delivery.create'), deliveryChallanRouter);
+app.use('/api/customer-invoices', requireDepartmentPermission('invoice.view'), customerInvoiceRouter);
+app.use('/api/export-invoices', requireDepartmentPermission('invoice.view'), exportInvoiceRouter);
+app.use('/api/procurement', procurementIntakeRouter);
+app.use('/api/store', storeRouter);
+app.use('/api/inventory', inventoryRouter);
+app.use('/api/masters', masterRouter);
+app.use('/api/debit-notes', debitNoteRouter);
+app.use('/api/commercial-returns', commercialReturnsRouter);
+app.use('/api/database-backups', databaseBackupRouter);
+app.use('/api/bom', bomRouter);
+app.use('/api/production', productionRouter);
+app.use('/api/routing', routingRouter);
+app.use('/api/recycle-bin', recycleBinRouter);
+app.use('/api/purchase-requests', purchaseRequestRouter);
+app.use('/api/advances', advanceRouter);
+app.use('/api/availability-checks', availabilityCheckRouter);
+app.use('/api', materialReceiptRouter);
 app.use('/api', erpStateRouter);
 app.use('/api/files', fileRouter);
 app.use('/api/records', moduleRecordsRouter);
@@ -169,7 +221,7 @@ app.use((req, res, next) => {
 app.use((error, _req, res, _next) => {
     const status = Number(error.status) >= 400 && Number(error.status) < 500 ? Number(error.status) : 500;
     if (status >= 500) console.error('API error:', error.message);
-    res.status(status).json({ error: status === 500 ? 'Internal server error' : error.message });
+    res.status(status).json({ error: status === 500 ? 'Internal server error' : error.message, ...(error.current ? { current: error.current } : {}) });
 });
 
 const HOST = process.env.HOST || '0.0.0.0';
@@ -178,15 +230,17 @@ const server = app.listen(PORT, HOST, async() => {
     console.log(`VYAVASTA ERP running on http://${HOST}:${PORT}`);
     console.log(`Local access: http://localhost:${PORT}`);
     console.log(`SMTP configured: ${Boolean(process.env.SMTP_HOST)}`);
-    if (process.env.DATABASE_URL) {
+    if (hasDatabaseConfiguration()) {
         try {
             await runMigrations();
+            databaseReady = true;
             console.log('PostgreSQL migrations are up to date.');
             // Two-way sync with the mobile QC server: periodically pull
             // checks/measurements/dispatches recorded on phones into the
             // ERP Quality Module. Disable with QC_PULL_ENABLED=0.
             if (process.env.QC_PULL_ENABLED !== '0') startQualityPullSync();
         } catch (error) {
+            databaseReady = false;
             console.error('PostgreSQL migration startup check failed:', error.message);
         }
     } else {

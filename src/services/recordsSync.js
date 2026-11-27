@@ -33,7 +33,23 @@ const getApiBase = () => {
 const API_BASE = String(getApiBase()).replace(/\/$/, '');
 
 // Must match RECORD_KEYS in server/moduleRecordsRoutes.js
-const MODULE_KEYS = ['inventoryItems', 'stockTransactions', 'productionDispatchRequests'];
+const MODULE_KEYS = [
+    'inventoryItems', 'stockTransactions', 'productionDispatchRequests',
+    'materialArrivals', 'qualityChecks', 'rejectionReports'
+];
+// Workflow ledgers historically used business numbers instead of `id`.
+// Normalize them to a stable record id before diffing so each inspection,
+// arrival and rejection is its own versioned PostgreSQL row.
+const RECORD_ID_FIELDS = {
+    materialArrivals: 'arrivalNumber',
+    qualityChecks: 'qcNumber',
+    rejectionReports: 'rejectionNumber'
+};
+const normalizeRecord = (key, record) => {
+    if (!record || typeof record !== 'object' || record.id || !RECORD_ID_FIELDS[key]) return record;
+    const id = record[RECORD_ID_FIELDS[key]];
+    return id ? { ...record, id: String(id) } : record;
+};
 const VERSIONS_STORAGE_KEY = 'erp_record_versions';
 const RETRY_INTERVAL_MS = 2000;
 const SAVE_DEBOUNCE_MS = 250;
@@ -78,7 +94,7 @@ const versionsFor = (key) => {
 const readLocalArray = (key) => {
     try {
         const parsed = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(parsed) ? parsed : [];
+        return Array.isArray(parsed) ? parsed.map((record) => normalizeRecord(key, record)) : [];
     } catch {
         return [];
     }
@@ -113,12 +129,24 @@ const canReadModule = (key) => isAdmin() || (key === 'productionDispatchRequests
     ? hasPermission('job_card.view') || hasPermission('delivery.view')
     : key === 'stockTransactions'
         ? hasPermission('inventory.transaction.view') || hasPermission('material_issue.view')
-        : hasPermission('inventory.view'));
+        : key === 'materialArrivals'
+            ? hasPermission('receipt.view') || hasPermission('material_issue.view')
+            : key === 'qualityChecks'
+                ? hasPermission('production.qc.view') || hasPermission('receipt.view')
+                : key === 'rejectionReports'
+                    ? hasPermission('rejection.view') || hasPermission('receipt.view')
+                    : hasPermission('inventory.view'));
 const canWriteModule = (key) => isAdmin() || (key === 'productionDispatchRequests'
     ? hasPermission('job_card.dispatch_request') || hasPermission('delivery.create')
     : key === 'stockTransactions'
         ? ['inventory.adjust','material_issue.create','material_return.create','receipt.create','production.entry.create'].some(hasPermission)
-        : hasPermission('inventory.adjust'));
+        : key === 'materialArrivals'
+            ? ['arrival.create','receipt.create','material_issue.confirm'].some(hasPermission)
+            : key === 'qualityChecks'
+                ? hasPermission('production.qc.manage')
+                : key === 'rejectionReports'
+                    ? hasPermission('rejection.forward') || hasPermission('receipt.create')
+                    : hasPermission('inventory.adjust'));
 const isPermissionError = (error) => error?.status === 401 || error?.status === 403;
 
 const request = async(path, options = {}) => {
@@ -165,7 +193,7 @@ const mergeServerRecords = (key, serverRecords) => {
         const id = String(record.id);
         serverIds.add(id);
         versionMap[id] = record.version;
-        return record.data;
+        return normalizeRecord(key, record.data);
     });
 
     // Records deleted on another device (we knew a version, server dropped it)
@@ -174,7 +202,7 @@ const mergeServerRecords = (key, serverRecords) => {
         if (id && !serverIds.has(id)) merged.push(record); // never synced — keep
     }
 
-    const serverJsonById = new Map(serverRecords.map((record) => [String(record.id), JSON.stringify(record.data)]));
+    const serverJsonById = new Map(serverRecords.map((record) => [String(record.id), JSON.stringify(normalizeRecord(key, record.data))]));
     lastSynced.set(key, serverJsonById);
 
     if (merged.length || readLocalArray(key).length) writeLocalArray(key, merged);
@@ -348,18 +376,19 @@ export const saveRecordsToServer = async(key) => {
 /** Atomically create a module record. A duplicate id is returned as a conflict. */
 export const createRecordOnServer = async(key, record) => {
     if (!MODULE_KEYS.includes(key)) throw new Error(`Unsupported shared record key '${key}'.`);
-    const id = String(record?.id || '');
+    const normalized = normalizeRecord(key, record);
+    const id = String(normalized?.id || '');
     if (!id) throw new Error('A shared record needs an id.');
     const payload = await request(`/records/${encodeURIComponent(key)}`, {
         method: 'PUT',
-        body: JSON.stringify({ records: [{ id, data: record, version: 0 }], deletes: [], updatedBy: getUpdatedBy() })
+        body: JSON.stringify({ records: [{ id, data: normalized, version: 0 }], deletes: [], updatedBy: getUpdatedBy() })
     });
     if (!(payload.saved || []).some((saved) => String(saved.id) === id)) {
         await pullRecordsFromServer();
         throw new Error(`A record with id '${id}' already exists.`);
     }
     await pullRecordsFromServer();
-    return record;
+    return normalized;
 };
 
 /** Update a record using the server version as a compare-and-swap guard. */

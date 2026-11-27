@@ -6,15 +6,26 @@
  *   plus input validation and a sanity check that /api/state still works
  *   after mounting the new router in server.js.
  *
- * Usage: node tests/file-api.test.mjs   (DATABASE_URL required)
+ * Usage: ERP_TEST_DATABASE_URL=<isolated test database> node tests/file-api.test.mjs
  */
 
 import 'dotenv/config';
 import { spawn } from 'node:child_process';
+import pg from 'pg';
 
-if (!process.env.DATABASE_URL) {
-  console.log('SKIP: DATABASE_URL is not configured.');
-  process.exit(0);
+const databaseUrl = process.env.ERP_TEST_DATABASE_URL;
+if (!databaseUrl) throw new Error('ERP_TEST_DATABASE_URL is required; refusing DATABASE_URL.');
+if (decodeURIComponent(new URL(databaseUrl).pathname.replace(/^\/+/, '')) !== 'vyavastha_test') {
+  throw new Error('Refusing to run: ERP_TEST_DATABASE_URL must point exactly to vyavastha_test.');
+}
+const testPool = new pg.Pool({ connectionString: databaseUrl });
+try {
+  const identity = await testPool.query('SELECT current_database() AS name');
+  if (identity.rows[0]?.name !== 'vyavastha_test') {
+    throw new Error('Refusing database writes: current_database() is not exactly vyavastha_test.');
+  }
+} finally {
+  await testPool.end();
 }
 
 const PORT = 3324;
@@ -47,8 +58,12 @@ const request = async (path, options = {}) => {
 let serverProcess = null;
 const startServer = () =>
   new Promise((resolve, reject) => {
+    const childEnv = {};
+    for (const key of Object.keys(process.env)) {
+      if (key !== 'DATABASE_URL') childEnv[key] = process.env[key];
+    }
     serverProcess = spawn(process.execPath, ['server.js'], {
-      env: { ...process.env, PORT: String(PORT) },
+      env: { ...childEnv, ERP_TEST_MODE: '1', ERP_TEST_DATABASE_URL: databaseUrl, PORT: String(PORT) },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     serverProcess.stdout.on('data', () => {});
@@ -57,10 +72,15 @@ const startServer = () =>
     setTimeout(resolve, 800);
   });
 
-const stopServer = () => {
+const stopServer = async() => {
   if (serverProcess) {
-    serverProcess.kill();
+    const processToStop = serverProcess;
     serverProcess = null;
+    await new Promise((resolve) => {
+      processToStop.once('exit', resolve);
+      processToStop.kill();
+      setTimeout(resolve, 3000).unref();
+    });
   }
 };
 
@@ -69,6 +89,8 @@ const CONTENT = 'Hello PostgreSQL file storage — नमस्ते 123';
 const CONTENT_B64 = Buffer.from(CONTENT, 'utf8').toString('base64');
 
 try {
+  const foreignServer = await fetch(`${BASE_URL}/api/health`, { signal: AbortSignal.timeout(1500) }).then(() => true).catch(() => false);
+  if (foreignServer) throw new Error(`Port ${PORT} is already serving an ERP server; refusing to run against it.`);
   section('1. Start server & health');
   await startServer();
   let ready = false;
@@ -140,7 +162,7 @@ try {
   fail('Fatal test exception', err.message);
   console.error(err);
 } finally {
-  stopServer();
+  await stopServer();
 }
 
 console.log(`\n${'═'.repeat(60)}`);

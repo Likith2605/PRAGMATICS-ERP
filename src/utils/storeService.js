@@ -2,14 +2,25 @@ import { generateSequentialNumber, saveSequenceCounter } from './storeSequencer.
 import {
   hasPermission,
   isAdmin,
-  getCurrentUserInfo,
-  normalizeDepartment,
-  normalizeRoleKey,
-  roleLabelForRoleKey
+  getCurrentUserInfo
 } from './permissions.js';
+import { getCachedMasters } from '../services/masterApi.js';
+import { getCachedJobCards, getCachedBoms } from '../services/productionAuthorityCache.js';
+import {
+  createStockTransfer as createStockTransferApi,
+  createStockVerification as createStockVerificationApi,
+  getStockTransfer as getStockTransferApi,
+  getStockVerification as getStockVerificationApi,
+  listInventoryItems as listInventoryItemsApi,
+  listStockTransfers as listStockTransfersApi,
+  listStockVerifications as listStockVerificationsApi,
+  resolveStockTransfer as resolveStockTransferApi,
+  resolveStockVerification as resolveStockVerificationApi
+} from '../services/inventoryApi.js';
+import { appendStoreAudit, getStoreAudit } from '../services/storeApi.js';
+import { listInventoryLots } from '../services/inventoryApi.js';
 
 const LS = {
-  employees: 'employees',
   materialRequests: 'materialRequests',
   storeIssueHistory: 'storeIssueHistory',
   materialReturnHistory: 'materialReturnHistory',
@@ -18,13 +29,66 @@ const LS = {
   storePurchaseRequests: 'storePurchaseRequests',
   inventoryItems: 'inventoryItems',
   stockTransactions: 'stockTransactions',
-  productionJobCards: 'productionJobCards',
   supplierPOHistory: 'supplierPOHistory',
   storeGRNs: 'storeGRNs',
   stockTransfers: 'stockTransfers',
   stockVerifications: 'stockVerifications',
   inventoryBatches: 'inventoryBatches',
-  machines: 'machines'
+};
+
+let inventoryBatchAuthorityCache = [];
+let inventoryBatchesLoadPromise = null;
+let inventoryItemAuthorityCache = [];
+let inventoryItemsLoadPromise = null;
+
+export const hydrateInventoryItemAuthority = async () => {
+  if (inventoryItemsLoadPromise) return inventoryItemsLoadPromise;
+  inventoryItemsLoadPromise = listInventoryItemsApi()
+    .then((rows) => {
+      inventoryItemAuthorityCache = (Array.isArray(rows) ? rows : []).map((row) => ({
+        ...(row.payload || {}),
+        id: row.payload?.id || row.item_code || row.payload?.itemCode || '',
+        itemCode: row.item_code || row.payload?.itemCode || '',
+        itemName: row.material_name || row.payload?.itemName || '',
+        description: row.payload?.description || row.payload?.itemDescription || '',
+        category: row.category || row.payload?.category || 'Standard Part',
+        unit: row.unit || row.payload?.unit || 'Nos',
+        specification: row.payload?.specification || row.payload?.spec || '',
+        spec: row.payload?.spec || row.payload?.specification || '',
+        hsnSac: row.hsn_code || row.payload?.hsnSac || '',
+        currentQty: Number(row.current_qty) || 0,
+        reservedQty: Number(row.payload?.reservedQty) || 0,
+        recordVersion: Number(row.version) || 1
+      }));
+      return inventoryItemAuthorityCache;
+    })
+    .finally(() => { inventoryItemsLoadPromise = null; });
+  return inventoryItemsLoadPromise;
+};
+
+export const hydrateInventoryBatchAuthority = async () => {
+  if (inventoryBatchesLoadPromise) return inventoryBatchesLoadPromise;
+  inventoryBatchesLoadPromise = listInventoryLots()
+    .then((rows) => {
+      inventoryBatchAuthorityCache = (Array.isArray(rows) ? rows : []).map((row) => ({
+        ...(row.payload || {}),
+        id: row.id,
+        itemCode: row.item_code || row.payload?.itemCode || '',
+        itemName: row.payload?.itemName || row.item_code || '',
+        batchNumber: row.batch_number || row.payload?.batchNumber || '',
+        supplierBatchNumber: row.payload?.supplierBatchNumber || row.batch_number || '',
+        lotNumber: row.lot_number || row.payload?.lotNumber || '',
+        availableQty: Number(row.available_qty) || 0,
+        qtyReceived: Number(row.initial_qty) || 0,
+        mfgDate: String(row.mfg_date || '').slice(0, 10),
+        expiryDate: String(row.expiry_date || '').slice(0, 10),
+        unit: row.unit || 'Nos',
+        status: row.status || 'Active'
+      }));
+      return inventoryBatchAuthorityCache;
+    })
+    .finally(() => { inventoryBatchesLoadPromise = null; });
+  return inventoryBatchesLoadPromise;
 };
 
 export const STATUS = {
@@ -153,7 +217,6 @@ const removeKey = (key) => {
 const QUOTA_RECOVERY_STEPS = [
   { label: 'kept only the latest automatic backup snapshot', run: () => trimListKey('erpDailySnapshots', 1) },
   { label: 'cleared the automatic backup snapshots', run: () => removeKey('erpDailySnapshots') },
-  { label: 'trimmed the audit log to its latest 500 entries', run: () => trimListKey(LS.storeAuditLog, 500) },
   { label: 'trimmed notifications to their latest 200 entries', run: () => trimListKey(LS.notifications, 200) }
 ];
 
@@ -251,42 +314,11 @@ export const dateOnly = (s) => {
 
 /* -------------------------------- seeding -------------------------------- */
 
-const DEFAULT_EMPLOYEES = [
-  { id: 'emp-1', employeeId: 'EMP-001', name: 'Production Manager', email: 'prodmanager@gmail.com', password: 'Prod@1234', mobile: '', department: 'Production Department', designation: 'Production Manager', roleKey: 'production_manager', role: 'Production Manager', active: true, joinedDate: '' },
-  { id: 'emp-2', employeeId: 'EMP-002', name: 'Mohan Kumar', email: 'mohan@gmail.com', password: 'Store@1234', mobile: '9845012345', department: 'Store Department', designation: 'Store Manager', roleKey: 'store_manager', role: 'Store Manager', active: true, joinedDate: '' },
-  { id: 'emp-3', employeeId: 'EMP-023', name: 'Ravi Kumar', email: 'ravi@gmail.com', password: 'Ravi@1234', mobile: '9845067890', department: 'Production Department', designation: 'Production Engineer', roleKey: 'production_employee', role: 'Production Employee', active: true, joinedDate: '' },
-  { id: 'emp-4', employeeId: 'EMP-004', name: 'Meena Devi', email: 'meena@gmail.com', password: 'Meena@1234', mobile: '9740011122', department: 'Production Department', designation: 'Quality Inspector', roleKey: 'production_employee', role: 'Production Employee', active: true, joinedDate: '' },
-  { id: 'emp-5', employeeId: 'EMP-005', name: 'Suresh Kumar', email: 'suresh@gmail.com', password: 'Store@1234', mobile: '9632011223', department: 'Store Department', designation: 'Store Assistant', roleKey: 'store_employee', role: 'Store Employee', active: true, joinedDate: '' },
-  { id: 'emp-6', employeeId: 'EMP-006', name: 'Priya Raman', email: 'priya@gmail.com', password: 'Prod@1234', mobile: '9632011224', department: 'Production Department', designation: 'Production Supervisor', roleKey: 'production_employee', role: 'Production Employee', active: true, joinedDate: '' },
-  { id: 'emp-7', employeeId: 'EMP-007', name: 'Anand Krishnan', email: 'anand@gmail.com', password: 'Purchase@1234', mobile: '9532011225', department: 'Purchase Department', designation: 'Purchase Executive', roleKey: 'purchase_employee', role: 'Purchase Employee', active: true, joinedDate: '' },
-  { id: 'emp-8', employeeId: 'EMP-008', name: 'Kavitha Nair', email: 'kavitha@gmail.com', password: 'Sales@1234', mobile: '9432011226', department: 'Sales Department', designation: 'Sales Executive', roleKey: 'sales_employee', role: 'Sales Employee', active: true, joinedDate: '' }
-];
-
-// One-time, idempotent migration of legacy employee records to the canonical
-// 5-department + role model. Preserves credentials, names and IDs.
-const migrateLegacyEmployeeData = () => {
-  const list = readLS(LS.employees, []);
-  if (!Array.isArray(list) || list.length === 0) return;
-  let changed = false;
-  const next = list.map((e) => {
-    const department = normalizeDepartment(e.department);
-    const roleKey = normalizeRoleKey(e.roleKey) || '';
-    const role = e.role || roleLabelForRoleKey(roleKey || undefined, department);
-    if (e.department !== department || e.roleKey !== roleKey || e.role !== role) changed = true;
-    return { ...e, department, roleKey, role: role || roleLabelForRoleKey(roleKey || undefined, department) };
-  });
-  if (changed) writeLS(LS.employees, next);
-};
-
 export const ensureSeededData = () => {
-  if (!localStorage.getItem(LS.employees)) writeLS(LS.employees, DEFAULT_EMPLOYEES);
-  migrateLegacyEmployeeData();
-  if (!localStorage.getItem(LS.machines)) writeLS(LS.machines, DEFAULT_MACHINES);
   [
     LS.materialRequests,
     LS.storeIssueHistory,
     LS.materialReturnHistory,
-    LS.storeAuditLog,
     LS.notifications,
     LS.storePurchaseRequests,
     LS_HT_OUTSOURCE,
@@ -305,30 +337,6 @@ export const ensureSeededData = () => {
   ].forEach((k) => {
     if (!localStorage.getItem(k)) writeLS(k, []);
   });
-};
-
-/* ------------------------------- auth/login ------------------------------- */
-
-// Employee Portal login: email is the Login ID, password is the Login Password
-// set by the administrator on the Employee Master page.
-export const authenticateEmployee = (email, password) => {
-  try {
-    const list = readLS(LS.employees, []);
-    const clean = String(email || '').trim().toLowerCase();
-    return (
-      list.find(
-        (e) =>
-          e &&
-          e.active !== false &&
-          e.email &&
-          e.email.trim().toLowerCase() === clean &&
-          e.password === password
-      ) || null
-    );
-  } catch (err) {
-    console.error('authenticateEmployee failed', err);
-    return null;
-  }
 };
 
 /* --------------------------------- numbers -------------------------------- */
@@ -362,12 +370,23 @@ export const appendAuditLog = ({ action, reference = '', details = '' }) => {
     reference,
     details
   };
-  const logs = readLS(LS.storeAuditLog, []);
-  writeLS(LS.storeAuditLog, [entry, ...logs].slice(0, 500));
+  appendStoreAudit({ action, reference, details })
+    .then(() => {
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('erp-store-audit-updated'));
+    })
+    .catch((error) => {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('erp-audit-write-error', {
+          detail: { message: `Audit event could not be saved to PostgreSQL: ${error.message}` }
+        }));
+      } else {
+        console.error('Audit event could not be saved to PostgreSQL:', error);
+      }
+    });
   return entry;
 };
 
-export const getAuditLog = () => readLS(LS.storeAuditLog, []);
+export const getAuditLog = (issueNumber, limit = 500) => getStoreAudit(issueNumber, limit);
 
 /**
  * Publish a notification. `docId` / `docName` optionally reference a file in
@@ -403,19 +422,7 @@ export const markAllNotificationsRead = () => {
   writeLS(LS.notifications, list.map((n) => ({ ...n, read: true })));
 };
 
-/* ------------------------------- employees -------------------------------- */
-
-export const getEmployees = () => readLS(LS.employees, []);
-
-const DEFAULT_MACHINES = [
-  { id: 'mc-1', machineId: 'MC001', name: 'CNC Turning Machine 01', type: 'CNC', workCenter: 'Turning', department: 'Production Department', location: 'Shop Floor 1', capacity: '1 shift', status: 'Active', remarks: '' },
-  { id: 'mc-2', machineId: 'MC002', name: 'CNC Turning Machine 02', type: 'CNC', workCenter: 'Turning', department: 'Production Department', location: 'Shop Floor 1', capacity: '1 shift', status: 'Active', remarks: '' },
-  { id: 'mc-3', machineId: 'MC003', name: 'VMC Machine 01', type: 'VMC', workCenter: 'Milling', department: 'Production Department', location: 'Shop Floor 1', capacity: '1 shift', status: 'Active', remarks: '' },
-  { id: 'mc-4', machineId: 'MC004', name: 'Surface Grinder 01', type: 'Grinder', workCenter: 'Grinding', department: 'Production Department', location: 'Shop Floor 2', capacity: '1 shift', status: 'Active', remarks: '' }
-];
-
-export const getMachines = () => readLS(LS.machines, DEFAULT_MACHINES);
-export const saveMachines = (list) => writeLS(LS.machines, list);
+export const getMachines = () => getCachedMasters('machines');
 export const generateMachineId = () => {
   const list = getMachines();
   let max = 0;
@@ -459,32 +466,14 @@ export const machineLabel = (m) => {
   return m.machineId && m.name ? `${m.machineId} - ${m.name}` : (m.name || m.machineId || '');
 };
 
-export const saveEmployees = (list) => {
-  writeLS(LS.employees, list);
-  return list;
-};
-
-export const generateEmployeeId = () => {
-  const list = getEmployees();
-  let max = 0;
-  list.forEach((e) => {
-    const m = String(e.employeeId || '').match(/(\d+)\s*$/);
-    if (m) {
-      const n = parseInt(m[1], 10);
-      if (!Number.isNaN(n) && n > max) max = n;
-    }
-  });
-  const next = max + 1;
-  return {
-    employeeId: `EMP-${String(next).padStart(3, '0')}`,
-    next
-  };
-};
-
 /* ------------------------------ inventory/transactions ------------------------------ */
 
-export const getInventoryItems = () => readLS(LS.inventoryItems, []);
-export const saveInventoryItems = (items) => writeLS(LS.inventoryItems, items);
+export const getInventoryItems = () => inventoryItemAuthorityCache;
+export const saveInventoryItems = (items) => {
+  inventoryItemAuthorityCache = Array.isArray(items) ? items : [];
+  writeLS(LS.inventoryItems, inventoryItemAuthorityCache);
+  return inventoryItemAuthorityCache;
+};
 export const getStockTransactions = () => readLS(LS.stockTransactions, []);
 export const saveStockTransactions = (tx) => writeLS(LS.stockTransactions, tx);
 
@@ -503,7 +492,6 @@ const INVENTORY_REFERENCE_KEYS = [
   'employeeIssueLog',
   'materialRequests',
   'productionRequirements',
-  'productionJobCards',
   'productionDispatchRequests',
   'qualityChecks',
   'inventoryBatches',
@@ -611,8 +599,7 @@ export const getMaterialRequests = () => readLS(LS.materialRequests, []);
 
 const saveMaterialRequests = (list) => writeLS(LS.materialRequests, list);
 
-export const getJobCards = () => readLS(LS.productionJobCards, []);
-export const saveJobCards = (list) => writeLS(LS.productionJobCards, list);
+export const getJobCards = () => getCachedJobCards();
 
 export const getStoreIssues = () => readLS(LS.storeIssueHistory, []);
 export const getMaterialReturns = () => readLS(LS.materialReturnHistory, []);
@@ -716,11 +703,19 @@ export const getMaterialShortages = (mr) => {
  * Scope = the selected Job Card and/or Sales Order. Cancelled / Rejected
  * requests never count; `excludeMrNumber` skips the request being edited.
  */
-export const getMRScopeQtyMaps = ({ salesOrderRef = '', jobCardNumber = '', excludeMrNumber = '' } = {}) => {
+export const getMRScopeQtyMaps = ({
+  salesOrderRef = '',
+  jobCardNumber = '',
+  excludeMrNumber = '',
+  requests,
+  issues
+} = {}) => {
   const so = String(salesOrderRef || '').trim();
   const jc = String(jobCardNumber || '').trim();
   if (!so && !jc) return { requested: {}, issued: {} };
-  const inScope = getMaterialRequests().filter((m) =>
+  const requestRows = Array.isArray(requests) ? requests : getMaterialRequests();
+  const issueRows = Array.isArray(issues) ? issues : getStoreIssues();
+  const inScope = requestRows.filter((m) =>
     m &&
     String(m.mrNumber || '') !== String(excludeMrNumber || '') &&
     ![STATUS.CANCELLED, STATUS.REJECTED].includes(m.status) &&
@@ -733,7 +728,7 @@ export const getMRScopeQtyMaps = ({ salesOrderRef = '', jobCardNumber = '', excl
   }));
   const scopeNos = new Set(inScope.map((m) => m.mrNumber));
   const issued = {};
-  getStoreIssues().filter((i) => scopeNos.has(i.mrNumber)).forEach((i) => (i.items || []).forEach((it) => {
+  issueRows.filter((i) => scopeNos.has(i.mrNumber)).forEach((i) => (i.items || []).forEach((it) => {
     const k = String(it.materialId || '');
     issued[k] = (issued[k] || 0) + (Number(it.currentIssueQty) || 0);
   }));
@@ -1017,6 +1012,7 @@ export const deleteMaterialRequest = (mrNumber) => {
 };
 
 export const markPendingStore = (mrNumber) => {
+  if (!hasPermission('material_issue.confirm')) throw new Error('Permission denied: material_issue.confirm');
   const list = getMaterialRequests();
   const idx = list.findIndex((m) => m.mrNumber === mrNumber);
   if (idx === -1) return null;
@@ -1300,13 +1296,6 @@ export const issueMaterial = ({ mrNumber, issueQtyById, receiver, remarks = '', 
   const updatedMr = { ...mr, status: updatedStatus, lastIssueAt: nowDateTimeStr() };
   writeLS(LS.materialRequests, mrs.map((m, i) => (i === mrIdx ? updatedMr : m)));
 
-  const jcs = getJobCards();
-  const jcIdx = jcs.findIndex((j) => j.jobCardNumber === mr.jobCardNumber);
-  if (jcIdx !== -1) {
-    const jcsNext = [...jcs];
-    jcsNext[jcIdx] = { ...jcsNext[jcIdx], materialStatus: updatedStatus, lastMaterialUpdate: nowDateTimeStr() };
-    writeLS(LS.productionJobCards, jcsNext);
-  }
 
   appendAuditLog({
     action: 'MATERIAL ISSUED',
@@ -1547,11 +1536,13 @@ export const getJobCardMaterialProfile = (jobCardNumber) => {
 const canCreateGRN = () => hasPermission('material_issue.confirm') || hasPermission('inventory.adjust');
 const canApproveStockOps = () => hasPermission('inventory.adjust');
 const canAdjustStock = () => hasPermission('inventory.adjust');
+const newStoreIdempotencyKey = (prefix) =>
+  `${prefix}-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`}`;
 
 export const getGRNs = () => readLS(LS.storeGRNs, []);
-export const getStockTransfers = () => readLS(LS.stockTransfers, []);
-export const getStockVerifications = () => readLS(LS.stockVerifications, []);
-export const getInventoryBatches = () => readLS(LS.inventoryBatches, []);
+export const getStockTransfers = (status = '') => listStockTransfersApi(status);
+export const getStockVerifications = (status = '') => listStockVerificationsApi(status);
+export const getInventoryBatches = () => inventoryBatchAuthorityCache;
 
 /* ------------------------------ shelf life / expiry ------------------------------
  * Best-practice model shared by SAP, Odoo and ERPNext:
@@ -1734,12 +1725,6 @@ export const writeOffExpiredBatch = ({ batchId, qty = 0, reason = '' }) => {
 
 export const generateGRNNumber = () =>
   generateSequentialNumber({ prefix: 'GRN', sequenceKey: 'grnSequence', historyKey: LS.storeGRNs, idField: 'grnNumber' });
-
-export const generateTransferNumber = () =>
-  generateSequentialNumber({ prefix: 'ST', sequenceKey: 'stockTransferSequence', historyKey: LS.stockTransfers, idField: 'transferNumber' });
-
-export const generateVerificationNumber = () =>
-  generateSequentialNumber({ prefix: 'SV', sequenceKey: 'stockVerificationSequence', historyKey: LS.stockVerifications, idField: 'verificationNumber' });
 
 const matchInventoryItem = (items, code, name) =>
   items.find(
@@ -2107,285 +2092,87 @@ export const adjustInventoryStock = ({
 
 /* ---------------------------------- stock transfer ---------------------------------- */
 
-export const createStockTransfer = ({ fromWarehouse = '', toWarehouse = '', toLocation = '', requestedBy = '', requestedByEmpId = '', remarks = '', items = [] }) => {
+export const createStockTransfer = async ({ fromWarehouse = '', fromLocation = '', toWarehouse = '', toLocation = '', requestedBy = '', requestedByEmpId = '', remarks = '', items = [] }) => {
   if (!canCreateGRN()) throw new Error('Permission denied: not a Store role.');
-  const lines = (items || []).filter((l) => Number(l.quantity) > 0);
-  if (lines.length === 0) throw new Error('Enter a transfer quantity for at least one item.');
-  if (!fromWarehouse.trim() || !toWarehouse.trim()) throw new Error('From and To warehouse/location are required.');
-
-  lines.forEach((l) => {
-    const qty = Number(l.quantity) || 0;
-    const inv = getInventoryItems();
-    const src = matchInventoryItem(inv, l.itemCode, l.itemName);
-    if (!src) throw new Error(`Source item "${l.itemName || l.itemCode}" not found in inventory.`);
-    if (qty > Number(src.currentQty) || 0) {
-      throw new Error(`Insufficient stock at source for "${l.itemName || l.itemCode}" (available ${src.currentQty} ${src.unit || 'Nos'}).`);
-    }
-    if (String(src.warehouse || src.location || '').toLowerCase() === String(toWarehouse).toLowerCase()) {
-      throw new Error(`Source and destination warehouse are the same for "${l.itemName || l.itemCode}".`);
-    }
-  });
-
-  const transferNumber = generateTransferNumber();
-  const info = getCurrentUserInfo();
-  const transfer = {
-    transferNumber,
-    transferDate: todayStr(),
-    fromWarehouse,
-    toWarehouse,
-    toLocation,
+  const source = String(fromLocation || fromWarehouse).trim();
+  const destination = String(toLocation || toWarehouse).trim();
+  if (!source || !destination) throw new Error('From and To warehouse/location are required.');
+  if (source.toLowerCase() === destination.toLowerCase()) throw new Error('Source and destination locations must be different.');
+  const result = await createStockTransferApi({
+    fromLocation: source,
+    toLocation: destination,
+    fromWarehouse: source,
+    toWarehouse: destination,
     requestedBy,
     requestedByEmpId,
-    requestedById: info.employee?.employeeId || '-',
-    grantedBy: info.employee?.name || info.auth?.username || 'Store',
-    remarks: remarks || '',
-    status: 'Pending',
-    createdAt: nowDateTimeStr(),
-    items: lines.map((l) => ({
-      itemCode: l.itemCode || '',
-      itemName: l.itemName,
-      unit: l.unit || 'Nos',
-      quantity: Number(l.quantity) || 0,
-      batchNumber: l.batchNumber || ''
-    }))
-  };
-  writeLS(LS.stockTransfers, [transfer, ...getStockTransfers()]);
-  saveSequenceCounter('stockTransferSequence', transferNumber);
-  appendAuditLog({ action: 'STOCK TRANSFER REQUESTED', reference: transferNumber, details: `${fromWarehouse} -> ${toWarehouse}` });
-  pushNotification({ title: 'Stock Transfer', message: `Transfer ${transferNumber} raised (${fromWarehouse} -> ${toWarehouse}), awaiting approval.`, type: 'store', reference: transferNumber });
-  return transfer;
+    remarks,
+    items
+  }, newStoreIdempotencyKey('stock-transfer'));
+  return result.record;
 };
 
-/** Approval is the point when stock actually moves (OUT from source, IN to destination). */
-export const approveStockTransfer = (transferNumber) => {
+/** Approval posts source and destination movements in one PostgreSQL transaction. */
+export const approveStockTransfer = async (transferNumber) => {
   if (!canApproveStockOps()) throw new Error('Permission denied: only Store Manager / Admin can approve transfers.');
-  const list = getStockTransfers();
-  const idx = list.findIndex((t) => t.transferNumber === transferNumber);
-  if (idx === -1) throw new Error('Stock Transfer not found.');
-  const transfer = list[idx];
-  if (transfer.status !== 'Pending') throw new Error(`Transfer ${transferNumber} is already ${transfer.status}.`);
-
-  const inv = getInventoryItems();
-  let updatedInv = [...inv];
-
-  transfer.items.forEach((line) => {
-    const qty = Number(line.quantity) || 0;
-    const srcIdx = updatedInv.findIndex(
-      (it) =>
-        (line.itemCode && String(it.itemCode || '').toLowerCase() === String(line.itemCode).toLowerCase()) ||
-        (line.itemName && it.itemName && String(it.itemName).toLowerCase() === String(line.itemName).toLowerCase())
-    );
-    if (srcIdx === -1) throw new Error(`Source item "${line.itemName || line.itemCode}" not found while approving.`);
-    if (qty > Number(updatedInv[srcIdx].currentQty) || 0) {
-      throw new Error(`Insufficient source stock for "${line.itemName || line.itemCode}".`);
-    }
-    const src = updatedInv[srcIdx];
-    const srcAfter = Math.max(0, (Number(src.currentQty) || 0) - qty);
-    updatedInv[srcIdx] = { ...src, currentQty: srcAfter };
-
-    pushStockTransaction(
-      {
-        id: `tx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        date: todayStr(),
-        dateTime: nowDateTimeStr(),
-        itemCode: line.itemCode || src.itemCode,
-        itemName: line.itemName || src.itemName,
-        unit: line.unit || src.unit || 'Nos',
-        type: 'OUT',
-        quantity: qty,
-        balanceAfter: srcAfter,
-        reason: 'Stock Transfer OUT',
-        reference: transferNumber,
-        transactionNumber: transferNumber,
-        warehouse: transfer.fromWarehouse,
-        batchNo: line.batchNumber || '',
-        lotNumber: line.lotNumber || ''
-      },
-      { transactionNumber: transferNumber }
-    );
-
-    const destIdx = updatedInv.findIndex(
-      (it) =>
-        !(Number(it.currentQty) === 0 && String(it.warehouse || it.location || '') !== '') &&
-        ((line.itemCode && String(it.itemCode || '').toLowerCase() === String(line.itemCode).toLowerCase()) ||
-          (line.itemName && it.itemName && String(it.itemName).toLowerCase() === String(line.itemName).toLowerCase())) &&
-        String(it.warehouse || it.location || '').toLowerCase() === String(transfer.toWarehouse).toLowerCase()
-    );
-
-    if (destIdx !== -1) {
-      const dest = updatedInv[destIdx];
-      const destAfter = (Number(dest.currentQty) || 0) + qty;
-      updatedInv[destIdx] = { ...dest, currentQty: destAfter };
-      pushStockTransaction(
-        {
-          id: `tx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          date: todayStr(),
-          dateTime: nowDateTimeStr(),
-          itemCode: line.itemCode || dest.itemCode,
-          itemName: line.itemName || dest.itemName,
-          unit: line.unit || dest.unit || 'Nos',
-          type: 'IN',
-          quantity: qty,
-          balanceAfter: destAfter,
-          reason: 'Stock Transfer IN',
-          reference: transferNumber,
-          transactionNumber: transferNumber,
-          warehouse: transfer.toWarehouse,
-          batchNo: line.batchNumber || '',
-          lotNumber: line.lotNumber || ''
-        },
-        { transactionNumber: transferNumber }
-      );
-    } else {
-      updatedInv = [
-        {
-          id: `item-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          itemCode: line.itemCode || src.itemCode,
-          itemName: line.itemName || src.itemName,
-          category: src.category || 'Raw Material',
-          hsnSac: src.hsnSac || '',
-          unit: line.unit || src.unit || 'Nos',
-          currentQty: qty,
-          reservedQty: 0,
-          minReorderLevel: src.minReorderLevel || 10,
-          unitCost: src.unitCost || 0,
-          sellingPrice: src.sellingPrice || (Number(src.unitCost) || 0) * 1.3,
-          location: transfer.toLocation || transfer.toWarehouse,
-          warehouse: transfer.toWarehouse
-        },
-        ...updatedInv
-      ];
-      pushStockTransaction(
-        {
-          id: `tx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          date: todayStr(),
-          dateTime: nowDateTimeStr(),
-          itemCode: line.itemCode || src.itemCode,
-          itemName: line.itemName || src.itemName,
-          unit: line.unit || src.unit || 'Nos',
-          type: 'IN',
-          quantity: qty,
-          balanceAfter: qty,
-          reason: 'Stock Transfer IN',
-          reference: transferNumber,
-          transactionNumber: transferNumber,
-          warehouse: transfer.toWarehouse,
-          batchNo: line.batchNumber || '',
-          lotNumber: line.lotNumber || ''
-        },
-        { transactionNumber: transferNumber }
-      );
-    }
+  const transfer = await getStockTransferApi(transferNumber);
+  const result = await resolveStockTransferApi(transferNumber, 'approve', {
+    version: Number(transfer.recordVersion || transfer.version),
+    idempotencyKey: newStoreIdempotencyKey('stock-transfer-approval')
   });
+  return result.record;
+};
 
-  writeLS(LS.inventoryItems, updatedInv);
-  const next = [...list];
-  next[idx] = { ...transfer, status: 'Completed', approvedBy: getCurrentUserInfo().employee?.name || 'Store', approvedAt: nowDateTimeStr() };
-  writeLS(LS.stockTransfers, next);
-  appendAuditLog({ action: 'STOCK TRANSFER APPROVED', reference: transferNumber, details: `Completed: ${transfer.fromWarehouse} -> ${transfer.toWarehouse}` });
-  pushNotification({ title: 'Stock Transfer Completed', message: `Transfer ${transferNumber} moved ${transfer.items.length} item(s).`, type: 'store', reference: transferNumber });
-  return next[idx];
+export const rejectStockTransfer = async (transferNumber, reason) => {
+  if (!canApproveStockOps()) throw new Error('Permission denied: only Store Manager / Admin can reject transfers.');
+  const transfer = await getStockTransferApi(transferNumber);
+  const result = await resolveStockTransferApi(transferNumber, 'reject', {
+    version: Number(transfer.recordVersion || transfer.version),
+    reason,
+    idempotencyKey: newStoreIdempotencyKey('stock-transfer-rejection')
+  });
+  return result.record;
 };
 
 /* ----------------------------- physical stock verification ----------------------------- */
 
-export const createStockVerification = ({ itemId = '', itemCode = '', itemName = '', physicalQty, reason = '' }) => {
+export const createStockVerification = async ({ itemId = '', itemCode = '', itemName = '', physicalQty, reason = '', location = '', batchId = '', batchNumber = '', lotNumber = '' }) => {
   if (!canCreateGRN()) throw new Error('Permission denied: not a Store role.');
-  const inv = getInventoryItems();
-  const target = inv.find((i) => i.id === itemId) || matchInventoryItem(inv, itemCode, itemName);
+  const inv = await listInventoryItemsApi();
+  const target = inv.find((i) => i.id === itemId || i.item_code === itemId)
+    || inv.find((i) => String(i.item_code || i.itemCode).toLowerCase() === String(itemCode).toLowerCase())
+    || inv.find((i) => String(i.material_name || i.itemName).toLowerCase() === String(itemName).toLowerCase());
   if (!target) throw new Error('Select an inventory item to verify.');
   const physical = Number(physicalQty);
-  if (Number.isNaN(physical) || physical < 0) throw new Error('Physical quantity must be a non-negative number.');
-
-  const verificationNumber = generateVerificationNumber();
-  const info = getCurrentUserInfo();
-  const verification = {
-    verificationNumber,
-    date: todayStr(),
-    itemId: target.id,
-    itemCode: target.itemCode,
-    itemName: target.itemName,
-    unit: target.unit || 'Nos',
-    systemQty: Number(target.currentQty) || 0,
-    physicalQty: physical,
-    difference: physical - (Number(target.currentQty) || 0),
-    reason: reason || '',
-    verifiedBy: info.employee?.name || info.auth?.username || 'Store',
-    verifiedById: info.employee?.employeeId || '-',
-    status: 'Pending Approval',
-    createdAt: nowDateTimeStr(),
-    approvedBy: '',
-    approvedAt: ''
-  };
-  writeLS(LS.stockVerifications, [verification, ...getStockVerifications()]);
-  saveSequenceCounter('stockVerificationSequence', verificationNumber);
-  appendAuditLog({ action: 'PHYSICAL VERIFICATION RECORDED', reference: verificationNumber, details: `${target.itemName} system ${verification.systemQty} vs physical ${physical}` });
-  pushNotification({
-    title: 'Physical Verification',
-    message: `Verification ${verificationNumber} recorded (difference ${verification.difference >= 0 ? '+' : ''}${verification.difference}), awaiting approval.`,
-    type: 'store',
-    reference: verificationNumber
-  });
-  return verification;
+  if (!Number.isFinite(physical) || physical < 0) throw new Error('Physical quantity must be a non-negative number.');
+  const itemCodeValue = target.item_code || target.itemCode;
+  const result = await createStockVerificationApi({
+    location: String(location || target.location || 'Unassigned'),
+    remarks: reason,
+    items: [{
+      itemCode: itemCodeValue,
+      itemName: target.material_name || target.itemName,
+      unit: target.unit || 'Nos',
+      physicalQty: physical,
+      batchId,
+      batchNumber,
+      lotNumber,
+      remarks: reason
+    }]
+  }, newStoreIdempotencyKey('stock-verification'));
+  return result.record;
 };
 
-/** Authorized approval applies the counted difference to inventory and posts a ledger entry. */
-export const approveStockVerification = (verificationNumber, approve = true) => {
+/** Authorized resolution applies the counted variance through the PostgreSQL ledger. */
+export const approveStockVerification = async (verificationNumber, approve = true, reason = '') => {
   if (!canApproveStockOps()) throw new Error('Permission denied: only Store Manager / Admin can approve verification.');
-  const list = getStockVerifications();
-  const idx = list.findIndex((v) => v.verificationNumber === verificationNumber);
-  if (idx === -1) throw new Error('Stock Verification not found.');
-  const verification = list[idx];
-  if (verification.status !== 'Pending Approval') throw new Error('Verification is already processed.');
-
-  const info = getCurrentUserInfo();
-  if (!approve) {
-    const next = [...list];
-    next[idx] = { ...verification, status: 'Rejected', approvedBy: info.employee?.name || 'Store', approvedAt: nowDateTimeStr() };
-    writeLS(LS.stockVerifications, next);
-    appendAuditLog({ action: 'PHYSICAL VERIFICATION REJECTED', reference: verificationNumber, details: verification.itemName });
-    return next[idx];
-  }
-
-  const inv = getInventoryItems();
-  const targetIdx = inv.findIndex((i) => i.id === verification.itemId);
-  if (targetIdx === -1) throw new Error('Inventory item not found.');
-  const target = inv[targetIdx];
-  const newQty = verification.physicalQty;
-  const diff = newQty - (Number(target.currentQty) || 0);
-  const nextInv = [...inv];
-  nextInv[targetIdx] = { ...target, currentQty: newQty };
-  writeLS(LS.inventoryItems, nextInv);
-
-  pushStockTransaction(
-    {
-      id: `tx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      date: todayStr(),
-      dateTime: nowDateTimeStr(),
-      itemCode: target.itemCode,
-      itemName: target.itemName,
-      unit: target.unit || 'Nos',
-      type: diff >= 0 ? 'IN' : 'OUT',
-      quantity: Math.abs(diff),
-      balanceAfter: newQty,
-      reason: 'Physical Verification Adjustment',
-      reference: verificationNumber,
-      transactionNumber: verificationNumber
-    },
-    { transactionNumber: verificationNumber }
-  );
-
-  const next = [...list];
-  next[idx] = { ...verification, status: 'Approved', approvedBy: info.employee?.name || 'Store', approvedAt: nowDateTimeStr() };
-  writeLS(LS.stockVerifications, next);
-  appendAuditLog({ action: 'PHYSICAL VERIFICATION APPROVED', reference: verificationNumber, details: `${target.itemName} adjusted ${diff >= 0 ? '+' : ''}${diff}` });
-  pushNotification({
-    title: 'Verification Applied',
-    message: `Stock for ${target.itemName} adjusted by ${diff >= 0 ? '+' : ''}${diff} as per approved verification ${verificationNumber}.`,
-    type: 'store',
-    reference: verificationNumber
+  const verification = await getStockVerificationApi(verificationNumber);
+  const action = approve ? 'approve' : 'reject';
+  const result = await resolveStockVerificationApi(verificationNumber, action, {
+    version: Number(verification.recordVersion || verification.version),
+    reason,
+    idempotencyKey: newStoreIdempotencyKey(`stock-verification-${action}`)
   });
-  return next[idx];
+  return result.record;
 };
 
 /* ------------------------------ authorized adjustment ------------------------------ */
@@ -2658,7 +2445,7 @@ export const getBatchAvailability = () => {
    ───────────────────────────────────────────── */
 const BOM_LS_KEY = 'bomMasterList';
 
-export const getBOMs = () => readLS(BOM_LS_KEY, []);
+export const getBOMs = () => getCachedBoms();
 
 export const saveBOMs = (list) => writeLS(BOM_LS_KEY, list);
 
@@ -3379,25 +3166,6 @@ const findInventoryForHTR = (rec) => {
   return inv.find((i) => String(i.itemName || '').trim().toLowerCase() === name) || null;
 };
 
-const syncJobCardHT = (jobCardNumber, patch) => {
-  if (!jobCardNumber) return;
-  const jcs = getJobCards();
-  const idx = jcs.findIndex((j) => j.jobCardNumber === jobCardNumber);
-  if (idx === -1) return;
-  const jc = jcs[idx];
-  jcs[idx] = {
-    ...jc,
-    operations: {
-      ...jc.operations,
-      heatTreatment: {
-        ...(jc.operations?.heatTreatment || {}),
-        ...patch
-      }
-    }
-  };
-  writeLS(LS.productionJobCards, jcs);
-};
-
 export const issueHTRToVendor = ({ htrNumber, qty, outwardChallan = '', vehicleNo = '', issuedBy = '' }) => {
   if (!hasPermission('ht_outsource.store_action') && !hasPermission('material_issue.confirm')) {
     throw new Error('Permission denied: ht_outsource.store_action');
@@ -3459,12 +3227,6 @@ export const issueHTRToVendor = ({ htrNumber, qty, outwardChallan = '', vehicleN
     vehicleNo,
     status: HT_OUTSOURCE_STATUS.ISSUED
   }, 'HTR ISSUED TO VENDOR');
-  syncJobCardHT(rec.jobCardNumber, {
-    qtySent: issueQty,
-    sentDate: todayStr(),
-    status: 'Sent to Vendor',
-    vendor: rec.vendorName
-  });
   appendAuditLog({
     action: 'HTR STOCK OUT',
     reference: htrNumber,
@@ -3534,11 +3296,6 @@ export const receiveHTRFromVendor = ({ htrNumber, qty, inwardChallan = '', recei
     remarks: remarks || rec.remarks,
     status: HT_OUTSOURCE_STATUS.RECEIVED
   }, 'HTR RECEIVED FROM VENDOR');
-  syncJobCardHT(rec.jobCardNumber, {
-    qtyReceived: recvQty,
-    receivedDate: todayStr(),
-    status: 'Received'
-  });
   appendAuditLog({
     action: 'HTR STOCK IN',
     reference: htrNumber,
@@ -3574,13 +3331,6 @@ export const completeHTR = ({ htrNumber, actualHardness = '', disposition = 'Pas
     remarks: remarks || rec.remarks,
     status
   }, 'HTR HARDNESS VERIFIED');
-  syncJobCardHT(rec.jobCardNumber, {
-    actualHardness,
-    disposition,
-    status: disposition === 'Pass' ? 'Completed' : 'Failed / Rework',
-    inspector: completedBy || info.employee?.name || 'Production',
-    remarks: remarks || rec.remarks
-  });
   pushNotification({
     title: `${htrNumber} hardness ${disposition}`,
     message: `Actual: ${actualHardness || '-'} vs Target: ${rec.targetHardness || '-'}`,

@@ -4,8 +4,9 @@ import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBrandin
 import { useCompanyBranding } from '../utils/companyBranding.js';
 import { generateQuotationPDF } from '../services/pdfGenerator.js';
 import { generateRFQExcel } from '../services/excelGenerator.js';
-import { updateVendorEnquiry, dateOnly, getAllVendorQuotations } from '../utils/storeService.js';
+import { dateOnly } from '../utils/storeService.js';
 import { hasPendingEnquiryVendor } from '../utils/vendorQuotationVendor.js';
+import { getProcurementRecord, listProcurementRecords, updateProcurementRecord } from '../services/procurementIntakeApi.js';
 
 const PdfDownloadIcon = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -70,28 +71,28 @@ const VendorEnquiryPreviewPage = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const [enquiry, setEnquiry] = useState(null);
+  const [quotations, setQuotations] = useState([]);
   const [shareOpen, setShareOpen] = useState(false);
   const [shareVendorIdx, setShareVendorIdx] = useState(0);
   const [message, setMessage] = useState('');
 
   useEffect(() => {
-    if (location.state?.enquiry) {
-      localStorage.setItem('currentVendorEnquiry', JSON.stringify(location.state.enquiry));
-      setEnquiry(location.state.enquiry);
-      setShareVendorIdx(0);
-      return;
+    let active = true;
+    let id = location.state?.enquiry?.enquiryNumber;
+    if (!id) {
+      try { id = JSON.parse(localStorage.getItem('currentVendorEnquiry') || '{}')?.enquiryNumber; } catch { /* cache may be malformed; no attachment/data fallback */ }
     }
-    const localData = localStorage.getItem('currentVendorEnquiry');
-    if (localData) {
-      try {
-        const parsed = JSON.parse(localData);
-        setEnquiry(parsed);
-        setShareVendorIdx(0);
-      } catch (error) {
-        console.error('Unable to parse saved enquiry', error);
-        setEnquiry(null);
-      }
-    }
+    if (!id) { setEnquiry(null); return () => { active = false; }; }
+    getProcurementRecord('vendorEnquiry', id).then((record) => {
+      if (!active) return;
+      setEnquiry(record); setShareVendorIdx(0);
+      localStorage.setItem('currentVendorEnquiry', JSON.stringify(record));
+    }).catch((error) => {
+      if (!active) return;
+      setEnquiry(null); setMessage(`Enquiry could not be loaded from PostgreSQL: ${error.message}`);
+    });
+    listProcurementRecords('vendorQuotation').then((rows) => { if (active) setQuotations(rows); }).catch((error) => { if (active) setMessage(`Vendor Quotations could not be loaded from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
   }, [location.state]);
 
   const vendors = enquiry?.vendors || [];
@@ -122,7 +123,7 @@ const VendorEnquiryPreviewPage = () => {
     ].join('\n');
   };
 
-  const markVendorShared = (vendorIdx, channel) => {
+  const markVendorShared = async (vendorIdx, channel) => {
     if (!enquiry || vendorIdx < 0) return;
     try {
       const nextVendors = (enquiry.vendors || []).map((v, i) =>
@@ -133,8 +134,7 @@ const VendorEnquiryPreviewPage = () => {
         updates.status = 'Sent';
         updates.sentAt = new Date().toISOString();
       }
-      updateVendorEnquiry(enquiry.enquiryNumber, updates);
-      const next = { ...enquiry, ...updates };
+      const next = (await updateProcurementRecord('vendorEnquiry', enquiry.enquiryNumber, updates, enquiry.version)).record;
       setEnquiry(next);
       localStorage.setItem('currentVendorEnquiry', JSON.stringify(next));
     } catch (err) {
@@ -219,13 +219,12 @@ const VendorEnquiryPreviewPage = () => {
     markVendorShared(vendorIdx, 'Email');
   };
 
-  const handleMarkSent = () => {
+  const handleMarkSent = async () => {
     if (!enquiry) return;
     if (!window.confirm(`Mark ${enquiry.enquiryNumber} as Sent to vendors?`)) return;
     try {
       const updates = { status: 'Sent', sentAt: new Date().toISOString() };
-      updateVendorEnquiry(enquiry.enquiryNumber, updates);
-      const next = { ...enquiry, ...updates };
+      const next = (await updateProcurementRecord('vendorEnquiry', enquiry.enquiryNumber, updates, enquiry.version)).record;
       setEnquiry(next);
       localStorage.setItem('currentVendorEnquiry', JSON.stringify(next));
     } catch (err) {
@@ -235,7 +234,7 @@ const VendorEnquiryPreviewPage = () => {
 
   const handleCreateQuotation = () => {
     if (!enquiry) return;
-    if (!hasPendingEnquiryVendor(enquiry, getAllVendorQuotations())) {
+    if (!hasPendingEnquiryVendor(enquiry, quotations)) {
       alert('All invited vendors already have a quotation recorded for this enquiry.');
       return;
     }
@@ -547,7 +546,7 @@ const VendorEnquiryPreviewPage = () => {
           </button>
         )}
         {enquiry.status !== 'Closed' && enquiry.status !== 'Cancelled' &&
-          hasPendingEnquiryVendor(enquiry, getAllVendorQuotations()) && (
+          hasPendingEnquiryVendor(enquiry, quotations) && (
           <button
             className="button-secondary"
             onClick={handleCreateQuotation}

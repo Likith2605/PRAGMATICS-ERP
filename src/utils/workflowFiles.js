@@ -3,10 +3,8 @@
  * (Tax Invoices, Delivery Challans, inspection photos, rejection documents).
  *
  * Metadata lives on the owning record (materialReceipts / qualityChecks /
- * rejectionReports); the binary payload is cached in IndexedDB so localStorage
- * quota is never exhausted, and mirrored to PostgreSQL (`file_blobs` via
- * /api/files) so database backups capture every attachment. On a local cache
- * miss the file is fetched from the server and re-cached.
+ * rejectionReports); PostgreSQL (`file_blobs` via /api/files) is the durable
+ * binary store. IndexedDB is a best-effort local cache.
  */
 
 import { putFile, getFile, deleteFile } from '../services/fileApi.js';
@@ -42,17 +40,20 @@ export const saveWorkflowDocument = async (file) => {
     size: file.size || 0,
     uploadedAt: new Date().toISOString()
   };
-  const db = await openDB();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).put(file, id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
+  // Do not report an attachment save until the PostgreSQL write is confirmed.
+  await putFile(id, file, { fileName: meta.name, mimeType: meta.type, scope: 'workflow', metadata: meta });
 
-  // Fire-and-forget: local cache succeeded; push the authoritative copy.
-  putFile(id, file, { fileName: meta.name, mimeType: meta.type, scope: 'workflow', metadata: meta })
-    .catch((error) => console.warn(`Workflow document '${id}' not yet saved to PostgreSQL:`, error.message));
+  try {
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).put(file, id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (error) {
+    console.warn(`Workflow document '${id}' was saved to PostgreSQL but could not be cached locally:`, error.message);
+  }
 
   return meta;
 };

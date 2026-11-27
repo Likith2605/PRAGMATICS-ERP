@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Archive, ArrowDownLeft, Building2, Boxes, CircleAlert, ClipboardCheck, ClipboardList, FileCheck2,
@@ -7,40 +7,33 @@ import {
 } from 'lucide-react';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import { getCurrentUserInfo } from '../utils/permissions.js';
-import {
-  getWorkflowDashboard,
-  getSalesOrdersWithMaterialStatus,
-  getIndents,
-  getReceipts,
-  getPurchaseOrders,
-  getRejectionReports,
-  getQualityChecks,
-  getPOProgress
-} from '../utils/workflowService.js';
-
-import {
-  getRequirementsAwaitingStoreReview,
-  getRequirementSummary
-} from '../utils/productionRequirementService.js';
-import { getInventoryItems, getStockTransactions, getStoreIssues, transactionTypeLabel } from '../utils/storeService.js';
+import { listProcurementRecords, listPurchaseOrders, listPurchaseIndentQualityChecks } from '../services/procurementIntakeApi.js';
+import { listMaterialReceiptQualityChecksApi, listMaterialReceiptsApi } from '../services/materialReceiptApi.js';
+import { getWorkflowDashboard, getSalesOrdersWithMaterialStatus } from '../utils/workflowService.js';
+import { getRequirementsAwaitingStoreReview, getRequirementSummary } from '../utils/productionRequirementService.js';
+import { listInventoryItems, listAllStockLedger } from '../services/inventoryApi.js';
+import { getStoreIssues } from '../services/storeApi.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { listModuleRecords } from '../services/moduleRecordsApi.js';
+import { listAvailabilityChecks } from '../services/availabilityCheckApi.js';
+import { listRequirements } from '../services/productionApi.js';
+import { normalizeInventoryItem, normalizeStockLedgerEntry } from '../utils/reportApiData.js';
 import './purchase-dashboard.css';
 import './store-dashboard.css';
 import './store-screens.css';
 
-// Keep this helper outside the component so every memo callback can safely use
-// it during the first render. Missing or malformed PO references are expected
-// in older/incomplete workflow chains and should not prevent the dashboard
-// from rendering.
-function getPOProgressSafe(poNumber) {
-  if (poNumber == null || String(poNumber).trim() === '') return null;
-  try {
-    return getPOProgress(String(poNumber));
-  } catch {
-    return null;
-  }
-}
-
 const badgeClass = (status) => `status-badge st-${String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
+const transactionTypeLabel = (transaction) => {
+  const reason = String(transaction.reason || '').toLowerCase();
+  if (reason.includes('store issue')) return 'Store Issue';
+  if (reason.includes('store return')) return 'Store Return';
+  if (reason.includes('purchase')) return 'Purchase Receipt';
+  if (reason.includes('manual adjustment') || reason.includes('adjustment')) return 'Stock Adjustment';
+  if (reason.includes('delivery challan') || reason.includes('dispatch')) return 'Dispatch';
+  if (reason.includes('production')) return 'Production';
+  if (reason.includes('issued to employee')) return 'Employee Issue';
+  return transaction.type === 'IN' ? 'Stock In' : 'Stock Out';
+};
 
 const StatCard = ({ label, value, tone = 'neutral', onClick }) => (
   <div
@@ -374,42 +367,93 @@ const StoreDashboardContent = ({ dash, receipts, inventory, issues, transactions
   );
 };
 
+const EMPTY_WORKFLOW_DATA = {
+  indents: [], enquiries: [], quotations: [], purchaseOrders: [], receipts: [],
+  salesOrders: [], availabilityChecks: [], qualityChecks: [], rejections: [],
+  inventoryItems: [], stockTransactions: [], storeIssues: [], requirements: []
+};
+
+const loadWorkflowDashboardData = async () => {
+  const [indents, enquiries, quotations, purchaseOrders, receipts, salesOrders,
+    availabilityChecks, recordChecks, receiptChecks, indentChecks, rejections,
+    inventoryRows, ledgerRows, storeIssues, requirements] = await Promise.all([
+    listProcurementRecords('purchaseIndent'),
+    listProcurementRecords('vendorEnquiry'),
+    listProcurementRecords('vendorQuotation'),
+    listPurchaseOrders(),
+    listMaterialReceiptsApi(),
+    listSalesOrders(),
+    listAvailabilityChecks(),
+    listModuleRecords('qualityChecks'),
+    listMaterialReceiptQualityChecksApi(),
+    listPurchaseIndentQualityChecks(),
+    listModuleRecords('rejectionReports'),
+    listInventoryItems(),
+    listAllStockLedger(),
+    getStoreIssues(),
+    listRequirements()
+  ]);
+  return {
+    indents, enquiries, quotations, purchaseOrders, receipts, salesOrders,
+    availabilityChecks: Array.isArray(availabilityChecks) ? availabilityChecks : [],
+    qualityChecks: [...new Map([...recordChecks, ...receiptChecks, ...indentChecks]
+      .map((record) => [String(record.qcNumber || record.id || ''), record])).values()],
+    rejections,
+    inventoryItems: inventoryRows.map(normalizeInventoryItem),
+    stockTransactions: ledgerRows.map(normalizeStockLedgerEntry),
+    storeIssues, requirements
+  };
+};
+
 const WorkflowDashboardPage = () => {
   const navigate = useNavigate();
   const [tick, setTick] = useState(0);
+  const [sourceData, setSourceData] = useState(EMPTY_WORKFLOW_DATA);
+  const [dashboardLoadError, setDashboardLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setDashboardLoadError('');
+    loadWorkflowDashboardData()
+      .then((data) => { if (active) setSourceData(data); })
+      .catch((error) => {
+        if (!active) return;
+        setSourceData(EMPTY_WORKFLOW_DATA);
+        setDashboardLoadError(`Dashboard data could not be loaded from PostgreSQL: ${error.message}`);
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [tick]);
   const info = getCurrentUserInfo();
   const dept = info.employee?.department || '';
 
-  const dash = useMemo(() => getWorkflowDashboard(), [tick]);
-  const reqSummary = useMemo(() => getRequirementSummary(), [tick]);
-  const awaitingReqs = useMemo(() => getRequirementsAwaitingStoreReview(), [tick]);
-  const soStatus = useMemo(() => getSalesOrdersWithMaterialStatus(), [tick]);
-  const indents = useMemo(() => getIndents(), [tick]);
-  const receipts = useMemo(() => getReceipts(), [tick]);
-  const storeInventory = useMemo(() => getInventoryItems(), [tick]);
-  const storeIssues = useMemo(() => getStoreIssues(), [tick]);
-  const stockTransactions = useMemo(() => getStockTransactions(), [tick]);
+  const dash = useMemo(() => getWorkflowDashboard(sourceData), [sourceData]);
+  const reqSummary = useMemo(() => getRequirementSummary(sourceData.requirements), [sourceData.requirements]);
+  const awaitingReqs = useMemo(() => getRequirementsAwaitingStoreReview(sourceData.requirements), [sourceData.requirements]);
+  const soStatus = useMemo(() => getSalesOrdersWithMaterialStatus(sourceData), [sourceData]);
+  const indents = sourceData.indents;
+  const receipts = sourceData.receipts;
+  const serverEnquiries = sourceData.enquiries;
+  const serverQuotations = sourceData.quotations;
+  const storeInventory = sourceData.inventoryItems;
+  const storeIssues = sourceData.storeIssues;
+  const stockTransactions = sourceData.stockTransactions;
   const purchaseOrders = useMemo(() => {
-    const rows = getPurchaseOrders();
+    const rows = sourceData.purchaseOrders;
     return Array.isArray(rows) ? rows.filter((record) => record && typeof record === 'object') : [];
-  }, [tick]);
+  }, [sourceData.purchaseOrders]);
   const purchaseActivity = useMemo(() => {
-    const read = (key) => {
-      try {
-        const parsed = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(parsed) ? parsed : [];
-      } catch { return []; }
-    };
     const value = (...values) => values.find((entry) => entry != null && String(entry).trim() !== '') || '';
     const rows = [
       ...purchaseOrders.map((record) => {
         const po = record.payload || record;
         const reference = value(record.reference, record.poNumber, po.reference, po.poNumber, po.purchaseOrderNumber);
-        const progress = getPOProgressSafe(reference);
+        const progress = record.progress || {};
         return { key: `po:${reference}`, date: value(record.poDate, po.poDate, po.poDetails?.poDate, record.createdAt, record.date), type: 'Purchase order', reference, supplier: value(record.vendor, po.vendor, record.vendorName, po.vendorDetails?.companyName), status: value(progress?.status, record.status, po.status, po.poStatus, po.poDetails?.poStatus, 'Raised'), path: '/purchase-order', state: { openPO: reference } };
       }),
-      ...read('vendorEnquiries').map((record) => ({ key: `enquiry:${record.enquiryNumber}`, date: value(record.enquiryDate, record.createdAt, record.date), type: 'Vendor enquiry', reference: value(record.enquiryNumber, 'Vendor enquiry'), supplier: (record.vendors || []).map((vendor) => typeof vendor === 'string' ? vendor : vendor?.vendorName || vendor?.name).filter(Boolean).join(', '), status: value(record.status, 'Open'), path: '/vendor-enquiry' })),
-      ...read('vendorQuotations').map((record) => ({ key: `quotation:${record.quotationNumber}`, date: value(record.quotationDate, record.createdAt, record.date), type: 'Vendor quotation', reference: value(record.quotationNumber, 'Vendor quotation'), supplier: value(record.vendor, record.vendorName, record.supplier), status: value(record.status, 'Recorded'), path: '/vendor-quotations' })),
+      ...serverEnquiries.map((record) => ({ key: `enquiry:${record.enquiryNumber}`, date: value(record.enquiryDate, record.createdAt, record.date), type: 'Vendor enquiry', reference: value(record.enquiryNumber, 'Vendor enquiry'), supplier: (record.vendors || []).map((vendor) => typeof vendor === 'string' ? vendor : vendor?.vendorName || vendor?.name).filter(Boolean).join(', '), status: value(record.status, 'Open'), path: '/vendor-enquiry' })),
+      ...serverQuotations.map((record) => ({ key: `quotation:${record.quotationNumber}`, date: value(record.quotationDate, record.createdAt, record.date), type: 'Vendor quotation', reference: value(record.quotationNumber, 'Vendor quotation'), supplier: value(record.vendor, record.vendorName, record.supplier), status: value(record.status, 'Recorded'), path: '/vendor-quotations' })),
       ...receipts.map((record) => ({ key: `receipt:${record.receiptNumber}`, date: value(record.receiptDate, record.dateReceived, record.createdAt), type: 'Material receipt', reference: value(record.receiptNumber, 'Material receipt'), supplier: value(record.vendor, record.vendorName), status: value(record.qcStatus, record.status, 'Received'), path: '/material-receipts' })),
       ...indents.map((record) => ({ key: `indent:${record.indentNumber}`, date: value(record.indentDate, record.createdAt), type: 'Purchase indent', reference: value(record.indentNumber, 'Purchase indent'), supplier: value(record.vendor, record.vendorName), status: value(record.status, 'Recorded'), path: '/purchase-indents', state: { openIndent: record.indentNumber } }))
     ].filter((record) => record.reference);
@@ -418,26 +462,18 @@ const WorkflowDashboardPage = () => {
       return Number.isFinite(parsed) ? parsed : 0;
     };
     return rows.sort((a, b) => timestamp(b) - timestamp(a)).slice(0, 10);
-  }, [purchaseOrders, receipts, indents, tick]);
+  }, [purchaseOrders, receipts, indents, serverEnquiries, serverQuotations]);
   const supplierCount = useMemo(() => new Set((dash.purchase.sections.vendorQuotations || []).map((quote) => String(quote.vendor || '').trim()).filter(Boolean)).size, [dash]);
-  const rejections = useMemo(() => getRejectionReports(), [tick]);
-  const qcs = useMemo(() => getQualityChecks(), [tick]);
+  const rejections = sourceData.rejections;
+  const qcs = sourceData.qualityChecks;
 
   /**
    * Joins every workflow record into one readable chain per PO / receipt so the
    * full SO → Indent → Enquiry → Quotation → PO → Receipt → QC lineage is visible.
    */
   const buildDocumentChains = () => {
-    const read = (key) => {
-      try {
-        const parsed = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {
-        return [];
-      }
-    };
-    const enquiries = read('vendorEnquiries');
-    const quotations = read('vendorQuotations');
+    const enquiries = serverEnquiries;
+    const quotations = serverQuotations;
     const chains = new Map();
 
     const upsert = (poNumber, patch) => {
@@ -492,7 +528,7 @@ const WorkflowDashboardPage = () => {
     return [...chains.values()]
       .filter((c) => c.projectId || c.indentNumber || c.receiptNumber)
       .map((c) => {
-        const progress = c.poNumber ? getPOProgressSafe(c.poNumber) : null;
+        const progress = c.poNumber ? purchaseOrders.find((po) => String(po.reference || '') === String(c.poNumber))?.progress : null;
         let status = 'In Progress';
         if (c.receiptNumber && !c.qcNumber) status = 'Awaiting Quality Check';
         else if (c.qcNumber) status = 'Quality Checked';
@@ -502,7 +538,7 @@ const WorkflowDashboardPage = () => {
       .sort((a, b) => String(a.key).localeCompare(String(b.key)));
   };
 
-  const chains = useMemo(() => buildDocumentChains(), [tick]);
+  const chains = useMemo(() => buildDocumentChains(), [purchaseOrders, receipts, indents, serverEnquiries, serverQuotations, qcs]);
 
   const isStore = dept === 'Store Department';  const isPurchase = dept === 'Purchase Department';
   const isProduction = dept === 'Production Department';
@@ -521,6 +557,10 @@ const WorkflowDashboardPage = () => {
           <button className={`button-secondary${isPurchase ? ' purchase-refresh' : ''}${isStore ? ' store-refresh' : ''}`} onClick={() => setTick((t) => t + 1)}>{(isPurchase || isStore) && <RotateCcw size={15} aria-hidden="true" />}Refresh</button>
         </div>
       </div>
+
+      {loading ? <div role="status" className="content-block">Loading dashboard data from PostgreSQL...</div>
+        : dashboardLoadError ? <div role="alert" className="form-error">{dashboardLoadError}</div>
+          : <>
 
       {isAdmin && (
         <>
@@ -983,6 +1023,7 @@ const WorkflowDashboardPage = () => {
           </table>
         </div>
       </Section>
+      </>}
     </section>
   );
 };

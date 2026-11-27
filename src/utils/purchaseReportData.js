@@ -2,9 +2,16 @@ import { getPOProgress, getPurchaseOrders } from './workflowService.js';
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 
-export const getPurchaseReportOrders = () => getPurchaseOrders().map((po) => {
+/**
+ * Builds report rows from an authoritative Purchase Order list. Callers that
+ * have already loaded PostgreSQL rows pass them in; the no-argument helpers
+ * remain for legacy/non-browser callers and tests. `record.progress` is written
+ * by the PostgreSQL reconciliation service, so browser caches are never used
+ * when the server has supplied progress.
+ */
+export const buildPurchaseReportOrders = (sourceOrders) => (sourceOrders || getPurchaseOrders()).map((po) => {
   const poNumber = po.reference || po.payload?.poDetails?.poNumber || '';
-  const progress = getPOProgress(poNumber);
+  const progress = po.progress && typeof po.progress === 'object' ? po.progress : getPOProgress(poNumber);
   const details = po.payload?.poDetails || {};
   const vendor = po.vendor || po.payload?.vendorDetails?.companyName || po.payload?.vendorDetails?.vendorName || '-';
   const date = details.poDate || po.date || '';
@@ -54,8 +61,10 @@ export const getPurchaseReportOrders = () => getPurchaseOrders().map((po) => {
   };
 });
 
-export const getStalePurchaseOrderRows = (today = new Date().toISOString().slice(0, 10)) =>
-  getPurchaseReportOrders().flatMap((order) => {
+export const getPurchaseReportOrders = (sourceOrders) => buildPurchaseReportOrders(sourceOrders);
+
+export const getStalePurchaseOrderRows = (today = new Date().toISOString().slice(0, 10), sourceOrders) =>
+  getPurchaseReportOrders(sourceOrders).flatMap((order) => {
     const dueTime = Date.parse(order.dueDate);
     const todayTime = Date.parse(today);
     if (!order.dueDate || !Number.isFinite(dueTime) || !Number.isFinite(todayTime) || dueTime >= todayTime || ['Closed', 'Cancelled'].includes(order.status)) return [];
@@ -72,11 +81,12 @@ export const getStalePurchaseOrderRows = (today = new Date().toISOString().slice
       receivedQty: item.receivedQty,
       pendingQty: item.pendingQty,
       daysOverdue,
-      status: order.status
+      status: order.status,
+      version: number(order.po.version ?? order.po.recordVersion)
     }));
   });
 
-export const getPreClosedPurchaseOrderRows = () => getPurchaseReportOrders().flatMap((order) => {
+export const getPreClosedPurchaseOrderRows = (sourceOrders) => getPurchaseReportOrders(sourceOrders).flatMap((order) => {
   if (order.status !== 'Closed') return [];
   const closure = order.po.shortClose || order.po.payload?.poDetails?.shortClose || null;
   const closeLines = closure?.lines || [];
@@ -108,7 +118,7 @@ export const getPreClosedPurchaseOrderRows = () => getPurchaseReportOrders().fla
   });
 });
 
-export const getSupplierWiseItemRows = () => getPurchaseReportOrders().flatMap((order) =>
+export const getSupplierWiseItemRows = (sourceOrders) => getPurchaseReportOrders(sourceOrders).flatMap((order) =>
   order.items.map((item) => ({
     supplier: order.vendor,
     item: item.itemName,

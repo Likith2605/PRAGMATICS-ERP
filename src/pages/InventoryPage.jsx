@@ -6,31 +6,23 @@ import { isAdmin } from '../utils/auth.js';
 import { getInventoryViewMeta, normalizeInventoryView } from '../utils/inventoryViews.js';
 import AddableSelect from '../components/AddableSelect.jsx';
 import StorePage from './StorePage.jsx';
-import { addCustomUnit, addInventoryCategory, DEFAULT_INVENTORY_CATEGORIES, DEFAULT_UNITS, getCustomUnits, getInventoryCategories } from '../utils/addableMasters.js';
+import { addInventoryCategory, DEFAULT_INVENTORY_CATEGORIES, DEFAULT_UNITS, getInventoryCategories } from '../utils/addableMasters.js';
+import { createMaster, listMasters } from '../services/masterApi.js';
+import {
+  deleteInventoryItem,
+  getInventoryItem,
+  listInventoryItems,
+  listAllStockLedger,
+  saveInventoryItem,
+  postOpeningStock,
+  postInventoryAdjustment
+} from '../services/inventoryApi.js';
 import ExcelImportDialog from '../components/ExcelImportDialog.jsx';
 import { Upload } from 'lucide-react';
 import { INVENTORY_EXCEL_COLUMNS, mapInventoryExcelRow, validateInventoryExcelRow, createInventoryItemsFromExcelRows } from '../utils/inventoryExcelImport.js';
 
 const DEFAULT_CATEGORIES = DEFAULT_INVENTORY_CATEGORIES;
 
-const SEED_INVENTORY_ITEMS = [
-  { id: 'INV-001', itemCode: 'PRAG-101', itemName: 'MS Plate 10mm', category: 'Raw Material', hsnSac: '7208', unit: 'Kg', currentQty: 500, reservedQty: 0, minReorderLevel: 100, unitCost: 85, sellingPrice: 95, location: 'Bay A-1' },
-  { id: 'INV-002', itemCode: 'PRAG-102', itemName: 'SS Pipe 2inch Sch40', category: 'Raw Material', hsnSac: '7304', unit: 'Nos', currentQty: 120, reservedQty: 0, minReorderLevel: 30, unitCost: 2200, sellingPrice: 2500, location: 'Bay A-2' },
-  { id: 'INV-003', itemCode: 'PRAG-103', itemName: 'Hex Bolt M12x50 Grade 8.8', category: 'Fastener', hsnSac: '7318', unit: 'Nos', currentQty: 2000, reservedQty: 0, minReorderLevel: 500, unitCost: 12, sellingPrice: 15, location: 'Bay B-1' },
-  { id: 'INV-004', itemCode: 'PRAG-104', itemName: 'Mild Steel Round Bar 32mm', category: 'Raw Material', hsnSac: '7215', unit: 'Kg', currentQty: 350, reservedQty: 0, minReorderLevel: 80, unitCost: 72, sellingPrice: 82, location: 'Bay A-3' },
-  { id: 'INV-005', itemCode: 'PRAG-105', itemName: 'Welding Electrode E7018 4mm', category: 'Consumable', hsnSac: '8311', unit: 'Kg', currentQty: 80, reservedQty: 0, minReorderLevel: 25, unitCost: 150, sellingPrice: 180, location: 'Bay C-1' },
-  { id: 'INV-006', itemCode: 'PRAG-106', itemName: 'Aluminium Round Bar 50mm', category: 'Raw Material', hsnSac: '7604', unit: 'Kg', currentQty: 180, reservedQty: 10, minReorderLevel: 50, unitCost: 210, sellingPrice: 245, location: 'Bay A-4' },
-  { id: 'INV-007', itemCode: 'PRAG-107', itemName: 'Brass C360 Rod 25mm', category: 'Raw Material', hsnSac: '7407', unit: 'Kg', currentQty: 45, reservedQty: 0, minReorderLevel: 60, unitCost: 480, sellingPrice: 540, location: 'Bay A-5' },
-  { id: 'INV-008', itemCode: 'PRAG-108', itemName: 'Deep Groove Ball Bearing 6204 ZZ', category: 'Standard Part', hsnSac: '8482', unit: 'Nos', currentQty: 75, reservedQty: 5, minReorderLevel: 20, unitCost: 145, sellingPrice: 185, location: 'Bay B-2' },
-  { id: 'INV-009', itemCode: 'PRAG-109', itemName: 'Pneumatic Cylinder DC63x100', category: 'Standard Part', hsnSac: '8412', unit: 'Nos', currentQty: 8, reservedQty: 0, minReorderLevel: 5, unitCost: 3200, sellingPrice: 3800, location: 'Bay B-3' },
-  { id: 'INV-010', itemCode: 'PRAG-110', itemName: 'Proximity Sensor M18 PNP', category: 'Standard Part', hsnSac: '8536', unit: 'Nos', currentQty: 0, reservedQty: 0, minReorderLevel: 10, unitCost: 850, sellingPrice: 1050, location: 'Bay B-4' },
-  { id: 'INV-011', itemCode: 'PRAG-111', itemName: 'CNC Machined Housing A-101', category: 'Machined Component', hsnSac: '8466', unit: 'Nos', currentQty: 35, reservedQty: 4, minReorderLevel: 15, unitCost: 1250, sellingPrice: 1650, location: 'Bay D-1' },
-  { id: 'INV-012', itemCode: 'PRAG-112', itemName: 'Shaft Collar 1/2in SS', category: 'Standard Part', hsnSac: '8483', unit: 'Nos', currentQty: 14, reservedQty: 0, minReorderLevel: 25, unitCost: 95, sellingPrice: 130, location: 'Bay B-5' },
-  { id: 'INV-013', itemCode: 'PRAG-113', itemName: 'Carbide Insert CNMG 120408', category: 'Consumable', hsnSac: '8207', unit: 'Nos', currentQty: 60, reservedQty: 6, minReorderLevel: 40, unitCost: 310, sellingPrice: 390, location: 'Bay C-2' },
-  { id: 'INV-014', itemCode: 'PRAG-114', itemName: 'MS Angle 40x40x5', category: 'Raw Material', hsnSac: '7216', unit: 'Kg', currentQty: 90, reservedQty: 0, minReorderLevel: 120, unitCost: 68, sellingPrice: 78, location: 'Bay A-6' },
-  { id: 'INV-015', itemCode: 'PRAG-115', itemName: 'Gear Motor 0.5kW 30:1', category: 'Standard Part', hsnSac: '8425', unit: 'Nos', currentQty: 3, reservedQty: 1, minReorderLevel: 2, unitCost: 7800, sellingPrice: 9200, location: 'Bay B-6' },
-  { id: 'INV-016', itemCode: 'PRAG-116', itemName: 'Machined Flange P-220', category: 'Machined Component', hsnSac: '8466', unit: 'Nos', currentQty: 0, reservedQty: 0, minReorderLevel: 10, unitCost: 640, sellingPrice: 850, location: 'Bay D-2' }
-];
 
 const InventoryPage = ({ view: viewProp }) => {
   const { logoUrl, companyName: brandName, company: brandCompany } = useCompanyBranding(defaultLogoUrl);
@@ -47,7 +39,15 @@ const InventoryPage = ({ view: viewProp }) => {
   const [customCategories, setCustomCategories] = useState(() => {
     return getInventoryCategories().filter((category) => !DEFAULT_CATEGORIES.includes(category));
   });
-  const [customUnits, setCustomUnits] = useState(getCustomUnits);
+  // Custom units come from the PostgreSQL UOM Master, never browser storage.
+  const [customUnits, setCustomUnits] = useState([]);
+  useEffect(() => {
+    let active = true;
+    listMasters('uoms')
+      .then((records) => { if (active) setCustomUnits(records.map((record) => record.code).filter(Boolean)); })
+      .catch(() => { if (active) setCustomUnits([]); });
+    return () => { active = false; };
+  }, []);
 
   const allCategories = useMemo(() => {
     return [...DEFAULT_CATEGORIES, ...customCategories];
@@ -85,8 +85,23 @@ const InventoryPage = ({ view: viewProp }) => {
   const importInventoryRows = async (rows) => {
     const mappedRows = rows.map(mapInventoryExcelRow);
     const entries = createInventoryItemsFromExcelRows(mappedRows, items);
-    saveItemsToStorage([...entries, ...items]);
-    return { success: entries.length, skipped: 0 };
+    let success = 0;
+    for (const entry of entries) {
+      await saveInventoryItem({
+        itemCode: entry.itemCode,
+        materialName: entry.itemName,
+        category: entry.category,
+        unit: entry.unit,
+        hsnSac: entry.hsnSac,
+        reorderLevel: entry.minReorderLevel,
+        unitPrice: entry.unitCost,
+        location: entry.location,
+        currentQty: entry.currentQty
+      });
+      success += 1;
+    }
+    await refreshInventory();
+    return { success, skipped: Math.max(0, rows.length - success) };
   };
   const [adjustFormData, setAdjustFormData] = useState({
     itemId: '',
@@ -97,77 +112,47 @@ const InventoryPage = ({ view: viewProp }) => {
     date: new Date().toISOString().slice(0, 10)
   });
 
-  // Load from localStorage
-  useEffect(() => {
-    try {
-      const storedItems = localStorage.getItem('inventoryItems');
-      let parsed = storedItems ? JSON.parse(storedItems) : [];
-      if (!Array.isArray(parsed)) parsed = [];
-      if (parsed.length === 0) {
-        parsed = SEED_INVENTORY_ITEMS.map((s) => ({ ...s }));
-      } else if (Number(localStorage.getItem('inventorySeedVersion') || 1) < 2) {
-        // Older/empty seed: append any missing dummy items once (keeps user's own edits)
-        const have = new Set(parsed.map((i) => i.id));
-        parsed = [...parsed, ...SEED_INVENTORY_ITEMS.filter((s) => !have.has(s.id)).map((s) => ({ ...s }))];
-      }
-      localStorage.setItem('inventoryItems', JSON.stringify(parsed));
-      localStorage.setItem('inventorySeedVersion', '2');
-      setItems(parsed);
-    } catch {
-      setItems([]);
+  const refreshInventory = async () => {
+    const [rows, ledger] = await Promise.all([listInventoryItems(), listAllStockLedger()]);
+    setItems(rows.map((row) => ({
+      ...(row.payload || {}),
+      id: row.item_code || row.payload?.id,
+      itemCode: row.item_code,
+      itemName: row.material_name,
+      category: row.category,
+      hsnSac: row.hsn_code,
+      unit: row.unit,
+      currentQty: Number(row.current_qty) || 0,
+      minReorderLevel: Number(row.reorder_level) || 0,
+      minOrderQty: Number(row.min_order_qty) || 0,
+      unitCost: Number(row.unit_price) || 0,
+      location: row.location,
+      shelfLifeManaged: Boolean(row.shelf_life_managed),
+      shelfLifeDays: Number(row.shelf_life_days) || 0,
+      recordVersion: Number(row.version) || 1
+    })));
+    setTransactions(ledger.map((row) => ({
+      id: row.id,
+      date: String(row.entry_date || '').slice(0, 10),
+      itemCode: row.item_code,
+      itemName: row.payload?.itemName || row.item_code,
+      unit: row.unit,
+      type: ['OUT', 'ISSUE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT'].includes(String(row.movement_type).toUpperCase()) ? 'OUT' : 'IN',
+      quantity: Number(row.quantity) || 0,
+      balanceAfter: Number(row.balance_after) || 0,
+      reason: row.reason,
+      reference: row.source_doc_ref || '-'
+    })));
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('inventory-authority-updated'));
     }
+  };
 
-    try {
-      const storedTx = localStorage.getItem('stockTransactions');
-      setTransactions(storedTx ? JSON.parse(storedTx) : []);
-    } catch {
-      setTransactions([]);
-    }
+  useEffect(() => {
+    refreshInventory().catch((error) => alert(error.message || 'Inventory could not be loaded from PostgreSQL.'));
   }, []);
 
-  const saveItemsToStorage = (updated) => {
-    setItems(updated);
-    localStorage.setItem('inventoryItems', JSON.stringify(updated));
-  };
-
-  const saveTransactionsToStorage = (updatedTx) => {
-    setTransactions(updatedTx);
-    localStorage.setItem('stockTransactions', JSON.stringify(updatedTx));
-  };
-
-  const selectInventoryTab = (tab) => {
-    if (tab === 'inventory' || tab === 'transactions') {
-      try {
-        const storedItems = localStorage.getItem('inventoryItems');
-        const storedTransactions = localStorage.getItem('stockTransactions');
-        if (storedItems) setItems(JSON.parse(storedItems));
-        if (storedTransactions) setTransactions(JSON.parse(storedTransactions));
-      } catch { /* keep the current view if local cache data is malformed */ }
-    }
-    setActiveTab(tab);
-  };
-
-  // Another user's newer save won a per-record conflict: the sync engine has
-  // already replaced the localStorage copy with the server version — refresh
-  // this page's state so the operator sees the latest data immediately.
-  useEffect(() => {
-    const refreshFromStorage = () => {
-      try {
-        const storedItems = localStorage.getItem('inventoryItems');
-        if (storedItems) setItems(JSON.parse(storedItems));
-        const storedTx = localStorage.getItem('stockTransactions');
-        if (storedTx) setTransactions(JSON.parse(storedTx));
-      } catch {
-        /* keep current state */
-      }
-    };
-    window.addEventListener('erp-records-conflict', refreshFromStorage);
-    window.addEventListener('erp-records-synced', refreshFromStorage);
-    return () => {
-      window.removeEventListener('erp-records-conflict', refreshFromStorage);
-      window.removeEventListener('erp-records-synced', refreshFromStorage);
-    };
-  }, []);
+  const selectInventoryTab = (tab) => setActiveTab(tab);
 
   // Store login: keep the active tab/status filter in sync with the requested view,
   // and auto-open the Add / Quick Adjustment modals when deep-linked.
@@ -301,7 +286,7 @@ const InventoryPage = ({ view: viewProp }) => {
   };
 
   // Save Item
-  const handleSaveItem = (e) => {
+  const handleSaveItem = async (e) => {
     e.preventDefault();
     if (!itemFormData.itemName.trim()) {
       alert('Please fill in Item Name.');
@@ -317,28 +302,40 @@ const InventoryPage = ({ view: viewProp }) => {
         `PRAG-${Math.floor(100 + Math.random() * 900)}`
     };
 
-    let updated;
-    if (isEditingItem) {
-      updated = items.map((it) => (it.id === payload.id ? payload : it));
-    } else {
-      updated = [payload, ...items];
+    try {
+      await saveInventoryItem(payload, isEditingItem ? Number(items.find((it) => it.id === payload.itemCode)?.recordVersion || 1) : undefined);
+      if (!isEditingItem && Number(payload.currentQty) > 0) {
+        await postOpeningStock({
+          idempotencyKey: `opening-${payload.itemCode}-${Date.now()}`,
+          itemCode: payload.itemCode,
+          materialName: payload.itemName,
+          quantity: Number(payload.currentQty),
+          unit: payload.unit,
+          unitCost: payload.unitCost,
+          reason: 'Opening stock'
+        });
+      }
+      await refreshInventory();
+      setShowItemModal(false);
+    } catch (error) {
+      alert(error.message || 'Inventory item could not be saved to PostgreSQL.');
     }
-
-    saveItemsToStorage(updated);
-    setShowItemModal(false);
   };
 
-  // Delete Item
-  const handleDeleteItem = (id) => {
+  // Delete Item — server confirms the soft delete before the local cache changes.
+  const handleDeleteItem = async (id) => {
     const item = items.find((entry) => String(entry.id) === String(id));
-    if (isAdmin() && item && window.confirm(`Delete inventory item ${item.itemCode || item.itemName || id}? Only unused items with zero stock can be deleted.`)) {
-      const reason = window.prompt(`Reason for deleting ${item.itemCode || item.itemName || id}:`)?.trim();
-      if (!reason) return;
-      const reasonStore = (() => { try { return JSON.parse(localStorage.getItem('erp_record_delete_reasons') || '{}'); } catch { return {}; } })();
-      reasonStore.inventoryItems = { ...(reasonStore.inventoryItems || {}), [String(id)]: reason };
-      localStorage.setItem('erp_record_delete_reasons', JSON.stringify(reasonStore));
-      const updated = items.filter((it) => it.id !== id);
-      saveItemsToStorage(updated);
+    if (!isAdmin() || !item) return;
+    if (!window.confirm(`Delete inventory item ${item.itemCode || item.itemName || id}? Only unused items with zero stock can be deleted.`)) return;
+    const reason = window.prompt(`Reason for deleting ${item.itemCode || item.itemName || id}:`)?.trim();
+    if (!reason) return;
+    try {
+      const itemCode = String(item.itemCode || item.id);
+      const fresh = await getInventoryItem(itemCode);
+      await deleteInventoryItem(itemCode, fresh.version, reason);
+      await refreshInventory();
+    } catch (err) {
+      alert(err.message);
     }
   };
 
@@ -348,10 +345,18 @@ const InventoryPage = ({ view: viewProp }) => {
     return created;
   };
 
-  const handleCreateUnit = ({ name, symbol }) => {
-    const created = addCustomUnit({ name, symbol });
-    setCustomUnits(getCustomUnits());
-    return created;
+  const handleCreateUnit = async ({ name, symbol }) => {
+    const code = String(symbol || name || '').trim();
+    if (!code) throw new Error('Unit symbol is required.');
+    const response = await createMaster('uoms', {
+      code,
+      name: String(name || code).trim(),
+      symbol: code,
+      description: ''
+    });
+    const records = await listMasters('uoms');
+    setCustomUnits(records.map((record) => record.code).filter(Boolean));
+    return response.record?.code || code;
   };
 
   // Open Stock Adjustment Modal
@@ -368,7 +373,7 @@ const InventoryPage = ({ view: viewProp }) => {
   };
 
   // Save Stock Adjustment
-  const handleSaveAdjustment = (e) => {
+  const handleSaveAdjustment = async (e) => {
     e.preventDefault();
     const qtyChange = Number(adjustFormData.quantity);
     if (!qtyChange || qtyChange <= 0) {
@@ -379,43 +384,23 @@ const InventoryPage = ({ view: viewProp }) => {
     const targetItem = items.find((it) => it.id === adjustFormData.itemId);
     if (!targetItem) return;
 
-    const current = Number(targetItem.currentQty) || 0;
-    let newQty = current;
-
-    if (adjustFormData.adjustType === 'IN') {
-      newQty = current + qtyChange;
-    } else {
-      if (qtyChange > current) {
-        if (!window.confirm('Adjusted quantity is greater than current stock. Proceed anyway?')) {
-          return;
-        }
-      }
-      newQty = Math.max(0, current - qtyChange);
+    const quantity = adjustFormData.adjustType === 'OUT' ? -qtyChange : qtyChange;
+    try {
+      await postInventoryAdjustment({
+        idempotencyKey: `adjust-${targetItem.itemCode}-${Date.now()}`,
+        itemCode: targetItem.itemCode,
+        materialName: targetItem.itemName,
+        quantity,
+        unit: targetItem.unit,
+        entryDate: adjustFormData.date,
+        reason: adjustFormData.reason,
+        reference: adjustFormData.reference || '-'
+      });
+      await refreshInventory();
+      setShowAdjustModal(false);
+    } catch (error) {
+      alert(error.message || 'Inventory adjustment could not be saved to PostgreSQL.');
     }
-
-    const updatedItems = items.map((it) =>
-      it.id === targetItem.id ? { ...it, currentQty: newQty } : it
-    );
-    saveItemsToStorage(updatedItems);
-
-    // Record Transaction
-    const newTx = {
-      id: `tx-${Date.now()}`,
-      date: adjustFormData.date,
-      itemCode: targetItem.itemCode,
-      itemName: targetItem.itemName,
-      unit: targetItem.unit,
-      type: adjustFormData.adjustType,
-      quantity: qtyChange,
-      balanceAfter: newQty,
-      reason: adjustFormData.reason,
-      reference: adjustFormData.reference || '-'
-    };
-
-    const updatedTx = [newTx, ...transactions];
-    saveTransactionsToStorage(updatedTx);
-
-    setShowAdjustModal(false);
   };
 
   return (

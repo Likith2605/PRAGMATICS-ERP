@@ -57,10 +57,6 @@ const section = (name) => {
   console.log('-'.repeat(name.length));
 };
 
-// ---------------------------------------------------------------------------
-// Mock localStorage
-// ---------------------------------------------------------------------------
-
 const company = {
   companyName: 'PRAGMATIC ENGINEERS',
   gstin: '29AKWPP8736E1ZA',
@@ -241,28 +237,20 @@ async function runTests() {
   // ── 3. buildTransactionRows ──
   section('3. buildTransactionRows');
 
-  // Mock localStorage
-  const originalLocalStorage = globalThis.localStorage;
-  const store = new Map();
-  const mockLS = {
-    getItem: (k) => store.get(k) || null,
-    setItem: (k, v) => store.set(k, v),
-    removeItem: (k) => store.delete(k),
-    clear: () => store.clear()
+  const sourceRecords = {
+    customerInvoices: [customerRecord],
+    supplierInvoices: [supplierRecord],
+    debitNotes: [debitNoteRecord],
+    vendorMaster,
+    company
   };
-  globalThis.localStorage = mockLS;
-
-  store.set('companySettings', JSON.stringify(company));
-  store.set('customerInvoiceHistory', JSON.stringify([customerRecord]));
-  store.set('supplierInvoiceHistory', JSON.stringify([supplierRecord]));
-  store.set('vendorMaster', JSON.stringify(vendorMaster));
-  store.set('debitNotes', JSON.stringify([debitNoteRecord]));
 
   // Test with Sale + Purchase types
   const rowsSP = buildTransactionRows({
     dateFrom: '2024-01-01',
     dateTo: '2024-01-31',
-    selectedTypes: [TransactionTypes.SALE, TransactionTypes.PURCHASE]
+    selectedTypes: [TransactionTypes.SALE, TransactionTypes.PURCHASE],
+    ...sourceRecords
   });
   assertEqual(rowsSP.length, 2, 'Sale + Purchase = 2 rows');
   const saleRow = rowsSP.find((r) => r.transactionType === TransactionTypes.SALE);
@@ -294,13 +282,15 @@ async function runTests() {
   const beforeBoundary = { ...customerRecord, date: '2023-12-31', reference: 'INV-BEFORE', payload: { ...customerRecord.payload, invoiceDetails: { ...customerRecord.payload.invoiceDetails, invoiceDate: '2023-12-31', invoiceNumber: 'INV-BEFORE' } } };
   const fromBoundary = { ...customerRecord, date: '2024-01-01', reference: 'INV-FROM', payload: { ...customerRecord.payload, invoiceDetails: { ...customerRecord.payload.invoiceDetails, invoiceDate: '2024-01-01', invoiceNumber: 'INV-FROM' } } };
   const toBoundary = { ...customerRecord, date: '2024-01-31', reference: 'INV-TO', payload: { ...customerRecord.payload, invoiceDetails: { ...customerRecord.payload.invoiceDetails, invoiceDate: '2024-01-31', invoiceNumber: 'INV-TO' } } };
-  store.set('customerInvoiceHistory', JSON.stringify([beforeBoundary, fromBoundary, toBoundary]));
-  const boundaryRows = buildTransactionRows({ dateFrom: '2024-01-01', dateTo: '2024-01-31', selectedTypes: [TransactionTypes.SALE] });
+  const boundaryRows = buildTransactionRows({
+    dateFrom: '2024-01-01', dateTo: '2024-01-31',
+    selectedTypes: [TransactionTypes.SALE],
+    ...sourceRecords,
+    customerInvoices: [beforeBoundary, fromBoundary, toBoundary]
+  });
   assertEqual(boundaryRows.length, 2, 'Both date boundaries included and outside date excluded');
   assert(boundaryRows.some((row) => row.invoiceNo === 'INV-FROM'), 'From Date transaction included');
   assert(boundaryRows.some((row) => row.invoiceNo === 'INV-TO'), 'To Date transaction included');
-  store.set('customerInvoiceHistory', JSON.stringify([customerRecord]));
-
   // Duplicate handling: successful exports block; failed exports are retryable.
   const duplicateCandidate = { transactionType: TransactionTypes.SALE, invoiceNo: 'INV-2024-001' };
   const blocked = excludePreviouslyExportedRows([duplicateCandidate], [{ export_status: 'generated', validation_summary: { voucherKeys: ['sale:INV-2024-001'] } }]);
@@ -317,33 +307,37 @@ async function runTests() {
   const rowsReceipt = buildTransactionRows({
     dateFrom: '2024-01-01',
     dateTo: '2024-01-31',
-    selectedTypes: [TransactionTypes.CUSTOMER_RECEIPT]
+    selectedTypes: [TransactionTypes.CUSTOMER_RECEIPT],
+    ...sourceRecords
   });
   assertEqual(rowsReceipt.length, 1, 'Customer Receipt = 1 row (has amountReceived)');
   if (rowsReceipt[0]) {
     assertEqual(rowsReceipt[0].transactionType, TransactionTypes.CUSTOMER_RECEIPT, 'Receipt type');
     assertEqual(rowsReceipt[0].amount, 50000, 'Receipt amount = amountReceived');
     assertEqual(rowsReceipt[0].balance, 0, 'Receipt balance = 0');
-    const mappedReceipt = mapSelectedToTally({ selectedRows: rowsReceipt, company });
+    const mappedReceipt = mapSelectedToTally({ selectedRows: rowsReceipt, company, vendorMaster });
     assertEqual(mappedReceipt.vouchers[0]?.voucherType, 'Receipt', 'Customer receipt maps to a receipt voucher');
   }
   const receiptOnPaymentDate = { ...customerRecord, payload: { ...customerRecord.payload, invoiceDetails: { ...customerRecord.payload.invoiceDetails, paymentDate: '2024-02-01' } } };
-  store.set('customerInvoiceHistory', JSON.stringify([receiptOnPaymentDate]));
-  const paymentDateRows = buildTransactionRows({ dateFrom: '2024-02-01', dateTo: '2024-02-01', selectedTypes: [TransactionTypes.CUSTOMER_RECEIPT] });
+  const paymentDateRows = buildTransactionRows({
+    dateFrom: '2024-02-01', dateTo: '2024-02-01',
+    selectedTypes: [TransactionTypes.CUSTOMER_RECEIPT],
+    ...sourceRecords,
+    customerInvoices: [receiptOnPaymentDate]
+  });
   assertEqual(paymentDateRows.length, 1, 'Receipt date filtering uses the recorded payment date');
-  store.set('customerInvoiceHistory', JSON.stringify([customerRecord]));
-
   // Test with Supplier Payment type
   const rowsPayment = buildTransactionRows({
     dateFrom: '2024-01-01',
     dateTo: '2024-01-31',
-    selectedTypes: [TransactionTypes.SUPPLIER_PAYMENT]
+    selectedTypes: [TransactionTypes.SUPPLIER_PAYMENT],
+    ...sourceRecords
   });
   assertEqual(rowsPayment.length, 1, 'Supplier Payment = 1 row (has amountPaid)');
   if (rowsPayment[0]) {
     assertEqual(rowsPayment[0].transactionType, TransactionTypes.SUPPLIER_PAYMENT, 'Payment type');
     assertEqual(rowsPayment[0].amount, 30000, 'Payment amount = amountPaid');
-    const mappedPayment = mapSelectedToTally({ selectedRows: rowsPayment, company });
+    const mappedPayment = mapSelectedToTally({ selectedRows: rowsPayment, company, vendorMaster });
     assertEqual(mappedPayment.vouchers[0]?.voucherType, 'Payment', 'Supplier payment maps to a payment voucher');
   }
 
@@ -351,7 +345,8 @@ async function runTests() {
   const rowsDN = buildTransactionRows({
     dateFrom: '2024-01-01',
     dateTo: '2024-02-28',
-    selectedTypes: [TransactionTypes.DEBIT_NOTE]
+    selectedTypes: [TransactionTypes.DEBIT_NOTE],
+    ...sourceRecords
   });
   assertEqual(rowsDN.length, 1, 'Debit Note = 1 row');
   if (rowsDN[0]) {
@@ -363,7 +358,8 @@ async function runTests() {
   const rowsFiltered = buildTransactionRows({
     dateFrom: '2024-01-16',
     dateTo: '2024-01-31',
-    selectedTypes: [TransactionTypes.SALE, TransactionTypes.PURCHASE]
+    selectedTypes: [TransactionTypes.SALE, TransactionTypes.PURCHASE],
+    ...sourceRecords
   });
   assertEqual(rowsFiltered.length, 1, 'Date filter: only purchase (Jan 20) in range');
   if (rowsFiltered[0]) {
@@ -374,7 +370,8 @@ async function runTests() {
   const rowsEmpty = buildTransactionRows({
     dateFrom: '2024-01-01',
     dateTo: '2024-01-31',
-    selectedTypes: []
+    selectedTypes: [],
+    ...sourceRecords
   });
   assertEqual(rowsEmpty.length, 0, 'No types = no rows');
 
@@ -384,10 +381,11 @@ async function runTests() {
   const allRows = buildTransactionRows({
     dateFrom: '2024-01-01',
     dateTo: '2024-01-31',
-    selectedTypes: [TransactionTypes.SALE, TransactionTypes.PURCHASE]
+    selectedTypes: [TransactionTypes.SALE, TransactionTypes.PURCHASE],
+    ...sourceRecords
   });
 
-  const result = mapSelectedToTally({ selectedRows: allRows, company });
+  const result = mapSelectedToTally({ selectedRows: allRows, company, vendorMaster });
   assert(result.vouchers.length >= 1, 'At least 1 valid voucher');
   assert(result.masters.customerLedgers.length >= 1, 'Customer ledgers collected');
   assert(result.masters.supplierLedgers.length >= 1, 'Supplier ledgers collected');
@@ -400,7 +398,7 @@ async function runTests() {
   });
   const missingPartyMapping = validateVouchers([{ ...result.vouchers[0], partyLedger: '', partyName: 'Unknown Customer' }]);
   assert(missingPartyMapping.invalid[0]?.errors.some((error) => error.includes('customer or supplier mapping')), 'Missing party mapping is rejected');
-  const missingCompany = mapSelectedToTally({ selectedRows: allRows, company: {} });
+  const missingCompany = mapSelectedToTally({ selectedRows: allRows, company: {}, vendorMaster });
   assertEqual(missingCompany.vouchers.length, 0, 'Missing company settings prevent export');
   assert(missingCompany.invalidVouchers.some((item) => item.errors.includes('Company name is missing from company settings.')), 'Missing company mapping is explained');
   const inconsistentGSTVoucher = { ...result.vouchers[0], totals: { ...result.vouchers[0]?.totals, cgst: 0, sgst: 0, igst: 0 } };
@@ -472,12 +470,12 @@ async function runTests() {
       invoiceDetails: { ...customerRecord.payload.invoiceDetails, creditNoteNumber: 'CN-001', creditNoteDate: '2024-02-02', creditNoteAmount: 2500, creditNoteTaxableAmount: 2500, creditNoteGSTAmount: 0, creditNoteCGST: 0, creditNoteSGST: 0, creditNoteIGST: 0 }
     }
   };
-  store.set('customerInvoiceHistory', JSON.stringify([customerRecord, creditRecord]));
-
   const rowsDNCN = buildTransactionRows({
     dateFrom: '2024-01-01',
     dateTo: '2024-02-28',
-    selectedTypes: [TransactionTypes.DEBIT_NOTE, TransactionTypes.CREDIT_NOTE]
+    selectedTypes: [TransactionTypes.DEBIT_NOTE, TransactionTypes.CREDIT_NOTE],
+    ...sourceRecords,
+    customerInvoices: [customerRecord, creditRecord]
   });
   // Debit note exists, credit note doesn't (no credit note data in test records)
   const dnRow = rowsDNCN.find((r) => r.transactionType === TransactionTypes.DEBIT_NOTE);
@@ -485,21 +483,37 @@ async function runTests() {
   assert(dnRow !== undefined, 'Debit note row present');
   assert(cnRow !== undefined, 'Credit note row present');
 
-  const resultDN = mapSelectedToTally({ selectedRows: [dnRow], company });
+  const resultDN = mapSelectedToTally({ selectedRows: [dnRow], company, vendorMaster });
   assert(resultDN.vouchers.length === 1, 'Debit note mapped to 1 voucher');
   if (resultDN.vouchers[0]) {
     assertEqual(resultDN.vouchers[0].voucherType, 'Debit Note', 'Debit Note voucher type');
   }
-  const resultCN = mapSelectedToTally({ selectedRows: [cnRow], company });
+  const resultCN = mapSelectedToTally({ selectedRows: [cnRow], company, vendorMaster });
   assertEqual(resultCN.vouchers.length, 1, 'Credit Note maps to one voucher');
   assertEqual(resultCN.vouchers[0]?.voucherType, 'Credit Note', 'Credit Note voucher type');
-  store.set('debitNotes', JSON.stringify([{ ...debitNoteRecord, status: 'Draft' }]));
-  const draftDebitRows = buildTransactionRows({ dateFrom: '2024-01-01', dateTo: '2024-02-28', selectedTypes: [TransactionTypes.DEBIT_NOTE] });
+  const draftDebitRows = buildTransactionRows({
+    dateFrom: '2024-01-01', dateTo: '2024-02-28',
+    selectedTypes: [TransactionTypes.DEBIT_NOTE],
+    ...sourceRecords,
+    debitNotes: [{ ...debitNoteRecord, status: 'Draft' }]
+  });
   assertEqual(draftDebitRows.length, 0, 'Draft debit notes are not treated as accounting vouchers');
-  store.set('debitNotes', JSON.stringify([debitNoteRecord]));
 
-  // ── 8. Restore localStorage ──
-  globalThis.localStorage = originalLocalStorage;
+  let missingCustomerSourceRejected = false;
+  try {
+    buildTransactionRows({
+      dateFrom: '2024-01-01',
+      dateTo: '2024-01-31',
+      selectedTypes: [TransactionTypes.SALE],
+      supplierInvoices: [],
+      debitNotes: [],
+      vendorMaster: [],
+      company
+    });
+  } catch (error) {
+    missingCustomerSourceRejected = /PostgreSQL Customer Invoice records are required/.test(error.message);
+  }
+  assert(missingCustomerSourceRejected, 'Missing PostgreSQL source records are rejected instead of silently falling back');
 
   // ── Summary ──
   console.log('\n' + '═'.repeat(60));

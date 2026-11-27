@@ -6,14 +6,10 @@ import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterMaterialRecords } from '../utils/historySearch.js';
 import { hasPermission } from '../utils/permissions.js';
 import {
-  getReceipts,
-  getReceipt,
-  getPurchaseOrders,
   getPOByRef,
   getPOProgress,
   createMaterialReceipt,
   updateMaterialReceipt,
-  deleteMaterialReceipt,
   getRejectionReports,
   getRejectionReport,
   getDebitNoteSummaryForRejection,
@@ -27,6 +23,10 @@ import {
   postApprovedMaterialToInventory} from '../utils/workflowService.js';
 import { saveWorkflowDocument, openWorkflowDocument } from '../utils/workflowFiles.js';
 import { generateMaterialReceiptPDF } from '../services/pdfGenerator.js';
+import { deleteMaterialReceiptApi, listMaterialReceiptsApi } from '../services/materialReceiptApi.js';
+import { listPurchaseOrders } from '../services/procurementIntakeApi.js';
+import { flushErpStateSync } from '../services/erpStateSync.js';
+import MaterialReceiptMigrationReview from '../components/MaterialReceiptMigrationReview.jsx';
 
 const badgeClass = (status) => `status-badge st-${String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
 const num = (v) => Number(v) || 0;
@@ -104,6 +104,11 @@ const MaterialReceiptsPage = () => {
   const [initialPO, setInitialPO] = useState(location.state?.newReceiptFor || '');
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
+  const [serverReceipts, setServerReceipts] = useState([]);
+  const [serverPOs, setServerPOs] = useState([]);
+  const [poLoadError, setPoLoadError] = useState('');
+  const [receiptsError, setReceiptsError] = useState('');
+  const [receiptsLoading, setReceiptsLoading] = useState(true);
   const [receiptSearch, setReceiptSearch] = useState('');
   const [awaitingSearch, setAwaitingSearch] = useState('');
   const [rejectionSearch, setRejectionSearch] = useState('');
@@ -148,7 +153,23 @@ const MaterialReceiptsPage = () => {
     }
   }, [location.state]);
 
-  const receipts = useMemo(() => getReceipts(), [tick]);
+  const refreshReceipts = async () => {
+    setReceiptsLoading(true);
+    try {
+      const [records, orders] = await Promise.all([listMaterialReceiptsApi(), listPurchaseOrders()]);
+      setServerReceipts(records);
+      setServerPOs(orders);
+      setPoLoadError('');
+      setReceiptsError('');
+      return records;
+    } catch (error) {
+      setServerReceipts([]);
+      setReceiptsError(`Material Receipts could not be loaded from PostgreSQL: ${error.message}`);
+      throw error;
+    } finally { setReceiptsLoading(false); }
+  };
+  useEffect(() => { refreshReceipts().catch(() => {}); }, []);
+  const receipts = useMemo(() => serverReceipts, [serverReceipts, tick]);
   const rejections = useMemo(() => getRejectionReports(), [tick]);
   const canCreate = hasPermission('receipt.create');
   const canViewRejections = hasPermission('rejection.view');
@@ -160,34 +181,27 @@ const MaterialReceiptsPage = () => {
     setTimeout(() => setMessage(null), 7000);
   };
 
-  const receipt = openReceipt ? getReceipt(openReceipt) : null;
+  /* Receipts and Purchase Orders are resolved only from PostgreSQL responses;
+   * a failed API load is shown as an error, not silently replaced by a cache. */
+  const receiptFromServer = (id) => serverReceipts.find((row) => String(row.receiptNumber) === String(id)) || null;
+  const receipt = openReceipt ? receiptFromServer(openReceipt) : null;
 
   // Purchase Orders still awaiting a material receipt (spec: pending > 0, not cancelled/closed)
   const awaitingPOs = useMemo(
     () =>
-      getPurchaseOrders()
+      serverPOs
         .map((po) => {
-          try {
-            return { poNumber: po.reference, ...getPOProgress(po.reference) };
-          } catch {
-            return null;
-          }
+          const progress = po.progress && typeof po.progress === 'object' ? po.progress : null;
+          if (!progress) return null;
+          return { poNumber: po.reference, ...progress, poStatus: po.status };
         })
         .filter((p) => p && p.ordered > 0 && p.pending > 0 && p.poStatus !== 'Cancelled'),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tick, receipts]
+    [serverPOs]
   );
 
   const createdPOs = useMemo(
-    () => getPurchaseOrders().map((po) => {
-      try {
-        return { ...po, progress: getPOProgress(po.reference) };
-      } catch {
-        return { ...po, progress: null };
-      }
-    }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tick, receipts]
+    () => serverPOs.map((po) => ({ ...po, progress: po.progress && typeof po.progress === 'object' ? po.progress : null })),
+    [serverPOs]
   );
   const searchedReceipts = filterMaterialRecords(receipts, receiptSearch, ['receiptNumber','poNumber','soNumber','vendor','invoiceNumber','receiptDate',(r) => r.receiptType || (r.isReplacement ? 'Replacement' : 'Original'),'qcStatus']);
   const searchedAwaitingPOs = filterMaterialRecords(awaitingPOs, awaitingSearch, ['poNumber','soNumber','vendor','dueDate','status']);
@@ -234,6 +248,9 @@ const MaterialReceiptsPage = () => {
           </button>
         )}
       </div>
+
+      {tab === 'receipts' && <MaterialReceiptMigrationReview onImported={refreshReceipts} />}
+      {receiptsLoading && <p role="status">Loading Material Receipts from PostgreSQL…</p>}
 
       {message && (
         <div
@@ -400,13 +417,16 @@ const MaterialReceiptsPage = () => {
         </div>
       )}
 
+      {receiptsError && <div className="alert alert-error" role="alert">{receiptsError}</div>}
+      {poLoadError && <div className="alert alert-error" role="alert">{poLoadError}</div>}
       {tab === 'receipts' &&
         (creating ? (
           <ReceiptForm
             key={editingReceipt ? `edit-${editingReceipt}` : `po-${initialPO}`}
             initialPO={initialPO}
-            editing={editingReceipt ? getReceipt(editingReceipt) : null}
-            onDone={(receiptNumber) => {
+            editing={editingReceipt ? receiptFromServer(editingReceipt) : null}
+            onDone={async (receiptNumber) => {
+              try { await refreshReceipts(); } catch { return; }
               const wasEditing = Boolean(editingReceipt);
               setCreating(false);
               setEditingReceipt(null);
@@ -427,14 +447,17 @@ const MaterialReceiptsPage = () => {
               setCreating(true);
             }}
             onDelete={(receiptNumber) => {
-              try {
-                deleteMaterialReceipt(receiptNumber);
-                setOpenReceipt(null);
-                setTick((t) => t + 1);
-                flash('ok', `Receipt ${receiptNumber} deleted.`);
-              } catch (err) {
-                flash('err', err.message);
-              }
+              (async () => {
+                try {
+                  const current = receipts.find((row) => String(row.receiptNumber) === String(receiptNumber));
+                  if (!current) throw new Error('Receipt is missing from the current PostgreSQL list. Refresh before deleting.');
+                  await deleteMaterialReceiptApi(receiptNumber, current.version || current.recordVersion, 'Deleted by Store');
+                  await refreshReceipts();
+                  setOpenReceipt(null);
+                  setTick((t) => t + 1);
+                  flash('ok', `Receipt ${receiptNumber} deleted.`);
+                } catch (err) { flash('err', err.message); }
+              })();
             }}
             flash={flash}
             canCreate={canCreate}
@@ -509,9 +532,17 @@ const MaterialReceiptsPage = () => {
 /* ------------------------------- receipt form ------------------------------- */
 
 export const ReceiptForm = ({ onDone, onCancel, onError, initialPO = '', editing = null }) => {
+  const [formPOs, setFormPOs] = useState([]);
+  useEffect(() => {
+    let active = true;
+    listPurchaseOrders()
+      .then((orders) => { if (active) setFormPOs(orders); })
+      .catch(() => { if (active) setFormPOs([]); });
+    return () => { active = false; };
+  }, []);
   const pos = useMemo(
-    () => getPurchaseOrders().filter((p) => !['Cancelled'].includes(p.status)),
-    []
+    () => formPOs.filter((p) => !['Cancelled'].includes(p.status)),
+    [formPOs]
   );
   const [poNumber, setPoNumber] = useState(editing?.poNumber || '');
   const [invoiceNumber, setInvoiceNumber] = useState(editing?.invoiceNumber || '');
@@ -629,11 +660,11 @@ export const ReceiptForm = ({ onDone, onCancel, onError, initialPO = '', editing
     }
   };
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
     try {
       if (editing) {
-        const result = updateMaterialReceipt(editing.receiptNumber, {
+        const result = await updateMaterialReceipt(editing.receiptNumber, {
           invoiceNumber,
           invoiceDate,
           dcNumber,
@@ -649,7 +680,7 @@ export const ReceiptForm = ({ onDone, onCancel, onError, initialPO = '', editing
         onDone(result.receipt.receiptNumber);
         return;
       }
-      const result = createMaterialReceipt({
+      const result = await createMaterialReceipt({
         poNumber,
         invoiceNumber,
         invoiceDate,
@@ -1369,10 +1400,14 @@ const ReceiptDetail = ({ receipt, onBack, onEdit, onDelete, flash, canCreate }) 
               <button
                 className="button-primary"
                 style={{ background: '#16a34a' }}
-                onClick={() => {
+                onClick={async () => {
                   try {
-                    const res = postApprovedMaterialToInventory(qc.qcNumber);
-                    flash('ok', `${res.posted} material line(s) added to inventory.`);
+                    /* postApprovedMaterialToInventory returns the server
+                     * confirmation: only then is the success message truthful. */
+                    const res = await postApprovedMaterialToInventory(qc.qcNumber);
+                    flash('ok', res.duplicate
+                      ? 'Approved material was already posted to inventory.'
+                      : `${res.movements?.length || 0} material line(s) added to inventory.`);
                   } catch (err) {
                     flash('err', err.message);
                   }
@@ -1548,9 +1583,13 @@ const RejectionsTab = ({ flash, tick, onTick }) => {
           {canForward && (
             <button
               className="button-primary"
-              onClick={() => {
+              onClick={async () => {
                 try {
                   forwardRejectionToPurchase(report.rejectionNumber, { dcNumber, dcDate, forwardRemarks });
+                  /* The report is stored through the PostgreSQL state mirror:
+                   * wait for the server confirmation before reporting success. */
+                  const synced = await flushErpStateSync();
+                  if (!synced.ok) throw new Error(synced.error || 'The server has not confirmed this change yet.');
                   flash('ok', 'Rejection Report + DC forwarded to Purchase.');
                   onTick();
                 } catch (err) {
@@ -1565,9 +1604,11 @@ const RejectionsTab = ({ flash, tick, onTick }) => {
             <button
               className="button-primary"
               style={{ background: '#b45309' }}
-              onClick={() => {
+              onClick={async () => {
                 try {
                   sendRejectionToVendor(report.rejectionNumber, { vendorRemarks });
+                  const synced = await flushErpStateSync();
+                  if (!synced.ok) throw new Error(synced.error || 'The server has not confirmed this change yet.');
                   flash('ok', 'Rejection documents sent to vendor.');
                   onTick();
                 } catch (err) {

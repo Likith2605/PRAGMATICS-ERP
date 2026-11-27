@@ -15,19 +15,61 @@ import MaterialStatusPanel from '../components/MaterialStatusPanel.jsx';
 import ProjectIdAutocomplete from '../components/ProjectIdAutocomplete.jsx';
 import { getDrawingInfo, openDrawing, attachDrawing } from '../utils/drawingLookup.js';
 import { deleteWorkflowDocument, openWorkflowDocument } from '../utils/workflowFiles.js';
-import { getProductionDispatchRequests, requestProductionDispatch } from '../utils/productionDispatchService.js';
 import VendorMasterAutocomplete from '../components/VendorMasterAutocomplete.jsx';
+import { findMachine, machineDisplay } from '../utils/storeService.js';
+import { listMasters } from '../services/masterApi.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { getCustomerPurchaseOrders } from '../services/customerPurchaseOrderApi.js';
+import { getMaterialRequests } from '../services/storeApi.js';
+import { listInventoryItems } from '../services/inventoryApi.js';
+import { listProcurementRecords } from '../services/procurementIntakeApi.js';
+import { normalizeInventoryItem } from '../utils/reportApiData.js';
 import {
-  createHTOutsourceRequest,
-  getHTOutsourceRequests,
-  findMachine,
-  machineDisplay
-} from '../utils/storeService.js';
+  listJobCards,
+  createJobCard,
+  updateJobCard,
+  requestJobCardDispatch,
+  listDispatchRequests,
+  listHtOutsource,
+  createHtOutsource
+} from '../services/productionApi.js';
 import {
   ACK_STATUS,
-  getProductionAckSummary,
-  getProcurementPhase
+  getProductionAckSummary
 } from '../utils/materialAckService.js';
+
+const useProductionAckSummary = () => {
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState('');
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([getMaterialRequests(), listInventoryItems()])
+      .then(async ([requests, inventoryRows]) => {
+        if (!active) return;
+        const inventory = inventoryRows.map(normalizeInventoryItem);
+        let indents = [];
+        let indentError = '';
+        try {
+          indents = await listProcurementRecords('purchaseIndent');
+        } catch (loadError) {
+          indentError = `Purchase Indent status is unavailable: ${loadError.message}`;
+        }
+        if (!active) return;
+        setRows(getProductionAckSummary({ requests, inventory, indents }));
+        setError(indentError);
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setRows([]);
+        setError(`Store acknowledgement data could not be loaded from PostgreSQL: ${loadError.message}`);
+      });
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  return { rows, error, refresh: () => setRefreshKey((key) => key + 1) };
+};
 
 /**
  * Production dashboard — "Store Material Acknowledgement".
@@ -37,16 +79,15 @@ import {
  */
 const StoreAckDashboard = () => {
   const navigate = useNavigate();
-  const [nonce, setNonce] = useState(0);
-  const rows = useMemo(() => getProductionAckSummary(), [nonce]);
+  const { rows, error, refresh } = useProductionAckSummary();
 
   const count = (status) => rows.filter((r) => r.ack.status === status).length;
   const pending = count(ACK_STATUS.PENDING);
   const full = count(ACK_STATUS.FULL);
   const partial = count(ACK_STATUS.PARTIAL);
   const none = count(ACK_STATUS.NONE);
-  const indentPending = rows.filter((r) => getProcurementPhase(r.mr.mrNumber) === 'Purchase Indent Pending').length;
-  const awaitingReceipt = rows.filter((r) => getProcurementPhase(r.mr.mrNumber) === 'Awaiting Material Receipt').length;
+  const indentPending = rows.filter((r) => r.phase === 'Purchase Indent Pending').length;
+  const awaitingReceipt = rows.filter((r) => r.phase === 'Awaiting Material Receipt').length;
   const shortMaterials = rows.reduce(
     (a, r) => a + r.lines.filter((l) => Number(l.shortageQty) > 0).length,
     0
@@ -65,12 +106,13 @@ const StoreAckDashboard = () => {
         <h3 className="block-title">Store Material Acknowledgement</h3>
         <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
           <span className="muted-text">Last acknowledgement: {lastAck}</span>
-          <button type="button" className="button-secondary button-small" onClick={() => setNonce((n) => n + 1)}>
+          <button type="button" className="button-secondary button-small" onClick={refresh}>
             Refresh
           </button>
         </div>
       </div>
 
+      {error && <div role="alert" className="form-error">{error}</div>}
       <div className="kpi-grid" style={{ marginBottom: '16px' }}>
         <div className="kpi-card">
           <span className="kpi-title">Pending Requests</span>
@@ -180,12 +222,13 @@ const StoreAckDashboard = () => {
  */
 const CreateAckNotice = ({ projectId }) => {
   const navigate = useNavigate();
+  const { rows, error } = useProductionAckSummary();
   const outstanding = useMemo(
     () =>
-      getProductionAckSummary().filter(
+      rows.filter(
         (r) => r.ack.status !== ACK_STATUS.FULL && (!projectId || (r.mr.projectId || '') === projectId)
       ),
-    [projectId]
+    [projectId, rows]
   );
 
   const pending = outstanding.filter((r) => r.ack.status === ACK_STATUS.PENDING).length;
@@ -204,6 +247,7 @@ const CreateAckNotice = ({ projectId }) => {
         fontSize: '13px'
       }}
     >
+      {error && <div role="alert" className="form-error">{error}</div>}
       <strong>Store Material Acknowledgement — </strong>
       {clear ? (
         <span>
@@ -334,6 +378,9 @@ const makeInitialFormData = () => ({
 
 const INITIAL_JOB_CARDS = [];
 
+const newCreateToken = () =>
+  globalThis.crypto?.randomUUID?.() || `jc-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+
 const ProductionPage = () => {
   const { logoUrl, companyName: brandName, company: brandCompany } = useCompanyBranding(defaultLogoUrl);
   const location = useLocation();
@@ -341,7 +388,11 @@ const ProductionPage = () => {
 
   const [mode, setMode] = useState('list'); // 'list' | 'create' | 'view'
   const [jobCards, setJobCards] = useState([]);
-  const [dispatchRequests, setDispatchRequests] = useState(() => getProductionDispatchRequests());
+  const [dispatchRequests, setDispatchRequests] = useState([]);
+  const [htRequests, setHtRequests] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [machineMasterError, setMachineMasterError] = useState('');
   const [salesOrders, setSalesOrders] = useState([]);
   const [customerPOs, setCustomerPOs] = useState([]);
   const [selectedJC, setSelectedJC] = useState(null);
@@ -418,32 +469,51 @@ const ProductionPage = () => {
     return jobCards.filter(isJobCardAssignedToMe);
   }, [jobCards, isEmployeeView, myEmpId, myName]);
 
-  // Load from localStorage
+  // PostgreSQL is authoritative for production records.
+  const loadProductionData = async () => {
+    setLoading(true);
+    setLoadError('');
+    try {
+      const [cards, requests, htrs] = await Promise.all([
+        listJobCards(), listDispatchRequests(), listHtOutsource()
+      ]);
+      setJobCards(cards);
+      setDispatchRequests(requests);
+      setHtRequests(htrs);
+    } catch (err) {
+      setLoadError(err.message || 'Could not load production data from PostgreSQL.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void loadProductionData(); }, []);
+
   useEffect(() => {
-    try {
-      const storedJC = localStorage.getItem('productionJobCards');
-      setJobCards(storedJC ? JSON.parse(storedJC) : []);
-    } catch {
-      setJobCards([]);
-    }
-
-    try {
-      const storedSO = localStorage.getItem('salesOrderHistory');
-      if (storedSO) setSalesOrders(JSON.parse(storedSO));
-    } catch {
-      setSalesOrders([]);
-    }
-
-    try {
-      const storedPO = localStorage.getItem('customerPOHistory');
-      if (storedPO) setCustomerPOs(JSON.parse(storedPO));
-    } catch {
-      setCustomerPOs([]);
-    }
+    let active = true;
+    listMasters('machines')
+      .then(() => { if (active) setMachineMasterError(''); })
+      .catch((error) => { if (active) setMachineMasterError(`Machine master could not be loaded from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
-    const refreshRequests = () => setDispatchRequests(getProductionDispatchRequests());
+    let active = true;
+    Promise.all([listSalesOrders(), getCustomerPurchaseOrders()])
+      .then(([orders, pos]) => {
+        if (!active) return;
+        setSalesOrders(orders);
+        setCustomerPOs(pos);
+      })
+      .catch((error) => {
+        if (!active) return;
+        setLoadError(error.message || 'Could not load Sales reference data from PostgreSQL.');
+      });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    const refreshRequests = () => { void loadProductionData(); };
     window.addEventListener('erp-state-change', refreshRequests);
     window.addEventListener('erp-records-synced', refreshRequests);
     return () => {
@@ -654,11 +724,6 @@ const ProductionPage = () => {
         }
       }));
     }
-  };
-
-  const saveJobCardsToStorage = (updated) => {
-    setJobCards(updated);
-    localStorage.setItem('productionJobCards', JSON.stringify(updated));
   };
 
   const handleSelectSalesOrder = (soRef) => {
@@ -935,7 +1000,7 @@ const ProductionPage = () => {
     });
   };
 
-  const handleSaveJobCard = (e) => {
+  const handleSaveJobCard = async (e) => {
     e.preventDefault();
     if (!formData.partName.trim()) {
       alert('Please enter Part / Component Name.');
@@ -952,43 +1017,36 @@ const ProductionPage = () => {
       ...formData,
       lotQty: formData.lotQty === '' || formData.lotQty === undefined ? formData.orderQuantity : formData.lotQty
     });
+    const existing = jobCards.find((j) => j.jobCardNumber === formData.jobCardNumber);
+    const record = {
+      ...normalizedForm,
+      // Project ID is read-only after creation — never allow it to change.
+      projectId: existing ? existing.projectId || normalizedProjectId : normalizedProjectId,
+      projectName: existing?.projectId
+        ? existing.projectName || getProjectNameForId(existing.projectId)
+        : normalizedForm.projectName || (normalizedProjectId ? getProjectNameForId(normalizedProjectId) : '')
+    };
 
-    let updated;
-    const existingIndex = jobCards.findIndex((j) => j.jobCardNumber === formData.jobCardNumber);
-    if (existingIndex !== -1) {
-      // Project ID is read-only after creation — never allow it to change on an existing Job Card.
-      const existing = jobCards[existingIndex];
-      const record = {
-        ...normalizedForm,
-        projectId: existing.projectId || normalizedProjectId,
-        projectName: existing.projectId
-          ? existing.projectName || getProjectNameForId(existing.projectId)
-          : normalizedForm.projectName
-      };
-      updated = [...jobCards];
-      updated[existingIndex] = record;
-      setSelectedJC(normalizeRouteCard(record));
-    } else {
-      const record = {
-        ...normalizedForm,
-        projectId: normalizedProjectId,
-        projectName: normalizedForm.projectName || (normalizedProjectId ? getProjectNameForId(normalizedProjectId) : '')
-      };
-      updated = [record, ...jobCards];
-      setSelectedJC(normalizeRouteCard(record));
+    try {
+      const result = existing
+        ? await updateJobCard(existing.jobCardNumber, Number(existing.version) || 1, record)
+        : await createJobCard(record, newCreateToken());
+      await loadProductionData();
+      setSelectedJC(normalizeRouteCard(result.record));
+      setFormData(normalizeRouteCard(result.record));
+      setMode('view');
+    } catch (err) {
+      alert(err.message || 'Could not save the Job Card to PostgreSQL.');
     }
-
-    saveJobCardsToStorage(updated);
-    setMode('view');
   };
 
   // Production only raises the persistent request; Sales owns challan creation.
-  const handleDispatchRequest = async(jc) => {
+  const handleDispatchRequest = async (jc) => {
     try {
-      const request = await requestProductionDispatch(jc.jobCardNumber);
-      setDispatchRequests(getProductionDispatchRequests());
+      const result = await requestJobCardDispatch(jc.jobCardNumber, Number(jc.version) || 1);
+      await loadProductionData();
       window.alert('Dispatch request sent successfully to the Sales Department.');
-      return request;
+      return result;
     } catch (error) {
       window.alert(error.message || 'Could not send the dispatch request.');
       return null;
@@ -1078,14 +1136,12 @@ const ProductionPage = () => {
       (!formData.operations.heatTreatment.outsourceMode && (formData.operations.heatTreatment.vendor || '').trim() !== '' && formData.operations.heatTreatment.vendor !== 'In-house' && formData.operations.heatTreatment.vendor !== 'Vendor name pending'));
 
   const linkedHTR = useMemo(() => {
-    void jobCards;
-    const list = getHTOutsourceRequests();
     const jcNo = mode === 'view' ? selectedJC?.jobCardNumber : formData.jobCardNumber;
     if (!jcNo) return null;
-    return list.find((r) => r.jobCardNumber === jcNo && r.status !== 'Cancelled') || null;
-  }, [mode, selectedJC, formData.jobCardNumber, jobCards]);
+    return htRequests.find((r) => r.jobCardNumber === jcNo && r.status !== 'Cancelled') || null;
+  }, [mode, selectedJC, formData.jobCardNumber, htRequests]);
 
-  const handleRaiseHTR = () => {
+  const handleRaiseHTR = async () => {
     const ht = formData.operations?.heatTreatment;
     if (!ht?.required) {
       alert('Heat Treatment is not marked as required on this Job Card.');
@@ -1109,9 +1165,10 @@ const ProductionPage = () => {
     }
     try {
       const vendorName = (ht.vendor || '').trim() === 'Vendor name pending' ? '' : (ht.vendor || '').trim();
-      const rec = createHTOutsourceRequest({
+      const result = await createHtOutsource({
         jobCardNumber: formData.jobCardNumber,
         projectId: formData.projectId || '',
+        partCode: formData.partNumber || formData.drawingNumber || '',
         partName: formData.partName || '',
         drawingNumber: formData.drawingNumber || '',
         processType: ht.processType || '',
@@ -1121,10 +1178,11 @@ const ProductionPage = () => {
         vendorName,
         needByDate: formData.targetDate || '',
         remarks: ht.remarks || ''
-      });
-      navigate('/ht-outsource', { state: { viewHtrNumber: rec.htrNumber, fromJobCard: formData.jobCardNumber } });
+      }, newCreateToken());
+      await loadProductionData();
+      navigate('/ht-outsource', { state: { viewHtrNumber: result.record.htrNumber, fromJobCard: formData.jobCardNumber } });
     } catch (e) {
-      alert(e.message);
+      alert(e.message || 'Could not raise the HT Outsource Request.');
     }
   };
 
@@ -1175,6 +1233,10 @@ const ProductionPage = () => {
           )}
         </div>
       </div>
+
+      {loading && <div className="form-error" style={{ marginBottom: '12px' }}>Loading production data from PostgreSQL…</div>}
+      {loadError && <div className="form-error" style={{ marginBottom: '12px' }}>{loadError}</div>}
+      {machineMasterError && <div role="alert" className="form-error" style={{ marginBottom: '12px' }}>{machineMasterError}</div>}
 
       {(mode !== 'list' || selectedJC?.drawingNumber || formData?.drawingNumber) && (
         <WorkflowNavigator
@@ -3047,7 +3109,7 @@ const ProductionPage = () => {
                         <div><strong>Vendor:</strong> {selectedJC.operations.heatTreatment.vendor || 'In-house'}</div>
                         <div><strong>Status:</strong> {selectedJC.operations.heatTreatment.status || 'Pending'}</div>
                         {(() => {
-                          const htr = getHTOutsourceRequests().find((r) => r.jobCardNumber === selectedJC.jobCardNumber && r.status !== 'Cancelled');
+                          const htr = htRequests.find((r) => r.jobCardNumber === selectedJC.jobCardNumber && r.status !== 'Cancelled');
                           if (!htr) return null;
                           return (
                             <div>

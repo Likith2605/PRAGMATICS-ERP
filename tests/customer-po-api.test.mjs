@@ -1,20 +1,22 @@
 import 'dotenv/config';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { getPool, closeDatabase } from '../server/database.js';
+import pg from 'pg';
 
-if (!process.env.DATABASE_URL) {
-  console.log('SKIP: DATABASE_URL is not configured.');
-  process.exit(0);
-}
+const testDatabaseUrl = process.env.ERP_TEST_DATABASE_URL;
+if (!testDatabaseUrl) throw new Error('ERP_TEST_DATABASE_URL is required; refusing to use DATABASE_URL.');
 if (!process.env.ERP_ADMIN_EMAIL || !process.env.ERP_ADMIN_PASSWORD) {
-  console.log('SKIP: ERP_ADMIN_EMAIL / ERP_ADMIN_PASSWORD are not configured.');
-  process.exit(0);
+  throw new Error('ERP_ADMIN_EMAIL / ERP_ADMIN_PASSWORD are required for the isolated integration test.');
 }
-const testDatabaseName = new URL(process.env.DATABASE_URL).pathname.slice(1);
-if (testDatabaseName !== 'pragmatics1_test_db') {
-  throw new Error(`Refusing Customer PO integration test against non-test database '${testDatabaseName}'.`);
-}
+const parsedTestUrl = new URL(testDatabaseUrl);
+const testDatabaseName = decodeURIComponent(parsedTestUrl.pathname.replace(/^\//, ''));
+if (testDatabaseName !== 'vyavastha_test') throw new Error('Refusing Customer PO test unless ERP_TEST_DATABASE_URL names exactly vyavastha_test.');
+const safetyPool = new pg.Pool({ connectionString: testDatabaseUrl });
+const identity = await safetyPool.query('SELECT current_database() AS name');
+await safetyPool.end();
+if (identity.rows[0]?.name !== 'vyavastha_test') throw new Error('Refusing Customer PO test writes: current_database() is not exactly vyavastha_test.');
+process.env.ERP_TEST_MODE = '1';
+const { getPool, closeDatabase } = await import('../server/database.js');
 
 const port = 3347;
 const vitePort = 5174;
@@ -62,7 +64,9 @@ const cleanup = async () => {
 };
 
 try {
-  server = spawn(process.execPath, ['server.js'], { env: { ...process.env, PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const serverEnv = { ...process.env, ERP_TEST_MODE: '1', ERP_TEST_DATABASE_URL: testDatabaseUrl, PORT: String(port) };
+  delete serverEnv.DATABASE_URL;
+  server = spawn(process.execPath, ['server.js'], { env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   server.stdout.on('data', () => {});
   server.stderr.on('data', () => {});
   let healthy = false;
@@ -70,14 +74,14 @@ try {
     try {
       const response = await fetch(`${base}/api/health`);
       const health = await response.json();
-      if (health.database?.connected) { healthy = true; break; }
+      if (health.ready && health.database?.migrations?.some((item) => item.version === '017_customer_po_versions')) { healthy = true; break; }
     } catch { /* server is starting */ }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   check(healthy, 'PostgreSQL API server starts with migrations available');
 
   vite = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(vitePort), '--strictPort'], {
-    env: { ...process.env, PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe']
+    env: serverEnv, stdio: ['ignore', 'pipe', 'pipe']
   });
   vite.stdout.on('data', () => {});
   vite.stderr.on('data', () => {});
@@ -96,6 +100,8 @@ try {
   adminToken = (await login()).token;
   secondClientToken = (await login()).token;
   check(Boolean(adminToken && secondClientToken && adminToken !== secondClientToken), 'two independent client sessions can authenticate');
+  const legacyMirror = await request('/api/state/customerPOHistory', { method: 'PUT', body: JSON.stringify({ data: [] }) });
+  check(legacyMirror.status === 400, 'generic ERP state API rejects Customer PO transaction history after conversion');
 
   const one = historical('SINGLE', [item('Single item', 3, 1, 50, 150, '01')]);
   const multiple = historical('MULTI', [item('Part A', 2, 1, 10, 20, '001'), item('Part B', 5, 2, 12.5, 62.5, '002')]);
@@ -141,8 +147,22 @@ try {
     items: [{ itemName: 'Live created item', quantity: 2, deliveredQty: 0, unitPrice: 8, amount: 16, gst: '18', unit: 'Nos' }],
     totals: { subtotal: 16, grandTotal: 18.88, totalGST: 2.88 }, amountInWords: 'fixture', currency: 'INR'
   };
-  const createdLive = await request('/api/customer-purchase-orders', { method: 'POST', body: JSON.stringify({ record: { reference: `${prefix}LIVE`, date: '2024-06-01', company: 'Live Fixture Customer', payload: livePayload } }) });
+  const createdLive = await request('/api/customer-purchase-orders', { method: 'POST', body: JSON.stringify({ createToken: prefix + 'TOKEN-LIVE', record: { reference: `${prefix}LIVE`, date: '2024-06-01', company: 'Live Fixture Customer', payload: livePayload } }) });
   check(createdLive.status === 201 && createdLive.body.record.recordType === 'Live', 'normal Customer PO creation also writes to PostgreSQL');
+  const retriedLive = await request('/api/customer-purchase-orders', { method: 'POST', body: JSON.stringify({ createToken: prefix + 'TOKEN-LIVE', record: { reference: `${prefix}LIVE`, date: '2024-06-01', company: 'Live Fixture Customer', payload: livePayload } }) });
+  check(retriedLive.status === 200 && retriedLive.body.duplicate === true, 'retry with the same idempotency token returns the existing Customer PO');
+  const editedPayload = { ...livePayload, poDetails: { ...livePayload.poDetails, notes: 'Version 2' } };
+  const editedLive = await request(`/api/customer-purchase-orders/${encodeURIComponent(`${prefix}LIVE`)}`, { method: 'PUT', body: JSON.stringify({ version: createdLive.body.record.version, record: { reference: `${prefix}LIVE`, date: '2024-06-01', company: 'Live Fixture Customer', payload: editedPayload } }) });
+  check(editedLive.status === 200 && editedLive.body.record.version === 2, 'edit is committed in PostgreSQL and increments the version');
+  const staleEdit = await request(`/api/customer-purchase-orders/${encodeURIComponent(`${prefix}LIVE`)}`, { method: 'PUT', body: JSON.stringify({ version: createdLive.body.record.version, record: { reference: `${prefix}LIVE`, date: '2024-06-01', company: 'Live Fixture Customer', payload: livePayload } }) });
+  check(staleEdit.status === 409, 'stale Customer PO edit is rejected');
+  const deletedLive = await request(`/api/customer-purchase-orders/${encodeURIComponent(`${prefix}LIVE`)}`, { method: 'DELETE', body: JSON.stringify({ version: editedLive.body.record.version, reason: 'isolated integration test' }) });
+  check(deletedLive.status === 200, 'Admin soft-delete of Customer PO is confirmed');
+  const deletedRow = await getPool().query('SELECT deleted_at,deleted_by,version FROM customer_purchase_orders WHERE po_number=$1', [`${prefix}LIVE`]);
+  check(deletedRow.rowCount === 1 && deletedRow.rows[0].deleted_at && deletedRow.rows[0].deleted_by, 'Customer PO deletion metadata persists in PostgreSQL');
+  check((await request(`/api/customer-purchase-orders/${encodeURIComponent(`${prefix}LIVE`)}`)).status === 404, 'soft-deleted Customer PO is absent from active reads');
+  const deletedImport = await request('/api/customer-purchase-orders/import', { method: 'POST', body: JSON.stringify({ records: [historical('LIVE', [item('Should not restore', 1, 0, 1, 1, 'X')])] }) });
+  check(deletedImport.body.outcomes[0]?.status === 'review', 'legacy import cannot restore a soft-deleted Customer PO number');
 
   const repeated = await request('/api/customer-purchase-orders/import', { method: 'POST', body: JSON.stringify({ records: [one, multiple, secondPO] }) });
   check(repeated.body.imported === 0 && repeated.body.duplicates === 0 && repeated.body.skippedItems === 4, 'repeated upload skips all four identical item lines without creating duplicate headers');

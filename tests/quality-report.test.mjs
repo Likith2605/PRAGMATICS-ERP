@@ -31,6 +31,7 @@ const { getLogoDataUri } = await import('../src/quality/report/logo.js');
 const { COMPANY_NAME } = await import('../src/quality/config.js');
 const { QUALITY_REPORT_FOOTER } = await import('../src/quality/report/footer.js');
 const { normalizeQualityNumber } = await import('../server/qualityPullSync.js');
+const { buildQualityReportSnapshot } = await import('../src/utils/qualityReportData.js');
 
 /* --------------------------------- test runner --------------------------------- */
 let passed = 0;
@@ -179,6 +180,31 @@ check('drawings and dispatches lists load', () => {
   const dispatches = api.listDispatches();
   eq(dispatches.length, 1, 'dispatch count');
   eq(dispatches[0].dispatcher_name, 'Anita Desai', 'dispatcher joined');
+});
+
+check('quality report builders accept authoritative PostgreSQL report data instead of cached snapshot', () => {
+  const pgSnapshot = buildQualityReportSnapshot({
+    drawings: [{ id: 'pg-drawing', drawing_no: 'PG-DRG', part_name: 'PostgreSQL Part' }],
+    checks: [{ id: 'pg-check', drawing_id: 'pg-drawing', checked_at: nowIso, inspector_name: 'PG Inspector' }],
+    dispatches: [{ id: 'pg-dispatch', drawing_id: 'pg-drawing', dispatch_no: 'PG-DSP', dispatched_by: 'PG Dispatcher' }],
+    drawingDetails: [{
+      id: 'pg-drawing', drawing_no: 'PG-DRG', part_name: 'PostgreSQL Part', dimensions: [
+        { id: 'pg-dimension', drawing_id: 'pg-drawing', dim_no: 1, nominal: 10, tol_upper: 1, tol_lower: -1 }
+      ]
+    }],
+    checkDetails: [{
+      id: 'pg-check', drawing_id: 'pg-drawing', checked_at: nowIso,
+      dimensions: [{
+        id: 'pg-dimension', drawing_id: 'pg-drawing', dim_no: 1, nominal: 10, tol_upper: 1, tol_lower: -1,
+        measurement: { id: 'pg-measurement', sample1: 10.5, pass: 1 }
+      }]
+    }]
+  });
+  const report = api.buildCheckReport('pg-check', pgSnapshot);
+  assert(report, 'report uses the explicit PostgreSQL snapshot');
+  eq(report.check.drawing_no, 'PG-DRG', 'PostgreSQL drawing relation is joined');
+  eq(report.rows[0].sample1, 10.5, 'measurement values are taken from the PostgreSQL API response');
+  eq(api.buildDispatchReport('pg-dispatch', pgSnapshot).dispatcher_name, 'PG Dispatcher', 'dispatcher identity is retained');
 });
 
 /* ----------------------------- individual report ----------------------------- */

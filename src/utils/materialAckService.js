@@ -97,11 +97,12 @@ export const ackStatusForLines = (lines) => {
  * Requests. Material already issued against those requests has left
  * `currentQty`, so it is subtracted back out to avoid double-penalising.
  */
-const committedToOtherRequests = (materialId, excludeMrNumber) => {
+const committedToOtherRequests = (materialId, excludeMrNumber, requests) => {
   const key = String(materialId || '');
   const exclude = String(excludeMrNumber || '');
+  const requestRows = Array.isArray(requests) ? requests : getMaterialRequests();
   let total = 0;
-  for (const mr of getMaterialRequests()) {
+  for (const mr of requestRows) {
     if (!mr || String(mr.mrNumber || '') === exclude) continue;
     if (!ACK_ELIGIBLE.has(mr.status)) continue;
     const ack = mr.acknowledgement;
@@ -122,15 +123,16 @@ const committedToOtherRequests = (materialId, excludeMrNumber) => {
  * `effectiveAvailable` is the number Stores may actually acknowledge —
  * on-hand, less reserved, less what other requests already hold.
  */
-export const computeAckLines = (mr, { excludeMrNumber = '' } = {}) => {
-  const inv = getInventoryItems();
+export const computeAckLines = (mr, { excludeMrNumber = '', requests, inventory } = {}) => {
+  const inv = Array.isArray(inventory) ? inventory : getInventoryItems();
+  const requestRows = Array.isArray(requests) ? requests : getMaterialRequests();
   const exclude = String(excludeMrNumber || mr?.mrNumber || '');
   return (mr?.items || []).map((it) => {
     const materialId = String(it.materialId || '');
     const invItem = inv.find((i) => i.itemCode === materialId) || null;
     const currentQty = num(invItem?.currentQty);
     const reservedQty = num(invItem?.reservedQty);
-    const blockedQty = committedToOtherRequests(materialId, exclude);
+    const blockedQty = committedToOtherRequests(materialId, exclude, requestRows);
     const effectiveAvailable = Math.max(0, currentQty - reservedQty - blockedQty);
     const requiredQty = num(it.requiredQty);
     const availableQty = Math.min(requiredQty, effectiveAvailable);
@@ -183,10 +185,11 @@ export const getAcknowledgementFor = (mrNumber) => {
 /* --------------------------- purchase indent linkage --------------------------- */
 
 /** Existing non-cancelled Purchase Indent raised for this Material Request. */
-export const findIndentForMR = (mrNumber) => {
+export const findIndentForMR = (mrNumber, indents) => {
   const target = String(mrNumber || '');
+  const indentRows = Array.isArray(indents) ? indents : getIndents();
   return (
-    getIndents().find(
+    indentRows.find(
       (i) =>
         i &&
         i.sourceType === 'materialRequest' &&
@@ -197,8 +200,8 @@ export const findIndentForMR = (mrNumber) => {
 };
 
 /** Where procurement stands for this request — used by the dashboard filters. */
-export const getProcurementPhase = (mrNumber) => {
-  const indent = findIndentForMR(mrNumber);
+export const getProcurementPhase = (mrNumber, indents) => {
+  const indent = findIndentForMR(mrNumber, indents);
   if (!indent) return '';
   if (indent.status === INDENT_STATUS.COMPLETED) return '';
   if (
@@ -294,7 +297,7 @@ export const linkPurchaseIndent = ({ mrNumber, indentNumber = '', remarks = '' }
     throw new Error('No shortage found — nothing to indent for this Material Request.');
   }
 
-  const indent = createPurchaseIndent({
+  const indentResult = createPurchaseIndent({
     soNumber: mr.salesOrderRef || '',
     reason: `Shortage from Material Request ${mrNumber}`,
     remarks: remarks || `Raised from the Store acknowledgement of ${mrNumber}.`,
@@ -317,9 +320,10 @@ export const linkPurchaseIndent = ({ mrNumber, indentNumber = '', remarks = '' }
       customer: mr.customer || '',
       productionJob: mr.jobCardNumber || '',
       source: 'Material Request Shortage'
-    }
+    },
+    persistToPostgres: typeof window !== 'undefined' && Boolean(window.document)
   });
-
+  const finish = (indent) => {
   const list = getMaterialRequests();
   writeLS(
     MR_KEY,
@@ -337,6 +341,8 @@ export const linkPurchaseIndent = ({ mrNumber, indentNumber = '', remarks = '' }
   );
 
   return { indent, created: true, changed: true };
+  };
+  return indentResult?.then ? indentResult.then(finish) : finish(indentResult);
 };
 
 /* ------------------------------ submit acknowledge ------------------------------ */
@@ -482,20 +488,22 @@ export const submitAcknowledgement = ({ mrNumber, lines = [], remarks = '' }) =>
  * Stores dashboard rows with procurement phase derived, so the page can apply
  * the required filters without duplicating any of this logic.
  */
-export const getAckQueue = () =>
-  getMaterialRequests()
+export const getAckQueue = ({ requests, inventory, indents } = {}) => {
+  const requestRows = Array.isArray(requests) ? requests : getMaterialRequests();
+  return requestRows
     .filter((m) => m && ACK_ELIGIBLE.has(m.status))
     .map((mr) => {
       const ack = getAcknowledgement(mr);
-      const lines = computeAckLines(mr);
+      const lines = computeAckLines(mr, { requests: requestRows, inventory });
       return {
         mr,
         ack,
         lines,
-        phase: getProcurementPhase(mr.mrNumber),
-        indentNumber: ack.purchaseIndentNumber || findIndentForMR(mr.mrNumber)?.indentNumber || ''
+        phase: getProcurementPhase(mr.mrNumber, indents),
+        indentNumber: ack.purchaseIndentNumber || findIndentForMR(mr.mrNumber, indents)?.indentNumber || ''
       };
     });
+};
 
 /** Apply one of `ACK_FILTERS` to a queue row. */
 export const matchesAckFilter = (row, filter) => {
@@ -511,13 +519,14 @@ export const matchesAckFilter = (row, filter) => {
 };
 
 /** Production dashboard — latest acknowledgement per Material Request. */
-export const getProductionAckSummary = () =>
-  getMaterialRequests()
+export const getProductionAckSummary = ({ requests, inventory, indents } = {}) => {
+  const requestRows = Array.isArray(requests) ? requests : getMaterialRequests();
+  return requestRows
     .filter((m) => m && ACK_ELIGIBLE.has(m.status))
     .map((mr) => {
       const ack = getAcknowledgement(mr);
-      const lines = computeAckLines(mr);
-      const indent = findIndentForMR(mr.mrNumber);
+      const lines = computeAckLines(mr, { requests: requestRows, inventory });
+      const indent = findIndentForMR(mr.mrNumber, indents);
       return {
         mr,
         ack,
@@ -530,3 +539,4 @@ export const getProductionAckSummary = () =>
         lastAcknowledgedAt: ack.acknowledgedAt || ''
       };
     });
+};

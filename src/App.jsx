@@ -21,12 +21,14 @@ import InventoryPage from './pages/InventoryPage.jsx';
 import StoreInventoryPage from './pages/StoreInventoryPage.jsx';
 import EmployeeMasterPage from './pages/EmployeeMasterPage.jsx';
 import MachineMasterPage from './pages/MachineMasterPage.jsx';
+import MasterDataPage from './pages/MasterDataPage.jsx';
 import ProductionMaterialRequestsPage from './pages/ProductionMaterialRequestsPage.jsx';
 import BOMPage from './pages/BOMPage.jsx';
 import StoreMaterialRequestsPage from './pages/StoreMaterialRequestsPage.jsx';
 import StoreIssuesPage from './pages/StoreIssuesPage.jsx';
 import MaterialReturnsPage from './pages/MaterialReturnsPage.jsx';
 import InventoryTransactionsPage from './pages/InventoryTransactionsPage.jsx';
+import StoreInventoryWorkflowsPage from './pages/StoreInventoryWorkflowsPage.jsx';
 import ShelfLifePage from './pages/ShelfLifePage.jsx';
 import PurchaseOrderPage from './pages/PurchaseOrderPage.jsx';
 import SupplierInvoicePage from './pages/SupplierInvoicePage.jsx';
@@ -49,6 +51,7 @@ import DebitNotesPage from './pages/DebitNotesPage.jsx';
 import WorkflowDashboardPage from './pages/WorkflowDashboardPage.jsx';
 import SettingsPage from './pages/SettingsPage.jsx';
 import BackupExportPage from './pages/BackupExportPage.jsx';
+import RecycleBinPage from './pages/RecycleBinPage.jsx';
 import TallyExportPage from './pages/TallyExportPage.jsx';
 import ReportsHomePage from './pages/ReportsHomePage.jsx';
 import InventoryStockStatusPage from './pages/reports/InventoryStockStatusPage.jsx';
@@ -69,15 +72,19 @@ import SupplierWiseItemsPage from './pages/reports/SupplierWiseItemsPage.jsx';
 import InventoryLotReportPage from './pages/reports/InventoryLotReportPage.jsx';
 import TrackAReportPage from './pages/reports/TrackAReportPage.jsx';
 import CustomersPage from './pages/CustomersPage.jsx';
-import { OFFICIAL_COMPANY_PROFILE } from './constants/companyProfile.js';
-import { checkAndPerformDailyAutoBackup } from './utils/backupManager.js';
 import { ensureSeededData, enforceStorageBudget } from './utils/storeService.js';
 import { ensureWorkflowSeeded, migrateWorkflowRecords } from './utils/workflowService.js';
-import { getVendorMaster } from './utils/vendorMaster.js';
+import { clearMasterCaches, getCompanySettings } from './services/masterApi.js';
+import { listJobCards, listRequirements } from './services/productionApi.js';
+import { listBoms } from './services/bomApi.js';
+import { clearProductionAuthorityCaches } from './services/productionAuthorityCache.js';
 import { resetERPStateSyncBaseline, startERPStateMirror, syncERPState } from './services/erpStateSync.js';
 import { pullRecordsFromServer, startRecordsSync } from './services/recordsSync.js';
 import SyncStatusBar from './components/SyncStatusBar.jsx';
 import { installContactValidation } from './utils/installContactValidation.js';
+import { hydrateProjectAuthorityData } from './utils/projectTracker.js';
+import { hydrateSalesOrderAuthority } from './utils/workflowService.js';
+import { hydrateInventoryBatchAuthority, hydrateInventoryItemAuthority } from './utils/storeService.js';
 import './styles/quotation.css';
 import './styles/erp-theme.css';
 import './styles/ballooning-tailwind.css';
@@ -152,8 +159,14 @@ function App() {
   const [auth, setAuth] = useState(() => getStoredAuth());
   const [erpReady, setErpReady] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [masterDataError, setMasterDataError] = useState('');
 
   useEffect(() => installContactValidation(), []);
+  useEffect(() => {
+    const showAuditError = (event) => window.alert(event.detail?.message || 'Audit event could not be saved.');
+    window.addEventListener('erp-audit-write-error', showAuditError);
+    return () => window.removeEventListener('erp-audit-write-error', showAuditError);
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -164,30 +177,16 @@ function App() {
       // localStorage is a single ~5 MB quota shared by every module; reclaim
       // space from old derived data before anything else writes to it.
       enforceStorageBudget();
-
-      try {
-        // A saved record is authoritative. Never rewrite it with defaults on
-        // refresh — the shared branding service fills any missing fields.
-        if (!localStorage.getItem('companySettings')) {
-          localStorage.setItem('companySettings', JSON.stringify(OFFICIAL_COMPANY_PROFILE));
-        }
-      } catch (e) {
-        console.error('Failed to initialise company settings', e);
-      }
-
-      // Auto-run daily backup check & audit logging
-      checkAndPerformDailyAutoBackup();
+      clearMasterCaches();
 
       // Seed employee master + warehouse module data if missing
       ensureSeededData();
-      getVendorMaster();
       ensureWorkflowSeeded();
       // Backfill Project ID / document-chain traceability and reconcile PO physical status
       // for records created before this workflow release. Existing data is preserved.
       migrateWorkflowRecords();
 
       if (disposed) return;
-      setErpReady(true);
       const saved = getStoredAuth();
       if (saved?.token) {
         try {
@@ -197,6 +196,42 @@ function App() {
           const session = await check.json();
           const verified = { ...session.user, token: saved.token, expiresAt: saved.expiresAt };
           localStorage.setItem('erp_auth', JSON.stringify(verified));
+          try {
+            await getCompanySettings();
+            setMasterDataError('');
+          } catch (error) {
+            setMasterDataError(`Company settings could not be loaded from PostgreSQL: ${error.message}`);
+          }
+          try {
+            await Promise.all([listJobCards(), listBoms(), listRequirements()]);
+          } catch (error) {
+            setMasterDataError(`Production authority could not be loaded from PostgreSQL: ${error.message}`);
+          }
+          try {
+            await Promise.all([hydrateProjectAuthorityData(), hydrateSalesOrderAuthority(), hydrateInventoryItemAuthority(), hydrateInventoryBatchAuthority()]);
+          } catch (error) {
+            setMasterDataError(`ERP PostgreSQL authority data could not be loaded: ${error.message}`);
+          }
+          try {
+            await hydrateProjectAuthorityData();
+          } catch (error) {
+            setMasterDataError(`Project Sales Order and Customer Invoice authority could not be loaded from PostgreSQL: ${error.message}`);
+          }
+          try {
+            await hydrateSalesOrderAuthority();
+          } catch (error) {
+            setMasterDataError(`Sales Order workflow authority could not be loaded from PostgreSQL: ${error.message}`);
+          }
+          try {
+            await hydrateInventoryBatchAuthority();
+          } catch (error) {
+            setMasterDataError(`Inventory batch authority could not be loaded from PostgreSQL: ${error.message}`);
+          }
+          try {
+            await hydrateInventoryItemAuthority();
+          } catch (error) {
+            setMasterDataError(`Inventory Item Master could not be loaded from PostgreSQL: ${error.message}`);
+          }
           setAuth(verified);
           await syncERPState();
           await pullRecordsFromServer();
@@ -206,7 +241,12 @@ function App() {
           localStorage.removeItem('erp_auth');
           setAuth(null);
         }
-      } else setAuth(null);
+      } else {
+        clearMasterCaches();
+        clearProductionAuthorityCaches();
+        setAuth(null);
+      }
+      if (!disposed) setErpReady(true);
     };
 
     initializeERP();
@@ -239,6 +279,19 @@ function App() {
   const handleLoginSuccess = async (authData) => {
     const nextAuth = { ...authData, activeDepartment: authData.assignments?.length === 1 ? authData.assignments[0].department : '' };
     setStoredAuth(nextAuth);
+    clearMasterCaches();
+    clearProductionAuthorityCaches();
+    try {
+      await getCompanySettings();
+      setMasterDataError('');
+    } catch (error) {
+      setMasterDataError(`Company settings could not be loaded from PostgreSQL: ${error.message}`);
+    }
+    try {
+      await Promise.all([listJobCards(), listBoms(), listRequirements()]);
+    } catch (error) {
+      setMasterDataError(`Production authority could not be loaded from PostgreSQL: ${error.message}`);
+    }
     setAuth(nextAuth);
     if (nextAuth.assignments?.length > 1) return;
     await syncERPState();
@@ -281,6 +334,7 @@ function App() {
     const base = window.location.port === '5173' ? `http://${window.location.hostname || 'localhost'}:3001/api` : '/api';
     if (saved?.token) fetch(`${base}/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${saved.token}` } }).catch(() => {});
     localStorage.removeItem('erp_auth');
+    clearMasterCaches();
     setAuth(null);
   };
 
@@ -308,6 +362,7 @@ function App() {
         <Sidebar onLogout={handleLogout} mobileOpen={mobileNavOpen} onMobileClose={() => setMobileNavOpen(false)} />
         {mobileNavOpen && <button type="button" className="mobile-sidebar-backdrop" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
         <div className="page-area">
+          {masterDataError && <div role="alert" className="form-error">{masterDataError}</div>}
           <Header auth={auth} onDepartmentChange={handleDepartmentChange} onLogout={handleLogout} onMenuToggle={() => setMobileNavOpen((open) => !open)} />
           <main className="main-content">
             <Routes>
@@ -328,6 +383,7 @@ function App() {
               <Route path="/store/issues" element={<Guard perm="material_issue.view"><StoreIssuesPage /></Guard>} />
               <Route path="/store/returns" element={<Guard perm="material_return.view"><MaterialReturnsPage /></Guard>} />
               <Route path="/store/transactions" element={<Guard perm="inventory.transaction.view"><InventoryTransactionsPage /></Guard>} />
+              <Route path="/store/inventory-workflows" element={<Guard perm={['inventory.view', 'inventory.transaction.view', 'inventory.adjust', 'store.module']}><StoreInventoryWorkflowsPage /></Guard>} />
               <Route path="/store/expiry" element={<Guard perm="inventory.adjust"><ShelfLifePage /></Guard>} />
               {/* Store: Items to Review (new workflow). Legacy /store/sales-orders kept as an alias. */}
               <Route path="/store/item-requirements" element={<Guard perm="store.module"><StoreItemRequirementsPage /></Guard>} />
@@ -370,18 +426,21 @@ function App() {
               <Route path="/ht-outsource" element={<Guard perm={['ht_outsource.view', 'material_request.create', 'purchase.order', 'store.module']}><HTOutsourcePage /></Guard>} />
               <Route path="/employees" element={<Guard perm="employee.view"><EmployeeMasterPage /></Guard>} />
         <Route path="/machines" element={<Guard perm="settings.view"><MachineMasterPage /></Guard>} />
+        <Route path="/master-data" element={<Guard perm={['inventory.view', 'settings.view']}><MasterDataPage /></Guard>} />
               <Route path="/purchase-order" element={<Guard perm="purchase.order"><PurchaseOrderPage /></Guard>} />
               <Route path="/supplier-invoice" element={<Guard perm="purchase.supplier_invoice"><SupplierInvoicePage /></Guard>} />
               <Route path="/vendor-enquiry" element={<Guard perm="purchase_request.view"><VendorEnquiryPage /></Guard>} />
               <Route path="/vendor-enquiry/preview" element={<Guard perm="purchase_request.view"><VendorEnquiryPreviewPage /></Guard>} />
               <Route path="/vendor-quotations" element={<Guard perm="purchase_request.view"><VendorQuotationPage /></Guard>} />
               <Route path="/vendor-quotations/preview" element={<Guard perm="purchase_request.view"><VendorQuotationPreviewPage /></Guard>} />
+              <Route path="/vendor-quotations/preview/:quotationNumber" element={<Guard perm="purchase_request.view"><VendorQuotationPreviewPage /></Guard>} />
               <Route path="/vendor-master" element={<Guard perm="purchase.order"><VendorMasterPage /></Guard>} />
               <Route path="/delivery-challan" element={<Guard perm="delivery.view"><DeliveryChallanPage /></Guard>} />
               <Route path="/customer-invoice" element={<Guard perm="invoice.view"><CustomerInvoicePage /></Guard>} />
               <Route path="/export-invoice" element={<Guard perm="invoice.view"><ExportInvoicePage /></Guard>} />
               <Route path="/settings" element={<Guard perm="settings.view"><SettingsPage /></Guard>} />
               <Route path="/backup-export" element={<Guard perm="backup.view"><BackupExportPage /></Guard>} />
+              <Route path="/recycle-bin" element={<Guard perm={['settings.view', 'store.module', 'purchase.order', 'purchase_request.view', 'production.view', 'sales_order.view', 'invoice.view']}><RecycleBinPage /></Guard>} />
               <Route path="/tally-export" element={<Guard perm="tally.export"><TallyExportPage /></Guard>} />
               <Route path="/project-request" element={<Guard perm={['sales.enquiry', 'job_card.view']}><ProjectRequestPage /></Guard>} />
               <Route path="/project-request/new" element={<Guard perm={['sales.enquiry', 'job_card.view']}><AddProjectRequestPage /></Guard>} />

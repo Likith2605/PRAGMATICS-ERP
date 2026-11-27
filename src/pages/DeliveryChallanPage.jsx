@@ -11,8 +11,10 @@ import { getAllProjectsSummary, getFullProjectData } from '../utils/projectTrack
 import WorkflowNavigator from '../components/WorkflowNavigator.jsx';
 import ProjectIdAutocomplete from '../components/ProjectIdAutocomplete.jsx';
 import { hasPermission } from '../utils/permissions.js';
-import { linkDispatchRequestToChallan, markDispatchRequestDispatched, refreshProductionDispatchRequests, releaseDispatchRequestChallan } from '../utils/productionDispatchService.js';
-import { saveERPRecord } from '../services/erpStateSync.js';
+import { isAdmin } from '../utils/auth.js';
+import { refreshProductionDispatchRequests } from '../utils/productionDispatchService.js';
+import { listDeliveryChallans, createDeliveryChallan, updateDeliveryChallan, confirmDeliveryChallanDispatch, deleteDeliveryChallan, getDeliveryChallanMigrationPreview, importMissingDeliveryChallans } from '../services/deliveryChallanApi.js';
+import { pullRecordsFromServer } from '../services/recordsSync.js';
 import { getProductionDispatchRequests } from '../utils/productionDispatchService.js';
 
 const generateDCNumber = () => {
@@ -44,9 +46,14 @@ const DeliveryChallanPage = () => {
   const [history, setHistory] = useState([]);
   const [salesOrderList, setSalesOrderList] = useState([]);
   const [selectedDC, setSelectedDC] = useState(null);
+  const [editingChallan, setEditingChallan] = useState(null);
   const [dispatchRequests, setDispatchRequests] = useState(() => getProductionDispatchRequests());
   const [selectedDispatchRequest, setSelectedDispatchRequest] = useState(null);
   const [dispatchError, setDispatchError] = useState('');
+  const [historyError, setHistoryError] = useState('');
+  const [migrationPreview, setMigrationPreview] = useState(null);
+  const [migrationSelection, setMigrationSelection] = useState(new Set());
+  const [migrationBusy, setMigrationBusy] = useState(false);
   const canCreateFromDispatchRequest = hasPermission('delivery.create');
 
   // Form states
@@ -82,40 +89,16 @@ const DeliveryChallanPage = () => {
     state: ''
   });
 
-  const [companyDetails, setCompanyDetails] = useState(() => {
-    try {
-      const stored = localStorage.getItem('companySettings');
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    const profile = getCompanyProfile();
-    return {
-      companyName: profile.companyName || '',
-      phone: profile.phone || '',
-      email: profile.email || '',
-      address: profile.address || '',
-      gstin: profile.gstin || '',
-      state: profile.state || ''
-    };
-  });
+  const [companyDetails, setCompanyDetails] = useState(() => getCompanyProfile());
 
   const [items, setItems] = useState([{ ...emptyItem }]);
 
-  // Load DC history and Sales Orders from localStorage
+  // Delivery Challans and source Sales Orders are server-authoritative.
   useEffect(() => {
-    try {
-      const storedDCs = localStorage.getItem('deliveryChallanHistory');
-      setHistory(storedDCs ? JSON.parse(storedDCs) : []);
-    } catch {
-      setHistory([]);
-    }
-
-    try {
-      const storedSOs = localStorage.getItem('salesOrderHistory');
-      setSalesOrderList(storedSOs ? JSON.parse(storedSOs) : []);
-    } catch {
-      setSalesOrderList([]);
-    }
     let active = true;
+    Promise.all([listDeliveryChallans(), import('../services/salesOrderApi.js').then((m) => m.listSalesOrders())])
+      .then(([dcs, orders]) => { if (active) { setHistory(dcs); setSalesOrderList(orders); setHistoryError(''); } })
+      .catch((error) => { if (active) setHistoryError(`Could not load Delivery Challans from PostgreSQL: ${error.message}`); });
     refreshProductionDispatchRequests()
       .then((requests) => { if (active) setDispatchRequests(requests); })
       .catch((error) => { if (active) setDispatchError(`Could not refresh Production dispatch requests: ${error.message}`); });
@@ -327,6 +310,22 @@ const DeliveryChallanPage = () => {
     return amount.toFixed(2);
   };
   const pendingDispatchCount = dispatchRequests.filter((request) => request.status === 'Pending').length;
+  const previewLegacyChallans = async () => {
+    setMigrationBusy(true);
+    try { setMigrationPreview(await getDeliveryChallanMigrationPreview()); setMigrationSelection(new Set()); setHistoryError(''); }
+    catch (error) { setHistoryError(`Could not preview legacy Delivery Challans: ${error.message}`); }
+    finally { setMigrationBusy(false); }
+  };
+  const importSelectedChallans = async () => {
+    setMigrationBusy(true);
+    try {
+      const selected = migrationPreview.eligible.filter((record) => migrationSelection.has(record.number));
+      const result = await importMissingDeliveryChallans(selected.map((record) => record.payload));
+      setHistory(await listDeliveryChallans()); setMigrationPreview(null);
+      setHistoryError(result.conflicts.length ? `${result.imported.length} imported; ${result.conflicts.length} conflicts remain unchanged.` : `${result.imported.length} legacy Delivery Challans imported.`);
+    } catch (error) { setHistoryError(`Legacy import was not confirmed: ${error.message}`); }
+    finally { setMigrationBusy(false); }
+  };
 
   const handleFieldChange = (index, field, value) => {
     setItems((prev) => {
@@ -388,96 +387,21 @@ const DeliveryChallanPage = () => {
       amountINR: totalINR
     };
 
-    let reservedRequestId = '';
-    let challanSaved = false;
-    const originalHistory = localStorage.getItem('deliveryChallanHistory');
     try {
-      const stored = localStorage.getItem('deliveryChallanHistory');
-      let current = stored ? JSON.parse(stored) : [];
-      if (dispatchRequestId) {
-        await linkDispatchRequestToChallan({ requestId: dispatchRequestId, challanNumber: dcDetails.dcNumber, quantity: totalQty });
-        reservedRequestId = dispatchRequestId;
-      }
-      const entry = {
-        date: dcDetails.dcDate,
-        reference: dcDetails.dcNumber,
-        salesOrderRef: dcDetails.salesOrderRef || '-',
-        company: customerDetails.companyName || customerDetails.customerName || '-',
-        vehicle: dcDetails.vehicleNumber ? `${dcDetails.vehicleNumber} (${dcDetails.transporterName || 'Self'})` : dcDetails.transporterName || '-',
-        totalQty: `${totalQty} Units`,
-        total: money(totals.grandTotal, currencyCode),
-        currency: currencyCode,
-        amountINR: totalINR,
-        status: dcDetails.challanStatus || 'Dispatched',
-        payload
-      };
-
-      const existingIndex = current.findIndex((h) => h.reference === entry.reference);
-      if (existingIndex !== -1) {
-        current[existingIndex] = entry;
-      } else {
-        current.unshift(entry);
-      }
-      localStorage.setItem('deliveryChallanHistory', JSON.stringify(current));
-      if (dispatchRequestId && !(await saveERPRecord('deliveryChallanHistory', current))) {
-        if (originalHistory === null) localStorage.removeItem('deliveryChallanHistory');
-        else localStorage.setItem('deliveryChallanHistory', originalHistory);
-        throw new Error('Delivery Challan could not be saved to the ERP backend.');
-      }
-      challanSaved = true;
+      const createToken = globalThis.crypto?.randomUUID?.() || `dc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const saved = editingChallan
+        ? await updateDeliveryChallan(editingChallan.reference, payload, editingChallan.version)
+        : await createDeliveryChallan(payload, createToken);
+      const current = [saved.record, ...history.filter((h) => h.reference !== saved.record.reference)];
+      setEditingChallan(null);
       setHistory(current);
+      pullRecordsFromServer().catch(() => {});
       if (dispatchRequestId) setDispatchRequests(await refreshProductionDispatchRequests());
-
-      // Request-linked challans post stock only after actual dispatch confirmation.
-      if (!dispatchRequestId) try {
-        const storedInv = localStorage.getItem('inventoryItems');
-        let invItems = storedInv ? JSON.parse(storedInv) : [];
-        const storedTx = localStorage.getItem('stockTransactions');
-        let transactions = storedTx ? JSON.parse(storedTx) : [];
-
-        computedItems.forEach((it) => {
-          const qty = Number(it.quantity) || 0;
-          if (qty <= 0) return;
-          const idx = invItems.findIndex(
-            (inv) => inv.itemCode === it.itemCode || inv.itemName.toLowerCase() === it.itemName.toLowerCase()
-          );
-          if (idx !== -1) {
-            const cur = Number(invItems[idx].currentQty) || 0;
-            const newQty = Math.max(0, cur - qty);
-            invItems[idx].currentQty = newQty;
-
-            transactions.unshift({
-              id: `tx-${Date.now()}-${Math.random()}`,
-              date: dcDetails.dcDate,
-              itemCode: it.itemCode || invItems[idx].itemCode,
-              itemName: it.itemName,
-              unit: it.unit || 'Nos',
-              type: 'OUT',
-              quantity: qty,
-              balanceAfter: newQty,
-              reason: 'Customer Dispatch (Delivery Challan)',
-              reference: dcDetails.dcNumber
-            });
-          }
-        });
-        localStorage.setItem('inventoryItems', JSON.stringify(invItems));
-        localStorage.setItem('stockTransactions', JSON.stringify(transactions));
-      } catch (err) {
-        console.warn('Inventory auto-deduction error:', err);
-      }
 
       setSelectedDC(payload);
       setMode('view');
       setDispatchError('');
     } catch (err) {
-      if (reservedRequestId && !challanSaved) {
-        try {
-          await releaseDispatchRequestChallan({ requestId: reservedRequestId, challanNumber: dcDetails.dcNumber });
-          setDispatchRequests(await refreshProductionDispatchRequests());
-        } catch (rollbackError) {
-          console.error('Could not release dispatch request after Delivery Challan save failed', rollbackError);
-        }
-      }
       console.error('Failed to save Delivery Challan', err);
       alert(err.message || 'Failed to save Delivery Challan.');
     }
@@ -488,64 +412,15 @@ const DeliveryChallanPage = () => {
     const requestId = dc?.dispatchRequestId || dc?.dcDetails?.dispatchRequestId;
     if (!requestId || dc?.dcDetails?.challanStatus !== 'Challan Created') return;
     const dispatchedPayload = { ...dc, dcDetails: { ...dc.dcDetails, challanStatus: 'Dispatched' } };
-    const previousHistory = history;
-    const nextHistory = history.map((entry) => entry.reference === dcNumber
-      ? { ...entry, status: 'Dispatched', payload: dispatchedPayload }
-      : entry);
     try {
-      localStorage.setItem('deliveryChallanHistory', JSON.stringify(nextHistory));
-      if (!(await saveERPRecord('deliveryChallanHistory', nextHistory))) {
-        localStorage.setItem('deliveryChallanHistory', JSON.stringify(previousHistory));
-        throw new Error('Could not save the dispatch confirmation to the ERP backend.');
-      }
-      try {
-        await markDispatchRequestDispatched({ requestId, challanNumber: dcNumber });
-      } catch (error) {
-        const restoredHistory = nextHistory.map((entry) => entry.reference === dcNumber
-          ? { ...entry, status: 'Challan Created', payload: dc }
-          : entry);
-        localStorage.setItem('deliveryChallanHistory', JSON.stringify(restoredHistory));
-        await saveERPRecord('deliveryChallanHistory', restoredHistory);
-        throw error;
-      }
+      const currentEntry = history.find((entry) => entry.reference === dcNumber);
+      if (!currentEntry) throw new Error('Delivery Challan is no longer available in the server list. Refresh and retry.');
+      const updated = await confirmDeliveryChallanDispatch(dcNumber, currentEntry.version);
+      const nextHistory = history.map((entry) => entry.reference === dcNumber ? updated.record : entry);
       setHistory(nextHistory);
+      pullRecordsFromServer().catch(() => {});
       setSelectedDC(dispatchedPayload);
       setDispatchRequests(await refreshProductionDispatchRequests());
-
-      // A request-linked challan does not post stock until this explicit action.
-      const storedInv = localStorage.getItem('inventoryItems');
-      const inventory = storedInv ? JSON.parse(storedInv) : [];
-      const storedTransactions = localStorage.getItem('stockTransactions');
-      const transactions = storedTransactions ? JSON.parse(storedTransactions) : [];
-      const alreadyPosted = transactions.some((transaction) =>
-        String(transaction.reference || '') === String(dcNumber) && transaction.reason === 'Customer Dispatch (Delivery Challan)'
-      );
-      if (!alreadyPosted) {
-        dispatchedPayload.items.forEach((item) => {
-          const quantity = Number(item.quantity) || 0;
-          if (quantity <= 0) return;
-          const index = inventory.findIndex((candidate) =>
-            candidate.itemCode === item.itemCode || String(candidate.itemName || '').toLowerCase() === String(item.itemName || '').toLowerCase()
-          );
-          if (index < 0) return;
-          const newQuantity = Math.max(0, (Number(inventory[index].currentQty) || 0) - quantity);
-          inventory[index].currentQty = newQuantity;
-          transactions.unshift({
-            id: `tx-${Date.now()}-${Math.random()}`,
-            date: dispatchedPayload.dcDetails.dispatchDate || dispatchedPayload.dcDetails.dcDate,
-            itemCode: item.itemCode || inventory[index].itemCode,
-            itemName: item.itemName,
-            unit: item.unit || 'Nos',
-            type: 'OUT',
-            quantity,
-            balanceAfter: newQuantity,
-            reason: 'Customer Dispatch (Delivery Challan)',
-            reference: dcNumber
-          });
-        });
-        localStorage.setItem('inventoryItems', JSON.stringify(inventory));
-        localStorage.setItem('stockTransactions', JSON.stringify(transactions));
-      }
       alert('Dispatch confirmed successfully.');
     } catch (error) {
       console.error('Failed to confirm production dispatch', error);
@@ -617,6 +492,8 @@ const DeliveryChallanPage = () => {
               Back to Challans
             </button>
           ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+            {isAdmin() && <button type="button" className="button-secondary" onClick={previewLegacyChallans} disabled={migrationBusy}>Review Legacy Data</button>}
             <button
               className="button-primary"
               onClick={() => {
@@ -646,11 +523,12 @@ const DeliveryChallanPage = () => {
                     '3. This is an official dispatch delivery document.'
                 });
                 setItems([{ ...emptyItem }]);
+                setEditingChallan(null);
                 setMode('create');
               }}
             >
               + Create Delivery Challan
-            </button>
+            </button></div>
           )}
         </div>
       </div>
@@ -664,13 +542,21 @@ const DeliveryChallanPage = () => {
       )}
 
       <div className="content-block">
+        {migrationPreview && isAdmin() && mode === 'list' && <section className="content-block" aria-label="Legacy Delivery Challan migration preview">
+          <h2>Legacy Delivery Challan Migration Preview</h2>
+          <p>Eligible: {migrationPreview.counts.eligible}; existing: {migrationPreview.counts.existing}; conflicts: {migrationPreview.counts.conflicts}; deleted IDs blocked: {migrationPreview.counts.deleted}.</p>
+          {migrationPreview.eligible.map((record) => <label key={record.number} style={{ display: 'block', padding: '4px 0' }}><input type="checkbox" checked={migrationSelection.has(record.number)} onChange={(event) => setMigrationSelection((current) => { const next = new Set(current); if (event.target.checked) next.add(record.number); else next.delete(record.number); return next; })} /> {record.number}</label>)}
+          {[...migrationPreview.conflicts, ...migrationPreview.deleted].map((record, index) => <p key={`${record.number}-${index}`}>{record.number}: {record.reason || 'Previously deleted; import blocked.'}</p>)}
+          <button type="button" className="button-primary" disabled={migrationBusy || !migrationSelection.size} onClick={importSelectedChallans}>Import Selected</button>{' '}
+          <button type="button" className="button-secondary" onClick={() => setMigrationPreview(null)}>Close Preview</button>
+        </section>}
         {mode === 'list' && (
           <>
             <div className="form-section" style={{ marginBottom: '22px', border: pendingDispatchCount ? '2px solid #f59e0b' : undefined }}>
               <div className="block-header">
                 <h2>Production Dispatch Requests <span className="badge" style={{ marginLeft: 8, background: pendingDispatchCount ? '#fef3c7' : '#e2e8f0', color: pendingDispatchCount ? '#92400e' : '#475569' }}>{pendingDispatchCount} pending</span></h2>
               </div>
-              {dispatchError && <div role="alert" className="alert alert-error">{dispatchError}</div>}
+      {dispatchError && <div role="alert" className="alert alert-error">{dispatchError}</div>}
               <div className="history-table-wrapper">
                 <table className="history-table">
                   <thead><tr>
@@ -706,6 +592,7 @@ const DeliveryChallanPage = () => {
             <div className="block-header">
               <h2>Delivery Challan Records</h2>
             </div>
+            {historyError && <div role="alert" className="alert alert-error">{historyError}</div>}
             <div className="history-table-wrapper">
               <table className="history-table">
                 <thead>
@@ -773,11 +660,17 @@ const DeliveryChallanPage = () => {
                                 setCustomerDetails(p.customerDetails);
                                 setCompanyDetails(p.companyDetails);
                                 setItems(p.items);
+                                setEditingChallan(dc);
                                 setMode('create');
                               }}
                             >
                               Edit
                             </button>}
+                            {isAdmin() && <button type="button" className="button-small" style={{ color: '#b91c1c' }} onClick={async () => {
+                              if (!window.confirm(`Move Delivery Challan ${dc.reference} to the Recycle Bin?`)) return;
+                              try { await deleteDeliveryChallan(dc.reference, dc.version, 'Admin deletion'); setHistory(await listDeliveryChallans()); }
+                              catch (error) { setHistoryError(`Delete was not confirmed: ${error.message}`); }
+                            }}>Delete</button>}
                             <button
                               className="button-small"
                               style={{ color: '#86198f', borderColor: '#f5d0fe' }}

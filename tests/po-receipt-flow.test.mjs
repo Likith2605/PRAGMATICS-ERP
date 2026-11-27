@@ -23,6 +23,7 @@ globalThis.localStorage = {
     return mem.size;
   }
 };
+await import('./helpers/availability-api-stub.mjs');
 
 const W = await import('../src/utils/workflowService.js');
 const S = await import('../src/utils/storeService.js');
@@ -111,7 +112,7 @@ W.ensureWorkflowSeeded();
 /* ---------------------------- 1. Purchase raises the PO ---------------------------- */
 section('1. Purchase raises a PO from an accepted quotation');
 loginAs('Store Department', 'store_manager', 'Suresh Store');
-W.saveMaterialAvailabilityCheck({ soNumber: 'SO-Q900', remarks: 'Shortage confirmed' });
+await W.saveMaterialAvailabilityCheck({ soNumber: 'SO-Q900', remarks: 'Shortage confirmed' });
 const indent = W.createPurchaseIndent({ soNumber: 'SO-Q900', reason: 'PO notification chain' });
 check(Boolean(indent?.indentNumber), `purchase indent raised (${indent.indentNumber})`);
 

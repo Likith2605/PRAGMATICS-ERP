@@ -1,11 +1,6 @@
-import React, { useMemo, useState } from 'react';
-import {
-  getExpiryWatchList,
-  getExpiryStatus,
-  EXPIRY_NEAR_DAYS,
-  writeOffExpiredBatch,
-  getInventoryItems
-} from '../utils/storeService.js';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { getExpiryStatus, EXPIRY_NEAR_DAYS } from '../utils/storeService.js';
+import { listInventoryItems, listInventoryLots, postInventoryAdjustment } from '../services/inventoryApi.js';
 import { hasPermission } from '../utils/permissions.js';
 
 /**
@@ -29,26 +24,73 @@ const STATUS_META = {
 
 const ShelfLifePage = () => {
   const canAdjust = hasPermission('inventory.adjust');
-  const [tick, setTick] = useState(0); // refresh after write-off
+  const [inventory, setInventory] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [writeOff, setWriteOff] = useState(null); // batch being written off
+  const [writeOffToken, setWriteOffToken] = useState('');
   const [woQty, setWoQty] = useState('');
   const [woReason, setWoReason] = useState('');
   const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
 
-  const batches = useMemo(() => {
-    void tick;
-    return getExpiryWatchList();
-  }, [tick]);
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [itemRows, lotRows] = await Promise.all([listInventoryItems(), listInventoryLots()]);
+      const items = (Array.isArray(itemRows) ? itemRows : []).map((row) => ({
+        ...(row.payload || {}),
+        itemCode: row.item_code || row.payload?.itemCode || '',
+        itemName: row.material_name || row.payload?.itemName || row.item_code || '',
+        shelfLifeManaged: Boolean(row.shelf_life_managed),
+        shelfLifeMonths: Number(row.payload?.shelfLifeMonths) || 0
+      }));
+      const itemFor = new Map(items.map((item) => [String(item.itemCode).toLowerCase(), item]));
+      const watchList = (Array.isArray(lotRows) ? lotRows : []).map((row) => {
+        const payload = row.payload || {};
+        const item = itemFor.get(String(row.item_code || '').toLowerCase());
+        const expiryDate = String(row.expiry_date || payload.expiryDate || '').slice(0, 10);
+        const { status, daysLeft } = getExpiryStatus(expiryDate);
+        return {
+          ...payload,
+          id: row.id,
+          itemCode: row.item_code || '',
+          itemName: payload.itemName || item?.itemName || row.item_code || '',
+          batchNumber: row.batch_number || payload.batchNumber || '',
+          lotNumber: row.lot_number || payload.lotNumber || '',
+          availableQty: Number(row.available_qty) || 0,
+          unit: row.unit || item?.unit || 'Nos',
+          supplier: payload.supplier || '',
+          grnNumber: payload.grnNumber || payload.receiptNumber || '',
+          mfgDate: String(row.mfg_date || payload.mfgDate || '').slice(0, 10),
+          expiryDate,
+          shelfLifeManaged: Boolean(item?.shelfLifeManaged),
+          status,
+          daysLeft
+        };
+      }).filter((batch) => batch.availableQty > 0 && (batch.expiryDate || batch.shelfLifeManaged))
+        .sort((a, b) => (a.expiryDate || '9999-12-31').localeCompare(b.expiryDate || '9999-12-31'));
+      setInventory(items);
+      setBatches(watchList);
+    } catch (loadError) {
+      setInventory([]);
+      setBatches([]);
+      setError(`Shelf-life records could not be loaded from PostgreSQL: ${loadError.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   // Shelf-life-managed items that have NO open batch with an expiry date yet.
   const gaps = useMemo(() => {
-    void tick;
     const tracked = new Set(batches.filter((b) => b.expiryDate).map((b) => String(b.itemCode || '').toLowerCase()));
-    return getInventoryItems().filter(
+    return inventory.filter(
       (i) => i.shelfLifeManaged && !tracked.has(String(i.itemCode || '').toLowerCase())
     );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [batches, tick]);
+  }, [batches, inventory]);
+
+  useEffect(() => { loadData(); }, [loadData]);
 
   const counts = batches.reduce(
     (a, b) => {
@@ -62,22 +104,36 @@ const ShelfLifePage = () => {
 
   const openWriteOff = (batch) => {
     setWriteOff(batch);
+    setWriteOffToken(globalThis.crypto?.randomUUID?.() || `expiry-writeoff-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     setWoQty(String(batch.availableQty || ''));
     setWoReason('');
     setError('');
   };
 
-  const confirmWriteOff = () => {
+  const confirmWriteOff = async () => {
+    if (!writeOff) return;
+    setSaving(true);
+    setError('');
     try {
-      writeOffExpiredBatch({
+      const quantity = Number(woQty);
+      if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('Enter a positive write-off quantity.');
+      await postInventoryAdjustment({
+        idempotencyKey: writeOffToken,
+        itemCode: writeOff.itemCode,
         batchId: writeOff.id,
-        qty: Number(woQty) || 0,
-        reason: woReason.trim()
+        quantity: -quantity,
+        unit: writeOff.unit,
+        batchNo: writeOff.batchNumber,
+        lotNumber: writeOff.lotNumber,
+        entryDate: new Date().toISOString().slice(0, 10),
+        reason: woReason.trim() || 'Expired stock write-off'
       });
       setWriteOff(null);
-      setTick((t) => t + 1);
+      await loadData();
     } catch (err) {
-      setError(err.message || String(err));
+      setError(`Expiry write-off failed: ${err.message || String(err)}`);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -87,7 +143,7 @@ const ShelfLifePage = () => {
     <div className="page-container" style={{ padding: '20px 24px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
         <h2 className="page-title">Shelf Life / Expiry Register</h2>
-        <button type="button" className="button-secondary button-small" onClick={() => setTick((t) => t + 1)}>
+        <button type="button" className="button-secondary button-small" onClick={loadData} disabled={loading}>
           ↻ Refresh
         </button>
       </div>
@@ -95,6 +151,9 @@ const ShelfLifePage = () => {
         Batches are listed FEFO — <strong>First Expiry, First Out</strong>. Expired batches are blocked at
         issue and may only leave stock through the audited write-off below.
       </div>
+
+      {error && !writeOff && <div role="alert" className="form-error">{error}</div>}
+      {loading && <div role="status" aria-busy="true">Loading shelf-life records from PostgreSQL…</div>}
 
       {/* Summary tiles */}
       <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '16px' }}>
@@ -135,8 +194,7 @@ const ShelfLifePage = () => {
               {batches.length === 0 ? (
                 <tr>
                   <td colSpan={canAdjust ? 10 : 9} className="no-history-row">
-                    No batches with expiry on record. Receive shelf-life material with a Batch / Lot number
-                    and Expiry Date to populate this register.
+                    {loading ? 'Loading batches…' : 'No batches with expiry on record. Receive shelf-life material with a Batch / Lot number and Expiry Date to populate this register.'}
                   </td>
                 </tr>
               ) : (
@@ -284,16 +342,17 @@ const ShelfLifePage = () => {
             )}
 
             <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-              <button type="button" className="button-secondary" onClick={() => setWriteOff(null)}>
+              <button type="button" className="button-secondary" onClick={() => setWriteOff(null)} disabled={saving}>
                 Cancel
               </button>
               <button
                 type="button"
                 className="button-primary"
                 onClick={confirmWriteOff}
+                disabled={saving}
                 style={{ background: '#b91c1c', borderColor: '#b91c1c' }}
               >
-                Confirm Write-off
+                {saving ? 'Saving…' : 'Confirm Write-off'}
               </button>
             </div>
           </div>

@@ -1,6 +1,8 @@
 import React, { useMemo } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getJobCards } from '../../utils/storeService.js';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { listJobCards } from '../../services/productionApi.js';
 import { formatQuantityByUnit } from '../../utils/reportFilters.js';
 
 const inr = (n) => Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -15,9 +17,12 @@ const formatTotalByUnit = (rows, field) => {
     .join(' | ') || '0';
 };
 
+const loadJobCards = () => listJobCards();
+
 const JobCardPlannedActualPage = () => {
+  const { data: jobCards, loading, error } = useAuthoritativeData(loadJobCards);
   const { rows, projects, statuses, summary } = useMemo(() => {
-    const list = getJobCards().map((jc) => {
+    const list = jobCards.map((jc) => {
       const jobCardNumber = jc.jobCardNumber || '-';
       const projectId = jc.projectId || '-';
       const productName = jc.partName || jc.projectName || jc.drawingNumber || '-';
@@ -75,7 +80,8 @@ const JobCardPlannedActualPage = () => {
         inProdCount
       }
     };
-  }, []);
+  }, [jobCards]);
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>

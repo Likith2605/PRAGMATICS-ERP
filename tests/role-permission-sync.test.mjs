@@ -23,14 +23,39 @@ assert.ok(ALLOWED_PERMISSION_KEYS.includes('sales.quotation'));
 assert.ok(ALLOWED_PERMISSION_KEYS.includes('inventory.adjust'));
 assert.equal(hasPermissionForRole('sales_employee', 'sales.quotation'), true, 'built-in permission defaults remain available');
 
-const routes = await readFile(new URL('../server/erpStateRoutes.js', import.meta.url), 'utf8');
+const routes = await readFile(new URL('../server/departmentRoleCatalogRoutes.js', import.meta.url), 'utf8');
 const auth = await readFile(new URL('../server/auth.js', import.meta.url), 'utf8');
 const employeeMaster = await readFile(new URL('../src/pages/EmployeeMasterPage.jsx', import.meta.url), 'utf8');
-assert.match(routes, /router\.put\('\/state\/rolePermissions\/:departmentId\/:roleId', requireAdmin/);
+const permissions = await readFile(new URL('../src/utils/permissions.js', import.meta.url), 'utf8');
+const stateRoutes = await readFile(new URL('../server/erpStateRoutes.js', import.meta.url), 'utf8');
+const masterRoutes = await readFile(new URL('../server/masterRoutes.js', import.meta.url), 'utf8');
+assert.match(routes, /router\.put\('\/role-permissions\/:departmentId\/:roleId', route/);
 assert.match(routes, /ALLOWED_PERMISSION_KEYS\.includes\(permission\)/, 'permission endpoint validates supported permission keys');
-assert.match(routes, /auditStateChanges\(client, req, 'rolePermissions'/, 'role permission updates are audited');
-assert.match(auth, /SELECT storage_key,data FROM erp_state WHERE storage_key IN \('departmentCatalog','roleCatalog','rolePermissions'\)/, 'authentication reloads centralized catalogs and permissions');
+assert.match(routes, /module: 'rolePermissions'/, 'role permission updates are audited');
+assert.match(auth, /readDepartmentRoleCatalogs\(\)/, 'authentication reloads the PostgreSQL-backed catalogs and permissions');
 assert.match(auth, /rolePermissions: assignment\.permissions/, 'selected department assignment carries its saved permissions');
+assert.match(masterRoutes, /readDepartmentRoleCatalogs\(\)/, 'master reference dropdowns use the authoritative catalog store');
+assert.doesNotMatch(masterRoutes, /SELECT data FROM erp_state WHERE storage_key='departmentCatalog'/, 'master references do not read stale generic department catalogs');
+assert.match(stateRoutes, /Scoped role permissions use the versioned \/api\/organization-catalogs API/, 'legacy scoped permission writes cannot bypass version checks');
+assert.doesNotMatch(permissions, /localStorage\.getItem\('rolePermissions'\)/, 'client authorization does not fall back to stale localStorage permissions');
 assert.match(employeeMaster, /saveRolePermissions\(/, 'Employee Master provides an Admin permission save flow');
+
+const storage = new Map([
+  ['erp_auth', JSON.stringify({
+    isLoggedIn: true,
+    roleKey: 'custom_operator',
+    role: 'Sales Operator',
+    activeDepartment: 'Sales Department',
+    assignments: [{ department: 'Sales Department', role: 'Sales Operator', roleKey: 'custom_operator' }]
+  })],
+  ['rolePermissions', JSON.stringify([{ departmentId: 'stale-dept', roleId: 'stale-role', permissions: ['inventory.adjust'] }])]
+]);
+globalThis.localStorage = {
+  getItem: (key) => storage.get(key) ?? null,
+  setItem: (key, value) => storage.set(key, value),
+  removeItem: (key) => storage.delete(key)
+};
+const { hasPermission: hasClientPermission } = await import('../src/utils/permissions.js');
+assert.equal(hasClientPermission('inventory.adjust'), false, 'stale localStorage permission records are ignored');
 
 console.log('Department-scoped role permission synchronization checks passed.');

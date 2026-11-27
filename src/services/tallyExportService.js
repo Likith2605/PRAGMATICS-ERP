@@ -3,9 +3,8 @@ import { authHeaders } from '../utils/auth.js';
 /**
  * Tally Export Service — Vyapar-style Export to Tally.
  *
- * Reads ERP records from localStorage (read-only), maps selected transactions
- * to Tally objects via tallyMapper, generates XML via tallyXmlGenerator, and
- * persists export history to the PostgreSQL server.
+ * Maps PostgreSQL-confirmed transaction records to Tally objects, generates
+ * XML via tallyMapper/tallyXmlGenerator, and persists export history to PostgreSQL.
  *
  * Supports per-row transaction selection: the UI picks individual invoice /
  * voucher rows, and this service generates masters + vouchers only for the
@@ -32,53 +31,9 @@ import {
   r2
 } from '../utils/tallyMapper.js';
 import { buildMasterXml, buildVoucherXml, validateTallyXml } from '../utils/tallyXmlGenerator.js';
-import { readLS } from '../utils/storeService.js';
+import { getCompanyProfile } from '../utils/companyBranding.js';
 
-// ---------------------------------------------------------------------------
-// Storage keys
-// ---------------------------------------------------------------------------
-
-const STORAGE_KEYS = {
-  CUSTOMER_INVOICES: 'customerInvoiceHistory',
-  SUPPLIER_INVOICES: 'supplierInvoiceHistory',
-  VENDOR_MASTER: 'vendorMaster',
-  COMPANY_SETTINGS: 'companySettings',
-  DEBIT_NOTES: 'debitNotes'
-};
-
-// ---------------------------------------------------------------------------
-// Data fetchers (read-only from localStorage)
-// ---------------------------------------------------------------------------
-
-const readJsonList = (key) => {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-};
-
-export const fetchCompany = () => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.COMPANY_SETTINGS);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return {
-    companyName: '',
-    gstin: '',
-    pan: '',
-    address: '',
-    state: '',
-    phone: '',
-    email: ''
-  };
-};
-
-export const fetchCustomerInvoices = () => readJsonList(STORAGE_KEYS.CUSTOMER_INVOICES);
-export const fetchSupplierInvoices = () => readJsonList(STORAGE_KEYS.SUPPLIER_INVOICES);
-export const fetchVendorMaster = () => readJsonList(STORAGE_KEYS.VENDOR_MASTER);
-export const fetchDebitNotes = () => readJsonList(STORAGE_KEYS.DEBIT_NOTES);
+export const fetchCompany = () => getCompanyProfile();
 
 // ---------------------------------------------------------------------------
 // Date range presets (Indian financial year: 1 April to 31 March)
@@ -276,9 +231,27 @@ const hasSupplierPayment = (record) => {
  * Build a flat list of transaction rows from raw ERP records.
  * Each row carries enough data to map to a Tally voucher later.
  */
-export const buildTransactionRows = ({ dateFrom, dateTo, selectedTypes }) => {
-  const company = fetchCompany();
-  const vendorMaster = fetchVendorMaster();
+export const buildTransactionRows = ({
+  dateFrom,
+  dateTo,
+  selectedTypes,
+  customerInvoices,
+  supplierInvoices,
+  debitNotes,
+  vendorMaster = [],
+  company = fetchCompany()
+}) => {
+  const selected = new Set(selectedTypes);
+  if ([TransactionTypes.SALE, TransactionTypes.CREDIT_NOTE, TransactionTypes.CUSTOMER_RECEIPT].some((type) => selected.has(type)) && !Array.isArray(customerInvoices)) {
+    throw new Error('PostgreSQL Customer Invoice records are required for the selected Tally transaction type.');
+  }
+  if ([TransactionTypes.PURCHASE, TransactionTypes.SUPPLIER_PAYMENT].some((type) => selected.has(type)) && !Array.isArray(supplierInvoices)) {
+    throw new Error('PostgreSQL Supplier Invoice records are required for the selected Tally transaction type.');
+  }
+  if (selected.has(TransactionTypes.DEBIT_NOTE) && !Array.isArray(debitNotes)) {
+    throw new Error('PostgreSQL Debit Note records are required for the selected Tally transaction type.');
+  }
+  if (!Array.isArray(vendorMaster)) throw new Error('PostgreSQL Vendor Master records are required for Tally export.');
   const vendorByName = {};
   vendorMaster.forEach((v) => {
     vendorByName[(v.name || v.vendorName || v.companyName || '').toLowerCase()] = v;
@@ -288,8 +261,7 @@ export const buildTransactionRows = ({ dateFrom, dateTo, selectedTypes }) => {
 
   // ---- SALES (Customer Invoices) ----
   if (selectedTypes.includes(TransactionTypes.SALE)) {
-    const invoices = readJsonList(STORAGE_KEYS.CUSTOMER_INVOICES);
-    invoices.forEach((inv) => {
+    customerInvoices.forEach((inv) => {
       const payload = inv.payload || {};
       const details = payload.invoiceDetails || {};
       const customer = payload.customerDetails || {};
@@ -326,8 +298,7 @@ export const buildTransactionRows = ({ dateFrom, dateTo, selectedTypes }) => {
 
   // ---- PURCHASES (Supplier Invoices) ----
   if (selectedTypes.includes(TransactionTypes.PURCHASE)) {
-    const invoices = readJsonList(STORAGE_KEYS.SUPPLIER_INVOICES);
-    invoices.forEach((inv) => {
+    supplierInvoices.forEach((inv) => {
       const payload = inv.payload || {};
       const details = payload.invoiceDetails || {};
       const vendor = payload.vendorDetails || {};
@@ -364,8 +335,7 @@ export const buildTransactionRows = ({ dateFrom, dateTo, selectedTypes }) => {
 
   // ---- CREDIT NOTES (Sales Returns) ----
   if (selectedTypes.includes(TransactionTypes.CREDIT_NOTE)) {
-    const invoices = readJsonList(STORAGE_KEYS.CUSTOMER_INVOICES);
-    invoices.forEach((inv) => {
+    customerInvoices.forEach((inv) => {
       const payload = inv.payload || {};
       const details = payload.invoiceDetails || {};
       const customer = payload.customerDetails || {};
@@ -429,7 +399,6 @@ export const buildTransactionRows = ({ dateFrom, dateTo, selectedTypes }) => {
 
   // ---- DEBIT NOTES (Purchase Returns) ----
   if (selectedTypes.includes(TransactionTypes.DEBIT_NOTE)) {
-    const debitNotes = readJsonList(STORAGE_KEYS.DEBIT_NOTES);
     debitNotes.forEach((dn) => {
       if (!exportableDebitNoteStatuses.has(dn.status)) return;
       const payload = dn.payload || {};
@@ -496,8 +465,7 @@ export const buildTransactionRows = ({ dateFrom, dateTo, selectedTypes }) => {
 
   // ---- CUSTOMER RECEIPTS ----
   if (selectedTypes.includes(TransactionTypes.CUSTOMER_RECEIPT)) {
-    const invoices = readJsonList(STORAGE_KEYS.CUSTOMER_INVOICES);
-    invoices.forEach((inv) => {
+    customerInvoices.forEach((inv) => {
       if (!hasCustomerReceipt(inv)) return;
       const payload = inv.payload || {};
       const details = payload.invoiceDetails || {};
@@ -533,8 +501,7 @@ export const buildTransactionRows = ({ dateFrom, dateTo, selectedTypes }) => {
 
   // ---- SUPPLIER PAYMENTS ----
   if (selectedTypes.includes(TransactionTypes.SUPPLIER_PAYMENT)) {
-    const invoices = readJsonList(STORAGE_KEYS.SUPPLIER_INVOICES);
-    invoices.forEach((inv) => {
+    supplierInvoices.forEach((inv) => {
       if (!hasSupplierPayment(inv)) return;
       const payload = inv.payload || {};
       const details = payload.invoiceDetails || {};
@@ -600,7 +567,7 @@ const inDateRange = (dateStr, dateFrom, dateTo) => {
  *
  * Only rows that are selected AND pass validation are included in vouchers.
  */
-export const mapSelectedToTally = ({ selectedRows, company }) => {
+export const mapSelectedToTally = ({ selectedRows, company, vendorMaster = [] }) => {
   const vouchers = [];
   const invalid = [];
   const warnings = [];
@@ -665,7 +632,7 @@ export const mapSelectedToTally = ({ selectedRows, company }) => {
 
   // Collect masters automatically from selected records
   const customerLedgers = collectCustomerLedgers(customerRecords);
-  const supplierLedgers = collectSupplierLedgers(supplierRecords, fetchVendorMaster());
+  const supplierLedgers = collectSupplierLedgers(supplierRecords, vendorMaster);
   const stockItems = collectStockItems(allRecordsForItems);
   const units = collectUnits(allRecordsForItems);
 

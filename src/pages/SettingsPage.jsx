@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl, COMPANY_SETTINGS_KEY } from '../utils/companyBranding.js';
-import { performAutoSystemBackup } from '../utils/backupManager.js';
+import { NEUTRAL_LOGO_DATA_URI as defaultLogoUrl } from '../utils/companyBranding.js';
 import { useCompanyBranding, notifyCompanyBrandingUpdated } from '../utils/companyBranding.js';
-import { saveERPRecord } from '../services/erpStateSync.js';
+import { getCompanySettings, saveCompanySettings } from '../services/masterApi.js';
 
 export const DEFAULT_COMPANY_SETTINGS = {
   // No company-specific defaults: every company configures its own identity.
@@ -47,6 +46,10 @@ export const DEFAULT_COMPANY_SETTINGS = {
 const SettingsPage = () => {
   const { logoUrl, companyName: brandName } = useCompanyBranding(defaultLogoUrl);
   const [settings, setSettings] = useState(DEFAULT_COMPANY_SETTINGS);
+  const [settingsVersion, setSettingsVersion] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [saveError, setSaveError] = useState('');
   const [activeTab, setActiveTab] = useState('company'); // 'company' | 'bank' | 'terms' | 'prefixes'
@@ -55,73 +58,60 @@ const SettingsPage = () => {
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
-  // Stored values always win over the shipped defaults; missing fields are
-  // filled from DEFAULT_COMPANY_SETTINGS so older records keep working.
-  const loadStoredSettings = () => {
-    try {
-      const stored = localStorage.getItem(COMPANY_SETTINGS_KEY);
-      const parsed = stored ? JSON.parse(stored) : {};
-      const safe = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-      return { ...DEFAULT_COMPANY_SETTINGS, ...safe };
-    } catch {
-      return { ...DEFAULT_COMPANY_SETTINGS };
-    }
-  };
-
-  const applyStoredSettings = () => {
-    const loaded = loadStoredSettings();
+  // PostgreSQL is the only authority for company settings. Missing fields are
+  // filled from defaults so older records keep working; localStorage is only
+  // refreshed by masterApi after a confirmed response.
+  const applyRecord = (record) => {
+    const loaded = { ...DEFAULT_COMPANY_SETTINGS, ...(record || {}) };
     setSettings(loaded);
+    setSettingsVersion(Number(record?.version) || 0);
     savedSnapshotRef.current = JSON.stringify(loaded);
+    return loaded;
   };
 
-  // Load synchronously on mount and again whenever PostgreSQL hydration or
-  // another tab changes the shared record. Never overwrite unsaved local edits.
+  const reload = async () => {
+    const record = await getCompanySettings();
+    if (record) notifyCompanyBrandingUpdated();
+    return applyRecord(record);
+  };
+
   useEffect(() => {
-    applyStoredSettings();
-    const onExternalChange = () => {
-      if (JSON.stringify(settingsRef.current) === savedSnapshotRef.current) applyStoredSettings();
-    };
-    window.addEventListener('erp-state-hydrated', onExternalChange);
-    window.addEventListener('storage', onExternalChange);
-    return () => {
-      window.removeEventListener('erp-state-hydrated', onExternalChange);
-      window.removeEventListener('storage', onExternalChange);
-    };
+    let active = true;
+    setLoading(true);
+    reload()
+      .catch((err) => { if (active) setLoadError(err.message || 'Company settings could not be loaded from PostgreSQL.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist locally first, then confirm the write to PostgreSQL before showing
-  // a success message. The shared record is synced to other computers by the
-  // existing erpStateSync mechanism.
-  const persistSettings = async(next) => {
-    try {
-      localStorage.setItem(COMPANY_SETTINGS_KEY, JSON.stringify(next));
-    } catch (err) {
-      console.error('Failed to save company settings locally', err);
-      setSaveError('Could not save company settings in this browser. Please check browser storage.');
-      setSaveSuccess(false);
-      return false;
-    }
-    notifyCompanyBrandingUpdated();
-    const persisted = await saveERPRecord(COMPANY_SETTINGS_KEY, next);
-    if (!persisted) {
-      setSaveError('Company settings were saved in this browser but could not be confirmed in PostgreSQL. Please try again.');
-      setSaveSuccess(false);
-      return false;
-    }
-    savedSnapshotRef.current = JSON.stringify(next);
+  // Save to the authoritative master API first. A failure never presents a
+  // browser-only success, and a stale version forces a PostgreSQL reload.
+  const persistSettings = async (next) => {
+    setSaving(true);
     setSaveError('');
+    setSaveSuccess(false);
     try {
-      performAutoSystemBackup('Company Settings Updated');
-    } catch { /* backup is best-effort; the settings record is already persisted */ }
-    setSaveSuccess(true);
-    setTimeout(() => setSaveSuccess(false), 3500);
-    return true;
+      const saved = await saveCompanySettings(next, settingsVersion);
+      const loaded = applyRecord(saved);
+      savedSnapshotRef.current = JSON.stringify(loaded);
+      notifyCompanyBrandingUpdated();
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 3500);
+      return true;
+    } catch (err) {
+      const stale = err.status === 409;
+      setSaveError(stale
+        ? 'Company settings changed in PostgreSQL. The database copy was kept; reload before saving again.'
+        : err.message || 'Company settings could not be saved to PostgreSQL. Please try again.');
+      if (stale) reload().catch(() => {});
+      return false;
+    } finally { setSaving(false); }
   };
 
-  const handleSaveSettings = async(e) => {
+  const handleSaveSettings = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
-    await persistSettings(settings);
+    await persistSettings(settingsRef.current);
   };
 
   // Resize before storing so the shared settings record stays well within the
@@ -175,15 +165,22 @@ const SettingsPage = () => {
         </div>
         <div className="header-actions no-print">
           <img className="page-header-logo" src={logoUrl} alt={`${brandName} logo`} />
-          <button className="button-secondary" type="button" onClick={handleResetDefaults}>
+          <button className="button-secondary" type="button" onClick={handleResetDefaults} disabled={loading || saving}>
             Reset Defaults
           </button>
-          <button className="button-primary" type="button" onClick={handleSaveSettings}>
-            Save All Settings
+          <button className="button-primary" type="button" onClick={handleSaveSettings} disabled={loading || saving}>
+            {saving ? 'Saving…' : 'Save All Settings'}
           </button>
         </div>
       </div>
 
+      {loading && <div role="status" style={{ padding: '10px 14px', marginBottom: 16, color: '#475569' }}>Loading company settings from PostgreSQL…</div>}
+      {loadError && (
+        <div role="alert" style={{ background: '#fef2f2', color: '#991b1b', padding: '12px 18px', borderRadius: 8, marginBottom: 20, border: '1px solid #fecaca' }}>
+          {loadError}{' '}
+          <button type="button" className="button-secondary button-small" onClick={() => reload().catch((err) => setLoadError(err.message))}>Retry</button>
+        </div>
+      )}
       {saveError && (
         <div
           role="alert"

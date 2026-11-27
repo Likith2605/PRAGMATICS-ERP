@@ -1,8 +1,8 @@
 /**
  * Sales Order → Store → Purchase → Receipt → Quality → Inventory → Production
  * ---------------------------------------------------------------------------
- * Department-wise workflow service layered on top of the existing ERP storage
- * (localStorage via storeService.js). Every mutation is permission gated and
+ * Department-wise workflow service layered on top of PostgreSQL APIs and
+ * existing ERP storage. Every mutation is permission gated and
  * produces an audit-log entry plus (where relevant) a department notification.
  *
  * Tables owned by this module:
@@ -33,7 +33,19 @@ import {
   todayStr,
   nowDateTimeStr
 } from './storeService.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
 import { generateSequentialNumber, saveSequenceCounter } from './storeSequencer.js';
+import { pullRecordsFromServer } from '../services/recordsSync.js';
+import {
+  createMaterialReceiptApi,
+  reserveMaterialReceiptNumberApi,
+  updateMaterialReceiptApi,
+  getReceiptInspectionCache,
+  cacheLocalReceiptInspection,
+  removeLocalReceiptInspection,
+  saveMaterialReceiptQualityCheckApi,
+  postMaterialReceiptStockApi
+} from '../services/materialReceiptApi.js';
 import {
   acceptVendorQuotation,
   getVendorQuotationByNumber,
@@ -43,13 +55,14 @@ import {
   QUOTATION_PO_CREATED_STATUSES
 } from './storeService.js';
 import { getVendorByName } from './vendorMaster.js';
+import { getCachedCompanySettings } from '../services/masterApi.js';
 import { calculateLineAmount, calculateGSTAmount, calculateTotals } from './calculations.js';
 import { numberToWords } from './numberToWords.js';
 import { hasPermission, getCurrentUserInfo, getCurrentDepartment } from './permissions.js';
-import { saveERPRecord } from '../services/erpStateSync.js';
+import { createProcurementRecord, reserveProcurementNumber, updateProcurementRecord, deleteProcurementRecord, reservePurchaseOrderNumber, createPurchaseOrderFromQuotationApi, savePurchaseIndentQualityCheck } from '../services/procurementIntakeApi.js';
+import { listAvailabilityChecks, markAvailabilityProductionNotified, saveAvailabilityCheck } from '../services/availabilityCheckApi.js';
 
 const WF = {
-  checks: 'soMaterialAvailabilityChecks',
   indents: 'purchaseIndents',
   indentSeq: 'purchaseIndentSequence',
   receipts: 'materialReceipts',
@@ -67,6 +80,37 @@ const WF = {
 
 const SO_HISTORY = 'salesOrderHistory';
 const PO_HISTORY = 'supplierPOHistory';
+let availabilityCheckCache = [];
+let availabilityChecksLoaded = false;
+let availabilityChecksLoadPromise = null;
+let salesOrderAuthorityCache = [];
+let salesOrdersLoadPromise = null;
+
+export const hydrateSalesOrderAuthority = async () => {
+  if (salesOrdersLoadPromise) return salesOrdersLoadPromise;
+  salesOrdersLoadPromise = listSalesOrders()
+    .then((records) => {
+      salesOrderAuthorityCache = Array.isArray(records) ? records : [];
+      return salesOrderAuthorityCache;
+    })
+    .finally(() => { salesOrdersLoadPromise = null; });
+  return salesOrdersLoadPromise;
+};
+
+const setAvailabilityCheckCache = (records) => {
+  availabilityCheckCache = Array.isArray(records) ? records : [];
+  availabilityChecksLoaded = true;
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('availability-checks-updated'));
+  return availabilityCheckCache;
+};
+
+export const hydrateAvailabilityChecks = async () => {
+  if (availabilityChecksLoadPromise) return availabilityChecksLoadPromise;
+  availabilityChecksLoadPromise = listAvailabilityChecks()
+    .then(setAvailabilityCheckCache)
+    .finally(() => { availabilityChecksLoadPromise = null; });
+  return availabilityChecksLoadPromise;
+};
 
 export const INDENT_STATUS = {
   DRAFT: 'Draft',
@@ -339,7 +383,7 @@ const notify = (title, message, reference, targetDept, type = 'info', link = '')
 const historyEntry = (action, details = '') => ({ ...currentUser(), action, details, at: nowDateTimeStr() });
 
 export const ensureWorkflowSeeded = () => {
-  [WF.checks, WF.indents, WF.receipts, WF.arrivals, WF.qcs, WF.rejections, WF.debitNotes].forEach((k) => {
+  [WF.indents, WF.receipts, WF.arrivals, WF.qcs, WF.rejections, WF.debitNotes].forEach((k) => {
     if (!localStorage.getItem(k)) localStorage.setItem(k, '[]');
   });
 };
@@ -368,7 +412,7 @@ export const migrateWorkflowRecords = () => {
       availableQty: num(it.availableQty)
     }))
   }));
-  if (JSON.stringify(indents) !== JSON.stringify(getIndents())) saveList(WF.indents, indents);
+  if (JSON.stringify(indents) !== JSON.stringify(getIndents()) && !(typeof window !== 'undefined' && window.document)) saveList(WF.indents, indents);
 
   // ---- receipts ----
   const receipts = getReceipts().map((r) => ({
@@ -440,7 +484,13 @@ export const migrateWorkflowRecords = () => {
       lotNumber: it.lotNumber || ''
     }))
   }));
-  if (JSON.stringify(qcs) !== JSON.stringify(getQualityChecks())) saveList(WF.qcs, qcs);
+  /* Receipt-linked inspections are kept in the receipt inspection cache
+   * (PostgreSQL in the browser): normalise them for this read, but only write
+   * back the records that genuinely live in the workflow list. */
+  const cacheIds = inspectionCacheIds();
+  const localQCs = qcs.filter((q) => !cacheIds.has(String(q?.qcNumber)));
+  const currentLocalQCs = getQualityChecks().filter((q) => !cacheIds.has(String(q?.qcNumber)));
+  if (JSON.stringify(localQCs) !== JSON.stringify(currentLocalQCs)) saveList(WF.qcs, localQCs);
 
   // ---- rejection reports ----
   const rejections = getRejectionReports().map((r) => {
@@ -557,7 +607,7 @@ export const migrateWorkflowRecords = () => {
 
 /* ------------------------------ document lookups ------------------------------ */
 
-export const getSalesOrders = () => readLS(SO_HISTORY, []);
+export const getSalesOrders = () => salesOrderAuthorityCache;
 export const getSalesOrderByRef = (ref) =>
   getSalesOrders().find((s) => String(s.reference) === String(ref)) || null;
 
@@ -663,7 +713,7 @@ export const buildAvailabilityLines = (soRecord) => {
 };
 
 export const getAvailabilityCheck = (soNumber) =>
-  getList(WF.checks).find((c) => String(c.soNumber) === String(soNumber)) || null;
+  availabilityCheckCache.find((check) => String(check.soNumber) === String(soNumber)) || null;
 
 /** Live (unsaved) availability view used by the Store review screen. */
 export const previewAvailability = (soNumber) => {
@@ -681,45 +731,22 @@ export const previewAvailability = (soNumber) => {
 export const saveMaterialAvailabilityCheck = ({ soNumber, remarks = '' }) => {
   requirePerm('indent.view', 'Permission denied: material availability check is restricted.');
   if (!isStore()) deny('Only the Store Department can perform the material availability check.');
-  const so = getSalesOrderByRef(soNumber);
-  if (!so) deny(`Sales Order ${soNumber} not found.`);
 
-  const lines = buildAvailabilityLines(so);
-  if (lines.length === 0) deny('Sales Order has no material lines.');
-
-  const list = getList(WF.checks);
-  const idx = list.findIndex((c) => String(c.soNumber) === String(soNumber));
-  const user = currentUser();
-  const prev = idx >= 0 ? list[idx] : null;
-  const record = {
-    soNumber,
-    projectId: so.payload?.soDetails?.projectId || '',
-    customer: so.payload?.customerDetails?.companyName || so.payload?.customerDetails?.customerName || so.company || '',
-    orderDate: so.payload?.soDetails?.soDate || so.date || '',
-    deliveryDate: so.payload?.soDetails?.deliveryDate || '',
-    status: 'Checked',
-    lines,
-    remarks,
-    checkedBy: user.name,
-    checkedByEmpId: user.empId,
-    checkedByDept: user.dept,
-    checkedAt: nowDateTimeStr(),
-    checkedDate: todayStr(),
-    productionNotified: prev?.productionNotified || false,
-    history: [...(prev?.history || []), historyEntry('Availability check saved', `${lines.filter((l) => l.shortageQty > 0).length} material(s) with shortage`)]
+  const persist = async () => {
+    const previous = getAvailabilityCheck(soNumber);
+    const record = await saveAvailabilityCheck(soNumber, remarks, previous?.recordVersion || 0);
+    setAvailabilityCheckCache([
+      record,
+      ...availabilityCheckCache.filter((check) => String(check.soNumber) !== String(soNumber))
+    ]);
+    log('MATERIAL AVAILABILITY CHECK', soNumber, `${record.lines.length} material(s); ${record.lines.filter((line) => line.shortageQty > 0).length} require purchase.`);
+    await maybeNotifyProductionReady(soNumber);
+    return record;
   };
-
-  if (idx >= 0) list[idx] = record;
-  else list.unshift(record);
-  saveList(WF.checks, list);
-
-  log('MATERIAL AVAILABILITY CHECK', soNumber, `${lines.length} material(s); ${lines.filter((l) => l.shortageQty > 0).length} require purchase.`);
-
-  maybeNotifyProductionReady(soNumber);
-  return record;
+  return availabilityChecksLoaded ? persist() : hydrateAvailabilityChecks().then(persist);
 };
 
-export const getAvailabilityChecks = () => getList(WF.checks);
+export const getAvailabilityChecks = () => availabilityCheckCache;
 
 /** Sales Orders that still need a store material availability check. */
 export const getSalesOrdersAwaitingCheck = () => {
@@ -765,15 +792,18 @@ export const canSubmitIndent = (indent) =>
   indent.status === INDENT_STATUS.DRAFT &&
   (isAdminUser() || (hasPermission('indent.submit') && getCurrentDepartment() === 'Store Department'));
 
-export const createPurchaseIndent = ({
-  soNumber = '',
-  reason = '',
-  remarks = '',
-  requiredDate = '',
-  selectedCodes = null,
-  lines = null,
-  sourceInfo = null
-}) => {
+export const createPurchaseIndent = (options = {}) => {
+  const {
+    soNumber = '',
+    reason = '',
+    remarks = '',
+    requiredDate = '',
+    selectedCodes = null,
+    lines = null,
+    sourceInfo = null,
+    persistToPostgres = true,
+    availabilityCheck: suppliedAvailabilityCheck = null
+  } = options;
   requirePerm('indent.create', 'Permission denied: only the Store Department can create a Purchase Indent.');
   if (!isStore()) deny('Only the Store Department can create a Purchase Indent.');
 
@@ -782,21 +812,77 @@ export const createPurchaseIndent = ({
      2. An explicit line list with pre-computed shortage (used by the
         Production Requirement workflow via sourceInfo). */
   const fromRequirement = Array.isArray(lines);
+  const cachedCheck = suppliedAvailabilityCheck || getAvailabilityCheck(soNumber);
+  if (!fromRequirement && !suppliedAvailabilityCheck && !availabilityChecksLoaded) {
+    return hydrateAvailabilityChecks().then(() => createPurchaseIndent(options));
+  }
+  if (!fromRequirement && !cachedCheck) {
+    return saveMaterialAvailabilityCheck({ soNumber, remarks: 'Auto-saved while creating indent.' })
+      .then((check) => createPurchaseIndent({ ...options, availabilityCheck: check }));
+  }
+  const currentCheck = cachedCheck;
   const so = !fromRequirement || soNumber ? getSalesOrderByRef(soNumber) : null;
-  if (!fromRequirement && !so) deny(`Sales Order ${soNumber} not found.`);
+  if (!fromRequirement && !so && !currentCheck) deny(`Sales Order ${soNumber} is not available in PostgreSQL.`);
 
   let shortageLines;
   if (fromRequirement) {
     shortageLines = lines.filter((l) => num(l.purchaseQty ?? l.shortageQty) > 0);
     if (shortageLines.length === 0) deny('No lines with quantity to indent.');
   } else {
-    let check = getAvailabilityCheck(soNumber);
-    if (!check) check = saveMaterialAvailabilityCheck({ soNumber, remarks: 'Auto-saved while creating indent.' });
+    const check = currentCheck;
+    if (!check) deny(`Material availability check for ${soNumber} is not available from PostgreSQL.`);
 
     shortageLines = check.lines.filter(
       (l) => num(l.shortageQty) > 0 && (!selectedCodes || selectedCodes.length === 0 || selectedCodes.includes(l.materialCode || l.materialName))
     );
     if (shortageLines.length === 0) deny('No materials with shortage — nothing to indent. All materials are available.');
+  }
+
+  const user = currentUser();
+  const reqReason = `Shortage from Production Requirement ${sourceInfo?.requirementNumber || ''}`;
+  const buildIndent = (indentNumber) => ({
+    indentNumber,
+    indentDate: todayStr(),
+    soNumber,
+    projectId: (fromRequirement ? sourceInfo?.projectId : so?.payload?.soDetails?.projectId || currentCheck?.projectId) || '',
+    customer: fromRequirement
+      ? sourceInfo?.customer || ''
+      : so?.payload?.customerDetails?.companyName || so?.payload?.customerDetails?.customerName || so?.company || currentCheck?.customer || '',
+    deliveryDate: so?.payload?.soDetails?.deliveryDate || currentCheck?.deliveryDate || '',
+    requiredDate: requiredDate || so?.payload?.soDetails?.deliveryDate || currentCheck?.deliveryDate || '',
+    reason: reason || (fromRequirement ? reqReason : 'Shortage against Sales Order material requirement'),
+    ...(fromRequirement ? { sourceType: sourceInfo?.sourceType || 'productionRequirement', requirementNumber: sourceInfo?.requirementNumber || '', productionJob: sourceInfo?.productionJob || '' } : {}),
+    storeRemarks: remarks, purchaseRemarks: '', status: INDENT_STATUS.DRAFT,
+    items: shortageLines.map((l) => ({
+      lineId: l.lineId || '',
+      materialCode: l.materialCode || '', materialName: l.materialName, drawingNo: l.drawingNo || '',
+      description: l.description || '', specification: l.specification || '', unit: l.unit || 'Nos',
+      requiredQty: num(l.requiredQty || l.orderedQty), orderedQty: num(l.orderedQty),
+      availableQty: num(l.availableStock ?? l.availableQty), shortageQty: num(l.shortageQty),
+      purchaseQty: num(l.purchaseQty ?? l.shortageQty),
+      requiredDate: fromRequirement ? requiredDate || l.requiredDate || '' : requiredDate || so?.payload?.soDetails?.deliveryDate || currentCheck?.deliveryDate || '',
+      reason: reason || (fromRequirement ? reqReason : 'Shortage against Sales Order'), remarks: '',
+      source: fromRequirement ? sourceInfo?.source || 'Production Requirement Shortage' : 'Sales Order Shortage'
+    })),
+    additionalRequirements: [], clarifications: [], createdBy: user.name, createdByEmpId: user.empId,
+    createdByDept: user.dept, createdAt: nowDateTimeStr(), updatedAt: nowDateTimeStr(), submittedAt: '',
+    poNumber: '', convertedAt: '', history: [historyEntry('Indent created', `${shortageLines.length} material(s) with shortage`)]
+  });
+  const finishCreate = (indent) => {
+    saveList(WF.indents, [indent, ...getIndents()]);
+    saveSequenceCounter(WF.indentSeq, indent.indentNumber);
+    log('PURCHASE INDENT CREATED', indent.indentNumber,
+      fromRequirement ? `Requirement ${sourceInfo?.requirementNumber || ''} | ${shortageLines.length} material(s)` : `SO ${soNumber} | ${shortageLines.length} material(s)`);
+    notify('New Purchase Indent', `Purchase Indent ${indent.indentNumber} is ready for vendor enquiry.`, indent.indentNumber, 'Purchase Department', 'info');
+    return indent;
+  };
+  const useBackend = persistToPostgres && typeof window !== 'undefined' && Boolean(window.document);
+  if (useBackend) {
+    return reserveProcurementNumber('purchaseIndent').then((indentNumber) => {
+      const draft = buildIndent(indentNumber);
+      return createProcurementRecord('purchaseIndent', draft, `purchase-indent:${crypto.randomUUID()}`)
+        .then(({ record }) => finishCreate(record));
+    });
   }
 
   const indentNumber = generateSequentialNumber({
@@ -805,81 +891,7 @@ export const createPurchaseIndent = ({
     historyKey: WF.indents,
     idField: 'indentNumber'
   });
-  const user = currentUser();
-  const reqReason = `Shortage from Production Requirement ${sourceInfo?.requirementNumber || ''}`;
-
-  const indent = {
-    indentNumber,
-    indentDate: todayStr(),
-    soNumber,
-    projectId: (fromRequirement ? sourceInfo?.projectId : so?.payload?.soDetails?.projectId) || '',
-    customer: fromRequirement
-      ? sourceInfo?.customer || ''
-      : so.payload?.customerDetails?.companyName || so.payload?.customerDetails?.customerName || so.company || '',
-    deliveryDate: so?.payload?.soDetails?.deliveryDate || '',
-    requiredDate: requiredDate || so?.payload?.soDetails?.deliveryDate || '',
-    reason: reason || (fromRequirement ? reqReason : 'Shortage against Sales Order material requirement'),
-    ...(fromRequirement
-      ? {
-          sourceType: sourceInfo?.sourceType || 'productionRequirement',
-          requirementNumber: sourceInfo?.requirementNumber || '',
-          productionJob: sourceInfo?.productionJob || ''
-        }
-      : {}),
-    storeRemarks: remarks,
-    purchaseRemarks: '',
-    status: INDENT_STATUS.DRAFT,
-    items: shortageLines.map((l) => ({
-      materialCode: l.materialCode || '',
-      materialName: l.materialName,
-      drawingNo: l.drawingNo || '',
-      description: l.description || '',
-      specification: l.specification || '',
-      unit: l.unit || 'Nos',
-      requiredQty: num(l.requiredQty || l.orderedQty),
-      orderedQty: num(l.orderedQty),
-      availableQty: num(l.availableStock ?? l.availableQty),
-      shortageQty: num(l.shortageQty),
-      purchaseQty: num(l.purchaseQty ?? l.shortageQty),
-      requiredDate: fromRequirement
-        ? requiredDate || l.requiredDate || ''
-        : requiredDate || so.payload?.soDetails?.deliveryDate || '',
-      reason: reason || (fromRequirement ? reqReason : 'Shortage against Sales Order'),
-      remarks: '',
-      source: fromRequirement ? sourceInfo?.source || 'Production Requirement Shortage' : 'Sales Order Shortage'
-    })),
-    additionalRequirements: [],
-    clarifications: [],
-    createdBy: user.name,
-    createdByEmpId: user.empId,
-    createdByDept: user.dept,
-    createdAt: nowDateTimeStr(),
-    updatedAt: nowDateTimeStr(),
-    submittedAt: '',
-    poNumber: '',
-    convertedAt: '',
-    history: [historyEntry('Indent created', `${shortageLines.length} material(s) with shortage`)]
-  };
-
-  saveList(WF.indents, [indent, ...getIndents()]);
-  saveSequenceCounter(WF.indentSeq, indentNumber);
-  log(
-    'PURCHASE INDENT CREATED',
-    indentNumber,
-    fromRequirement
-      ? `Requirement ${sourceInfo?.requirementNumber || ''} | ${shortageLines.length} material(s)`
-      : `SO ${soNumber} | ${shortageLines.length} material(s)`
-  );
-
-  notify(
-    'New Purchase Indent',
-    `Purchase Indent ${indentNumber} is ready for vendor enquiry.`,
-    indentNumber,
-    'Purchase Department',
-    'info'
-  );
-
-  return indent;
+  return finishCreate(buildIndent(indentNumber));
 };
 
 const updateIndentHistory = (indent, action, details) => {
@@ -899,6 +911,15 @@ const summarizeChanges = (before, patch) => {
     changes.push(`items: ${before.items?.length || 0} → ${patch.items.length}`);
   }
   return changes.join('; ');
+};
+
+const confirmIndentSave = (indent) => {
+  if (typeof window === 'undefined' || !window.document) {
+    saveIndent(indent);
+    return indent;
+  }
+  return updateProcurementRecord('purchaseIndent', indent.indentNumber, indent, indent.version)
+    .then(({ record }) => { saveIndent(record); return record; });
 };
 
 export const updatePurchaseIndent = (indentNumber, patch = {}) => {
@@ -926,13 +947,13 @@ export const updatePurchaseIndent = (indentNumber, patch = {}) => {
   if (patch.requiredDate !== undefined) indent.requiredDate = patch.requiredDate;
 
   updateIndentHistory(indent, 'Indent edited', changes || 'details updated');
-  const list = getIndents();
-  const idx = list.findIndex((i) => String(i.indentNumber) === String(indentNumber));
-  list[idx] = indent;
-  saveList(WF.indents, list);
-  log('PURCHASE INDENT EDITED', indentNumber, changes || 'details updated');
-  void before;
-  return indent;
+  const finish = (saved) => {
+    log('PURCHASE INDENT EDITED', indentNumber, changes || 'details updated');
+    void before;
+    return saved;
+  };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 export const submitPurchaseIndent = (indentNumber, remarks = '') => {
@@ -946,11 +967,7 @@ export const submitPurchaseIndent = (indentNumber, remarks = '') => {
   if (remarks) indent.storeRemarks = indent.storeRemarks ? `${indent.storeRemarks}\n${remarks}` : remarks;
   updateIndentHistory(indent, 'Indent submitted to Purchase', remarks);
 
-  const list = getIndents();
-  const idx = list.findIndex((i) => String(i.indentNumber) === String(indentNumber));
-  list[idx] = indent;
-  saveList(WF.indents, list);
-
+  const finish = (saved) => {
   log('PURCHASE INDENT SUBMITTED', indentNumber, indent.requirementNumber ? `Requirement ${indent.requirementNumber}` : `SO ${indent.soNumber}`);
   notify(
     'New Purchase Indent',
@@ -973,7 +990,10 @@ export const submitPurchaseIndent = (indentNumber, remarks = '') => {
     'store',
     `/purchase-indents?indent=${indentNumber}`
   );
-  return indent;
+  return saved;
+  };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 export const startPurchaseIndentReview = (indentNumber, remarks = '') => {
@@ -986,9 +1006,9 @@ export const startPurchaseIndentReview = (indentNumber, remarks = '') => {
   indent.status = INDENT_STATUS.UNDER_REVIEW;
   indent.purchaseRemarks = remarks || indent.purchaseRemarks || '';
   updateIndentHistory(indent, 'Purchase review started', remarks);
-  saveIndent(indent);
-  log('PURCHASE INDENT REVIEW STARTED', indentNumber, remarks);
-  return indent;
+  const finish = (saved) => { log('PURCHASE INDENT REVIEW STARTED', indentNumber, remarks); return saved; };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 /**
@@ -1012,14 +1032,12 @@ export const approveIndentByAdmin = async (indentNumber, remarks = '') => {
   indent.adminApprovedByEmpId = approver.empId !== '-' ? approver.empId : getCurrentUserInfo().auth?.username || approver.name;
   indent.adminApprovedRemarks = remarks;
   updateIndentHistory(indent, 'Indent approved by Admin', remarks);
-  const list = getIndents();
-  const idx = list.findIndex((item) => String(item.indentNumber) === String(indentNumber));
-  list[idx] = indent;
-  // Approval is a hand-off between departments, so confirm the shared
-  // PostgreSQL write before reporting success to the Admin.
-  const persisted = await saveERPRecord(WF.indents, list);
-  if (!persisted) deny(`Approval for Purchase Indent ${indentNumber} could not be saved to PostgreSQL. Check the server connection and retry.`);
-  saveList(WF.indents, list);
+  // Approval is a hand-off: PostgreSQL must confirm it before the local
+  // compatibility cache and notification are updated.
+  const saved = await (typeof window === 'undefined' || !window.document
+    ? Promise.resolve((saveIndent(indent), indent))
+    : updateProcurementRecord('purchaseIndent', indentNumber, indent, indent.version).then(({ record }) => (saveIndent(record), record)));
+  Object.assign(indent, saved);
 
   log('PURCHASE INDENT APPROVED BY ADMIN', indentNumber, remarks);
   notify(
@@ -1051,16 +1069,13 @@ export const cancelIndent = (indentNumber, reason = '') => {
   indent.status = INDENT_STATUS.CANCELLED;
   indent.cancelReason = reason;
   updateIndentHistory(indent, 'Indent cancelled', reason);
-  const list = getIndents();
-  const idx = list.findIndex((i) => String(i.indentNumber) === String(indentNumber));
-  list[idx] = indent;
-  saveList(WF.indents, list);
-  log('PURCHASE INDENT CANCELLED', indentNumber, reason);
-  return indent;
+  const finish = (saved) => { log('PURCHASE INDENT CANCELLED', indentNumber, reason); return saved; };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 /** Permanently remove an unapproved indent that has not entered procurement or QC. */
-export const deletePurchaseIndent = (indentNumber) => {
+export const deletePurchaseIndent = (indentNumber, reason = 'Admin approved deletion before procurement') => {
   if (!isAdminUser()) deny('Permission denied: only an Admin can delete a Purchase Indent.');
 
   const indent = getIndent(indentNumber);
@@ -1083,9 +1098,13 @@ export const deletePurchaseIndent = (indentNumber) => {
     deny(`Purchase Indent ${indentNumber} has Quality / Store records and cannot be deleted.`);
   }
 
-  saveList(WF.indents, getIndents().filter((record) => String(record.indentNumber) !== String(indentNumber)));
-  log('PURCHASE INDENT DELETED', indentNumber, 'Deleted by Admin before approval / procurement');
-  return indent;
+  const finish = () => {
+    saveList(WF.indents, getIndents().filter((record) => String(record.indentNumber) !== String(indentNumber)));
+    log('PURCHASE INDENT DELETED', indentNumber, 'Deleted by Admin before approval / procurement');
+    return indent;
+  };
+  if (typeof window === 'undefined' || !window.document) return finish();
+  return deleteProcurementRecord('purchaseIndent', indentNumber, indent.version, reason).then(finish);
 };
 
 const saveIndent = (indent) => {
@@ -1121,17 +1140,19 @@ export const requestProductionClarification = (indentNumber, question = '') => {
   if ([INDENT_STATUS.SUBMITTED, INDENT_STATUS.UNDER_REVIEW].includes(indent.status))
     indent.status = INDENT_STATUS.AWAITING_PRODUCTION;
   updateIndentHistory(indent, 'Production clarification requested', question);
-  saveIndent(indent);
-
-  log('PRODUCTION CLARIFICATION REQUESTED', indentNumber, question);
-  notify(
-    'Clarification Required for Purchase Indent',
-    `Purchase needs Production confirmation for Indent ${indentNumber} (Sales Order ${indent.soNumber}): ${question}`,
-    indentNumber,
-    'Production Department',
-    'info'
-  );
-  return indent;
+  const finish = (saved) => {
+    log('PRODUCTION CLARIFICATION REQUESTED', indentNumber, question);
+    notify(
+      'Clarification Required for Purchase Indent',
+      `Purchase needs Production confirmation for Indent ${indentNumber} (Sales Order ${indent.soNumber}): ${question}`,
+      indentNumber,
+      'Production Department',
+      'info'
+    );
+    return saved;
+  };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 export const provideAdditionalRequirement = (indentNumber, { materialCode = '', materialName, quantity, unit = 'Nos', reason = '', remarks = '' }) => {
@@ -1166,17 +1187,19 @@ export const provideAdditionalRequirement = (indentNumber, { materialCode = '', 
   });
   if (indent.status === INDENT_STATUS.AWAITING_PRODUCTION) indent.status = INDENT_STATUS.SUBMITTED;
   updateIndentHistory(indent, 'Additional material requirement provided', `${materialName} × ${quantity} ${unit} — ${reason}`);
-  saveIndent(indent);
-
-  log('ADDITIONAL MATERIAL REQUIREMENT', indentNumber, `${materialName} × ${quantity} ${unit}`);
-  notify(
-    'Additional Material Requirement',
-    `Production requires additional material for Indent ${indentNumber}: ${materialName} × ${quantity} ${unit}. ${reason}`,
-    indentNumber,
-    'Purchase Department',
-    'info'
-  );
-  return indent;
+  const finish = (saved) => {
+    log('ADDITIONAL MATERIAL REQUIREMENT', indentNumber, `${materialName} × ${quantity} ${unit}`);
+    notify(
+      'Additional Material Requirement',
+      `Production requires additional material for Indent ${indentNumber}: ${materialName} × ${quantity} ${unit}. ${reason}`,
+      indentNumber,
+      'Purchase Department',
+      'info'
+    );
+    return saved;
+  };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 export const reviewAdditionalRequirement = (indentNumber, reqId, action, remarks = '') => {
@@ -1214,17 +1237,19 @@ export const reviewAdditionalRequirement = (indentNumber, reqId, action, remarks
     if (indent.status === INDENT_STATUS.AWAITING_PRODUCTION) indent.status = INDENT_STATUS.SUBMITTED;
   }
   updateIndentHistory(indent, `Additional requirement ${req.status.toLowerCase()}`, `${req.materialName} — ${remarks}`);
-  saveIndent(indent);
-
-  log('ADDITIONAL REQUIREMENT REVIEWED', indentNumber, `${req.materialName}: ${req.status}`);
-  notify(
-    `Indent ${indentNumber} — Additional Requirement ${req.status}`,
-    `Purchase ${req.status.toLowerCase()} additional material "${req.materialName}" (${req.quantity} ${req.unit}) for Indent ${indentNumber}.`,
-    indentNumber,
-    'Production Department',
-    action === 'approve' ? 'store' : 'info'
-  );
-  return indent;
+  const finish = (saved) => {
+    log('ADDITIONAL REQUIREMENT REVIEWED', indentNumber, `${req.materialName}: ${req.status}`);
+    notify(
+      `Indent ${indentNumber} — Additional Requirement ${req.status}`,
+      `Purchase ${req.status.toLowerCase()} additional material "${req.materialName}" (${req.quantity} ${req.unit}) for Indent ${indentNumber}.`,
+      indentNumber,
+      'Production Department',
+      action === 'approve' ? 'store' : 'info'
+    );
+    return saved;
+  };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 /* ------------------------ 6 & 7. Indent → Purchase Order ------------------------ */
@@ -1232,6 +1257,7 @@ export const reviewAdditionalRequirement = (indentNumber, reqId, action, remarks
 export const markIndentConverted = (indentNumber, poNumber) => {
   requirePerm('indent.convert', 'Permission denied: only Purchase can convert an indent into a Purchase Order.');
   if (!isPurchase()) deny('Only the Purchase Department can convert a Purchase Indent into a Purchase Order.');
+  if (typeof window !== 'undefined' && window.document) deny('Purchase Indent conversion is performed atomically when its PostgreSQL Purchase Order is created.');
   const indent = getIndent(indentNumber);
   if (!indent) deny(`Purchase Indent ${indentNumber} not found.`);
   if (isRetiredDirectIndent(indent)) deny(`Purchase Indent ${indentNumber} is a historical record and cannot be converted.`);
@@ -1459,7 +1485,7 @@ export const buildPOFromQuotation = (quotationNumber, overrides = {}) => {
     projectId,
     salesOrderRef: soNumber || '',
     soNumber: soNumber || '',
-    prRef: '',
+    prRef: overrides.prRef || enquiry.prNumber || '',
     indentRef: indentNumber || '',
     enquiryRef: enquiry.enquiryNumber || '',
     quotationRef: q.quotationNumber,
@@ -1498,7 +1524,7 @@ export const buildPOFromQuotation = (quotationNumber, overrides = {}) => {
   const payload = {
     poDetails,
     vendorDetails,
-    companyDetails: readLS('companySettings', {}),
+    companyDetails: getCachedCompanySettings(),
     items: poItems,
     totals,
     amountInWords: numberToWords(totals.grandTotal),
@@ -1559,6 +1585,28 @@ export const buildPOFromQuotation = (quotationNumber, overrides = {}) => {
  */
 export const createPurchaseOrderFromQuotation = (quotationNumber, overrides = {}) => {
   requirePerm('purchase.order');
+
+  if (typeof window !== 'undefined' && window.document) {
+    const tokenId = String(quotationNumber).replace(/[^A-Za-z0-9._-]/g, '_');
+    return reservePurchaseOrderNumber().then((reservedNumber) => {
+      const dbDraft = buildPOFromQuotation(quotationNumber, { ...overrides, poNumber: reservedNumber });
+      const token = `purchase-order:${tokenId}`;
+      return createPurchaseOrderFromQuotationApi(dbDraft.entry, token).then(({ record, duplicate }) => {
+        saveSequenceCounter('purchaseOrderSequence', record.reference);
+        log('PURCHASE ORDER FROM QUOTATION', record.reference,
+          `Quotation ${quotationNumber} | Vendor ${record.vendor} | ${record.total}`);
+        if (!duplicate) notify(
+          'Purchase Order from Accepted Quotation',
+          `PO ${record.reference} was created from accepted quotation ${quotationNumber} for ${record.vendor}. Amount: ${record.total}. Record the vendor delivery on the Tax Invoice / Material Receipt screen when it arrives — that receipt is shared with Quality and Purchase.`,
+          record.reference,
+          'Store Department',
+          'info',
+          `/material-receipts?po=${encodeURIComponent(record.reference)}`
+        );
+        return record;
+      });
+    });
+  }
 
   /* 1–4. quotation exists, is accepted, and has not already produced a PO */
   const gate = canCreatePOFromQuotation(quotationNumber);
@@ -1697,6 +1745,7 @@ export const validatePOProcurementChain = ({
  * and inherit the Project ID / Sales Order / Indent references.
  */
 export const linkPOToProcurementChain = (poNumber, { enquiryNumber = '', quotationNumber = '' } = {}) => {
+  if (typeof window !== 'undefined' && window.document) deny('Procurement chain updates must be performed by the PostgreSQL Purchase Order transaction.');
   const po = getPOByRef(poNumber);
   if (!po) return null;
   const chain = validatePOProcurementChain({
@@ -2783,7 +2832,7 @@ export const createMaterialReceipt = ({
   }
 
   const progressBefore = getPOProgress(poNumber);
-  const receiptNumber = generateSequentialNumber({
+  let receiptNumber = generateSequentialNumber({
     prefix: isReplacement ? 'RR' : 'REC',
     sequenceKey: isReplacement ? WF.replReceiptSeq : WF.receiptSeq,
     historyKey: WF.receipts,
@@ -2871,7 +2920,8 @@ export const createMaterialReceipt = ({
     ]
   };
 
-  saveList(WF.receipts, [receipt, ...getReceipts()]);
+  const finishReceiptSave = () => {
+  saveList(WF.receipts, [receipt, ...getReceipts().filter((row) => String(row.receiptNumber) !== String(receipt.receiptNumber))]);
   saveSequenceCounter(isReplacement ? WF.replReceiptSeq : WF.receiptSeq, receiptNumber);
 
   // The replacement consumes the rejected balance on the Rejection Report. The
@@ -2908,7 +2958,7 @@ export const createMaterialReceipt = ({
     const qlist = getQualityChecks();
     const qidx = qlist.findIndex((q) => String(q.qcNumber) === String(linkedQc.qcNumber));
     if (qidx >= 0) {
-      qlist[qidx] = {
+      const linked = {
         ...qlist[qidx],
         receiptNumber,
         history: [
@@ -2916,7 +2966,12 @@ export const createMaterialReceipt = ({
           historyEntry('Tax invoice recorded', `${receiptNumber} | invoice ${normalizedInvoice}`)
         ]
       };
-      saveList(WF.qcs, qlist);
+      qlist[qidx] = linked;
+      /* A receipt-numbered inspection is resolved through the receipt
+       * inspection cache (PostgreSQL in the browser), so the linked copy is
+       * moved there and never left in the generic workflow list. */
+      persistLocalQualityCheck(linked);
+      cacheLocalReceiptInspection(linked);
     }
   }
 
@@ -3017,6 +3072,19 @@ export const createMaterialReceipt = ({
   }
 
   return { receipt, progress: getPOProgress(poNumber) };
+  };
+  if (typeof window !== 'undefined' && window.document) {
+    return reserveMaterialReceiptNumberApi(isReplacement).then((reservedNumber) => {
+      receiptNumber = reservedNumber;
+      receipt.receiptNumber = reservedNumber;
+      const token = `material-receipt:${String(poNumber).trim()}:${normalizedInvoice.toLowerCase()}`;
+      return createMaterialReceiptApi(receipt, token).then(({ record }) => {
+        Object.assign(receipt, record);
+        return finishReceiptSave();
+      });
+    });
+  }
+  return finishReceiptSave();
 };
 
 export const updateReceiptDocuments = (receiptNumber, documents) => {
@@ -3183,6 +3251,7 @@ export const updateMaterialReceipt = (receiptNumber, patch = {}) => {
   };
 
   // A replacement booking consumes rejected balance — keep the report in step.
+  const finishReceiptUpdate = () => {
   if (isReplacement && receipt.rejectionNumber) {
     const report = getRejectionReport(receipt.rejectionNumber);
     if (report) {
@@ -3220,6 +3289,14 @@ export const updateMaterialReceipt = (receiptNumber, patch = {}) => {
     `PO ${receipt.poNumber} | Invoice ${invoiceNumber} | ${updated.items.length} line(s)`
   );
   return { receipt: updated, progress: progressAfter };
+  };
+  if (typeof window !== 'undefined' && window.document) {
+    return updateMaterialReceiptApi(receiptNumber, updated, receipt.version || receipt.recordVersion || 1).then(({ record }) => {
+      Object.assign(updated, record);
+      return finishReceiptUpdate();
+    });
+  }
+  return finishReceiptUpdate();
 };
 
 /**
@@ -3264,7 +3341,9 @@ export const deleteMaterialReceipt = (receiptNumber, reason = '') => {
           historyEntry('Tax invoice removed', `${receiptNumber} deleted${reason ? ` — ${reason}` : ''}`)
         ]
       };
-      saveList(WF.qcs, qlist);
+      /* The inspection no longer belongs to a receipt, so it moves out of the
+       * receipt inspection cache and back into the workflow list. */
+      persistLocalQualityCheck(qlist[qidx]);
     }
   }
 
@@ -3410,7 +3489,34 @@ export const markReceiptSupplierInvoice = (receiptNumber, supplierInvoiceNumber)
 
 /* --------------------------- 12. Purchase Indent → Quality Check --------------------------- */
 
-export const getQualityChecks = () => getList(WF.qcs);
+export const getQualityChecks = () => {
+  const cached = getReceiptInspectionCache();
+  /* PostgreSQL copies (held in the receipt inspection cache) win; a legacy or
+   * non-browser copy of the same inspection is only used when the cache does
+   * not hold it, so one inspection can never appear twice. */
+  const seen = new Set(cached.map((q) => String(q?.qcNumber)));
+  return [...cached, ...getList(WF.qcs).filter((record) => record && !seen.has(String(record.qcNumber)))];
+};
+const inspectionCacheIds = () => new Set(getReceiptInspectionCache().map((q) => String(q?.qcNumber)));
+
+/**
+ * Persist a locally mutated inspection where getQualityChecks reads it from: a
+ * receipt-linked check lives in the receipt inspection cache, everything else
+ * in the workflow list. Browsers still confirm every change through the
+ * PostgreSQL API; this only bridges runtimes without one.
+ */
+const persistLocalQualityCheck = (record) => {
+  const qcNumber = String(record?.qcNumber || '');
+  if (!qcNumber) return;
+  const others = getList(WF.qcs).filter((q) => String(q?.qcNumber) !== qcNumber);
+  if (record.receiptNumber) {
+    saveList(WF.qcs, others);
+    cacheLocalReceiptInspection(record);
+  } else {
+    removeLocalReceiptInspection(qcNumber);
+    saveList(WF.qcs, [record, ...others]);
+  }
+};
 export const getQualityCheck = (qcNumber) =>
   getQualityChecks().find((q) => String(q.qcNumber) === String(qcNumber)) || null;
 export const getQualityCheckForReceipt = (receiptNumber) =>
@@ -3474,20 +3580,19 @@ export const sendIndentToQualityCheck = (indentNumber, { remarks = '' } = {}) =>
     'Sent to Quality Check',
     `PO ${indent.poNumber} | pending ${progress.pending} unit(s) across ${progress.lines.filter((l) => l.pendingQty > 0).length} material(s)`
   );
-  const list = getIndents();
-  const idx = list.findIndex((i) => String(i.indentNumber) === String(indentNumber));
-  if (idx >= 0) list[idx] = indent;
-  saveList(WF.indents, list);
-
-  log('SENT TO QUALITY CHECK', indentNumber, `PO ${indent.poNumber} | ${progress.pending} unit(s) pending`);
-  notify(
-    'Purchase Indent sent to Quality Check',
-    `Purchase Indent ${indentNumber} (PO ${indent.poNumber}) is awaiting material inspection. ${progress.pending} unit(s) pending.`,
-    indentNumber,
-    'Production Department',
-    'info'
-  );
-  return indent;
+  const finish = (saved) => {
+    log('SENT TO QUALITY CHECK', indentNumber, `PO ${indent.poNumber} | ${progress.pending} unit(s) pending`);
+    notify(
+      'Purchase Indent sent to Quality Check',
+      `Purchase Indent ${indentNumber} (PO ${indent.poNumber}) is awaiting material inspection. ${progress.pending} unit(s) pending.`,
+      indentNumber,
+      'Production Department',
+      'info'
+    );
+    return saved;
+  };
+  const saveResult = confirmIndentSave(indent);
+  return saveResult?.then ? saveResult.then(finish) : finish(saveResult);
 };
 
 const deriveQCStatus = (items) => {
@@ -3686,16 +3791,24 @@ export const saveQualityCheck = ({
     ]
   };
 
+  const finalizeQualitySave = () => {
   const list = getQualityChecks();
   const idx = list.findIndex((q) => String(q.qcNumber) === String(record.qcNumber));
   if (idx >= 0) list[idx] = record;
   else list.unshift(record);
-  saveList(WF.qcs, list);
+  if (!receipt) saveList(WF.qcs, list.filter((q) => !inspectionCacheIds().has(String(q?.qcNumber))));
+  else if (typeof window === 'undefined' || !window.document) {
+    /* No server round-trip exists in this runtime: keep the receipt inspection
+     * readable from the local inspection cache. In a browser this branch never
+     * runs — receipt inspections are saved through the PostgreSQL API. */
+    cacheLocalReceiptInspection(record);
+  }
   if (!existing) saveSequenceCounter(WF.qcSeq, record.qcNumber);
 
-  // Keep non-usable receipt material visible to lot reports while it is being
-  // inspected or while accepted stock is still waiting to be posted.
-  record.items.forEach((line) => {
+  // Legacy arrival inspections remain visible in their local lot register.
+  // Receipt-linked inspections use PostgreSQL batches created only when
+  // accepted stock is posted.
+  if (!receipt) record.items.forEach((line) => {
     const sourceLines = arrival?.items || receipt?.items || [];
     const sourceLine = findMatchingReceiptLine(sourceLines, line) || {};
     addInventoryBatch({
@@ -3754,7 +3867,7 @@ export const saveQualityCheck = ({
       rlist[ridx] = { ...rlist[ridx], qcStatus: status, qcNumber: record.qcNumber };
       saveList(WF.receipts, rlist);
     }
-  } else if (indent) {
+  } else if (indent && !(typeof window !== 'undefined' && window.document)) {
     const ilist = getIndents();
     const iidx = ilist.findIndex((i) => String(i.indentNumber) === String(indent.indentNumber));
     if (iidx >= 0) {
@@ -3862,6 +3975,24 @@ export const saveQualityCheck = ({
   }
 
   return record;
+  };
+
+  if (indent && typeof window !== 'undefined' && window.document) {
+    return savePurchaseIndentQualityCheck(record, indent.version).then(({ record: confirmedQC, indent: confirmedIndent }) => {
+      Object.assign(record, confirmedQC);
+      Object.assign(indent, confirmedIndent);
+      saveIndent(indent);
+      return finalizeQualitySave();
+    });
+  }
+  if (receipt && typeof window !== 'undefined' && window.document) {
+    return saveMaterialReceiptQualityCheckApi(record, existing?.version || existing?.recordVersion || 0).then(({ record: confirmedQC, receipt: confirmedReceipt }) => {
+      Object.assign(record, confirmedQC);
+      Object.assign(receipt, confirmedReceipt);
+      return finalizeQualitySave();
+    });
+  }
+  return finalizeQualitySave();
 };
 
 /* --------------------------- 13 & 14. Rejection report --------------------------- */
@@ -4012,7 +4143,8 @@ export const createRepurchaseIndent = (rejectionNumber) => {
   const lines = (report.items || []).filter((l) => num(l.rejectedQty) - num(l.replacementQty) > 0);
   if (lines.length === 0) deny(`Rejection Report ${rejectionNumber} has no rejected quantity to repurchase.`);
 
-  const indentNumber = generateSequentialNumber({
+  const browserPersistence = typeof window !== 'undefined' && Boolean(window.document);
+  let indentNumber = browserPersistence ? '' : generateSequentialNumber({
     prefix: 'IND',
     sequenceKey: WF.indentSeq,
     historyKey: WF.indents,
@@ -4069,8 +4201,9 @@ export const createRepurchaseIndent = (rejectionNumber) => {
     ]
   };
 
-  saveList(WF.indents, [indent, ...getIndents()]);
-  saveSequenceCounter(WF.indentSeq, indentNumber);
+  const finish = (savedIndent) => {
+  const savedNumber = savedIndent.indentNumber;
+  saveSequenceCounter(WF.indentSeq, savedNumber);
 
   report.items = (report.items || []).map((l) => {
     if (num(l.rejectedQty) - num(l.replacementQty) <= 0) return l;
@@ -4081,17 +4214,17 @@ export const createRepurchaseIndent = (rejectionNumber) => {
     (a, l) => a + Math.max(0, num(l.rejectedQty) - num(l.replacementQty)),
     0
   );
-  report.repurchaseIndentNumber = indentNumber;
-  report.replacementIndentNumber = indentNumber;
+  report.repurchaseIndentNumber = savedNumber;
+  report.replacementIndentNumber = savedNumber;
   report.history = [
     ...(report.history || []),
-    historyEntry('Repurchase indent raised', `${indentNumber} | ${lines.length} material(s) | ${availableQty} unit(s)`)
+    historyEntry('Repurchase indent raised', `${savedNumber} | ${lines.length} material(s) | ${availableQty} unit(s)`)
   ];
   saveRejection(report);
 
   syncPOStatus(report.poNumber, { force: true });
 
-  log('REPURCHASE INDENT CREATED', indentNumber, `RRN ${rejectionNumber} | PO ${report.poNumber}`);
+  log('REPURCHASE INDENT CREATED', savedNumber, `RRN ${rejectionNumber} | PO ${report.poNumber}`);
   notify(
     'Replacement purchase required',
     `Replacement Indent ${indentNumber} raised for ${availableQty} rejected unit(s) of ${rejectionNumber} (PO ${report.poNumber}). Create Vendor Enquiry → Quotation → Replacement PO.`,
@@ -4106,7 +4239,19 @@ export const createRepurchaseIndent = (rejectionNumber) => {
     'Purchase Department',
     'info'
   );
-  return indent;
+  return savedIndent;
+  };
+
+  if (browserPersistence) {
+    const tokenId = String(rejectionNumber).replace(/[^A-Za-z0-9._-]/g, '_');
+    return reserveProcurementNumber('purchaseIndent').then((reservedNumber) => {
+      indentNumber = reservedNumber;
+      indent.indentNumber = reservedNumber;
+      return createProcurementRecord('purchaseIndent', indent, `repurchase-indent:${tokenId}`).then(({ record }) => finish(record));
+    });
+  }
+  saveList(WF.indents, [indent, ...getIndents()]);
+  return finish(indent);
 };
 
 export const forwardRejectionToPurchase = (rejectionNumber, { dcNumber = '', dcDate = '', forwardRemarks = '', documents = null }) => {
@@ -5085,6 +5230,24 @@ export const postApprovedMaterialToInventory = (qcNumber) => {
   if (!isStore()) deny('Only the Store Department can confirm approved material into inventory.');
   const qc = getQualityCheck(qcNumber);
   if (!qc) deny(`Quality Check ${qcNumber} not found. No inspection = no inventory update.`);
+  if (qc.receiptNumber && typeof window !== 'undefined' && window.document) {
+    return postMaterialReceiptStockApi(qcNumber).then(async ({ record, movements, duplicate }) => {
+      Object.assign(qc, record);
+      await pullRecordsFromServer();
+      log('INVENTORY POSTED', qcNumber, `${movements?.length || 0} line(s) against PO ${qc.poNumber}`);
+      if (!duplicate) {
+        for (const line of record.items || []) if (num(line.acceptedQty) > 0) notify(
+          'Approved material added to inventory',
+          `Material ${line.materialName}, quantity ${line.acceptedQty}, has been approved and added to inventory against PO ${qc.poNumber}.`,
+          qc.receiptNumber,
+          'Production Department',
+          'store'
+        );
+        notify('Inventory receipt confirmed', `Accepted material from receipt ${qc.receiptNumber} (PO ${qc.poNumber}) added to PostgreSQL inventory.`, qc.receiptNumber, 'Store Department', 'store');
+      }
+      return { qc: record, movements: movements || [], duplicate: Boolean(duplicate) };
+    });
+  }
 
   if (!qc.receiptNumber && !qc.arrivalNumber && qc.poNumber && getReceiptsForPO(qc.poNumber).length > 0) {
     deny(
@@ -5254,7 +5417,7 @@ export const postApprovedMaterialToInventory = (qcNumber) => {
   const qlist = getQualityChecks();
   const qidx = qlist.findIndex((q) => q.qcNumber === qcNumber);
   qlist[qidx] = qc;
-  saveList(WF.qcs, qlist);
+  saveList(WF.qcs, qlist.filter((q) => !inspectionCacheIds().has(String(q?.qcNumber))));
 
   const rlist = getReceipts();
   const ridx = rlist.findIndex((r) => r.receiptNumber === qc.receiptNumber);
@@ -5284,20 +5447,28 @@ export const postApprovedMaterialToInventory = (qcNumber) => {
     'store'
   );
 
-  if (qc.soNumber) maybeNotifyProductionReady(qc.soNumber);
-  return { qc, posted: postedLines.length, postedQty: qc.inventoryPostedQty };
+  const result = { qc, posted: postedLines.length, postedQty: qc.inventoryPostedQty };
+  if (qc.soNumber && typeof window !== 'undefined' && window.document) {
+    return maybeNotifyProductionReady(qc.soNumber).then(() => result);
+  }
+  if (qc.soNumber) maybeNotifyProductionReadyLocally(qc.soNumber);
+  return result;
 };
 
 /* ------------------- 17. Sales Order material procurement status ------------------- */
 
-export const getSalesOrderMaterialStatus = (soNumber) => {
-  const so = getSalesOrderByRef(soNumber);
+export const getSalesOrderMaterialStatus = (soNumber, sourceData = {}) => {
+  const salesOrders = Array.isArray(sourceData.salesOrders) ? sourceData.salesOrders : getSalesOrders();
+  const so = salesOrders.find((record) => String(record.reference) === String(soNumber)) || null;
   if (!so) return null;
 
-  const check = getAvailabilityCheck(soNumber);
-  const inv = getInventoryItems();
-  const indents = getIndentForSO(soNumber).filter((i) => i.status !== INDENT_STATUS.CANCELLED);
-  const qcs = getQualityChecks().filter((q) => String(q.soNumber) === String(soNumber));
+  const checks = Array.isArray(sourceData.availabilityChecks) ? sourceData.availabilityChecks : getAvailabilityChecks();
+  const check = checks.find((record) => String(record.soNumber) === String(soNumber)) || null;
+  const inv = Array.isArray(sourceData.inventoryItems) ? sourceData.inventoryItems : getInventoryItems();
+  const allIndents = Array.isArray(sourceData.indents) ? sourceData.indents : getIndents();
+  const indents = allIndents.filter((record) => String(record.soNumber) === String(soNumber) && record.status !== INDENT_STATUS.CANCELLED);
+  const allQcs = Array.isArray(sourceData.qualityChecks) ? sourceData.qualityChecks : getQualityChecks();
+  const qcs = allQcs.filter((record) => String(record.soNumber) === String(soNumber));
 
   const purchasedByMaterial = {};
   indents.forEach((ind) => {
@@ -5361,20 +5532,42 @@ export const getSalesOrderMaterialStatus = (soNumber) => {
   };
 };
 
-export const getSalesOrdersWithMaterialStatus = () =>
-  getSalesOrders().map((so) => ({ ...so, material: getSalesOrderMaterialStatus(so.reference) }));
+export const getSalesOrdersWithMaterialStatus = (sourceData = {}) => {
+  const salesOrders = Array.isArray(sourceData.salesOrders) ? sourceData.salesOrders : getSalesOrders();
+  return salesOrders.map((so) => ({ ...so, material: getSalesOrderMaterialStatus(so.reference, sourceData) }));
+};
 
 /** Fires notification #13 exactly once per Sales Order. */
-const maybeNotifyProductionReady = (soNumber) => {
+const maybeNotifyProductionReady = async (soNumber) => {
   const status = getSalesOrderMaterialStatus(soNumber);
   if (!status || status.overallStatus !== 'COMPLETED') return;
-  const list = getList(WF.checks);
-  const idx = list.findIndex((c) => String(c.soNumber) === String(soNumber));
-  if (idx >= 0 && list[idx].productionNotified) return;
-  if (idx >= 0) {
-    list[idx] = { ...list[idx], productionNotified: true, productionNotifiedAt: nowDateTimeStr() };
-    saveList(WF.checks, list);
-  }
+  if (!availabilityChecksLoaded) await hydrateAvailabilityChecks();
+  const check = getAvailabilityCheck(soNumber);
+  if (!check || check.productionNotified) return;
+  const updated = await markAvailabilityProductionNotified(soNumber, check.recordVersion);
+  setAvailabilityCheckCache([
+    updated,
+    ...availabilityCheckCache.filter((item) => String(item.soNumber) !== String(soNumber))
+  ]);
+  notify(
+    'Materials ready for production',
+    `Required materials for Sales Order ${soNumber} are now available in Store and ready for production.`,
+    soNumber,
+    'Production Department',
+    'store'
+  );
+  log('MATERIALS AVAILABLE FOR PRODUCTION', soNumber, 'All Sales Order materials available');
+};
+
+const maybeNotifyProductionReadyLocally = (soNumber) => {
+  const status = getSalesOrderMaterialStatus(soNumber);
+  const check = getAvailabilityCheck(soNumber);
+  if (!status || status.overallStatus !== 'COMPLETED' || !check || check.productionNotified) return;
+  const updated = { ...check, productionNotified: true, productionNotifiedAt: nowDateTimeStr() };
+  setAvailabilityCheckCache([
+    updated,
+    ...availabilityCheckCache.filter((item) => String(item.soNumber) !== String(soNumber))
+  ]);
   notify(
     'Materials ready for production',
     `Required materials for Sales Order ${soNumber} are now available in Store and ready for production.`,
@@ -5387,27 +5580,39 @@ const maybeNotifyProductionReady = (soNumber) => {
 
 /* ------------------------ 19. Department dashboards ------------------------ */
 
-export const getWorkflowDashboard = () => {
-  const soList = getSalesOrders();
-  const checks = getAvailabilityChecks();
-  const indents = getIndents();
-  const receipts = getReceipts();
-  const qcs = getQualityChecks();
-  const rejections = getRejectionReports();
-  const storedPOs = getPurchaseOrders();
-  const pos = Array.isArray(storedPOs)
-    ? storedPOs.filter((po) => po && typeof po === 'object')
-    : [];
-  const enquiries = readVendorEnquiries();
-  const quotations = readVendorQuotations();
+export const getWorkflowDashboard = (sourceData = {}) => {
+  const soList = Array.isArray(sourceData.salesOrders) ? sourceData.salesOrders : getSalesOrders();
+  const checks = Array.isArray(sourceData.availabilityChecks) ? sourceData.availabilityChecks : getAvailabilityChecks();
+  const indents = Array.isArray(sourceData.indents) ? sourceData.indents : getIndents();
+  const receipts = Array.isArray(sourceData.receipts) ? sourceData.receipts : getReceipts();
+  const qcs = Array.isArray(sourceData.qualityChecks) ? sourceData.qualityChecks : getQualityChecks();
+  const rejections = Array.isArray(sourceData.rejections) ? sourceData.rejections : getRejectionReports();
+  const storedPOs = Array.isArray(sourceData.purchaseOrders) ? sourceData.purchaseOrders : getPurchaseOrders();
+  const pos = storedPOs.filter((po) => po && typeof po === 'object');
+  const enquiries = Array.isArray(sourceData.enquiries) ? sourceData.enquiries : readVendorEnquiries();
+  const quotations = Array.isArray(sourceData.quotations) ? sourceData.quotations : readVendorQuotations();
+  const dashboardSources = { ...sourceData, salesOrders: soList, availabilityChecks: checks, indents, qualityChecks: qcs };
 
   const checkedSet = new Set(checks.map((c) => String(c.soNumber)));
   const openSOs = soList.filter((so) => !['Dispatched', 'Closed'].includes(so.status));
-  const materialStatuses = openSOs.map((so) => getSalesOrderMaterialStatus(so.reference)).filter(Boolean);
+  const materialStatuses = openSOs.map((so) => getSalesOrderMaterialStatus(so.reference, dashboardSources)).filter(Boolean);
 
   const poProgress = pos
     .filter((p) => !String(p.reference || '').startsWith('legacy'))
-    .map((p) => ({ poNumber: p.reference, ...getPOProgress(p.reference) }));
+    .map((p) => {
+      if (!Array.isArray(sourceData.purchaseOrders)) return { poNumber: p.reference, ...getPOProgress(p.reference) };
+      const payload = p.payload || {};
+      const details = payload.poDetails || payload.payload?.poDetails || {};
+      return {
+        poNumber: p.reference,
+        projectId: p.projectId || details.projectId || payload.projectId || '',
+        soNumber: p.soNumber || details.soNumber || payload.soNumber || '',
+        indentNumber: p.indentNumber || details.indentNumber || details.indentRef || payload.indentNumber || '',
+        vendor: p.vendor || p.vendorName || payload.vendorDetails?.companyName || payload.vendorDetails?.vendorName || '',
+        poStatus: p.status || details.poStatus || '',
+        ...(p.progress || {})
+      };
+    });
 
   /* ---- row builders shared by the three department dashboards ---- */
   const qtyOf = (rows, field) => rows.reduce((a, r) => a + num((r.items || []).reduce((s, it) => s + num(it[field]), 0)), 0);
@@ -5507,7 +5712,7 @@ export const getWorkflowDashboard = () => {
         requiredDate: i.requiredDate,
         createdBy: i.createdBy,
         status: i.status,
-        action: getProcurementChainForIndent(i.indentNumber).quotations.length ? 'Create Purchase Order' : 'Create Vendor Enquiry'
+        action: quotations.some((quotation) => String(quotation.indentNumber || '') === String(i.indentNumber || '')) ? 'Create Purchase Order' : 'Create Vendor Enquiry'
       })),
     vendorEnquiries: enquiries.map((e) => ({
       enquiryNumber: e.enquiryNumber,
@@ -5529,7 +5734,9 @@ export const getWorkflowDashboard = () => {
       totalAmount: num(q.totalAmount),
       status: q.status || QUOTATION_STATUS.RECEIVED,
       poNumber: q.poNumber || q.purchaseOrderNumber || '',
-      action: quotationAlreadyConverted(q)
+      action: QUOTATION_PO_CREATED_STATUSES.includes(String(q.status)) ||
+        Boolean(String(q.poNumber || q.purchaseOrderNumber || '').trim()) ||
+        pos.some((po) => String(po.payload?.poDetails?.quotationRef || po.payload?.quotationRef || '') === String(q.quotationNumber || ''))
         ? 'PO Created'
         : QUOTATION_ACCEPTED_STATUSES.includes(String(q.status))
           ? 'Create Purchase Order'

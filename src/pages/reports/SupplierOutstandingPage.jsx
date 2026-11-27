@@ -1,8 +1,16 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { readLocalStorageList } from '../../utils/reportData.js';
+import { listAdvances } from '../../services/advanceApi.js';
+import { listSupplierInvoicesApi } from '../../services/procurementIntakeApi.js';
+import {
+  buildSupplierOutstandingPartySummary,
+  buildSupplierOutstandingRows,
+  buildSupplierOutstandingSummary,
+  sumSupplierOutstanding
+} from '../../utils/supplierOutstandingData.js';
 
-const inr = (n) => Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+const formatAmount = (value, currency) =>
+  `${currency} ${Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 4 })}`;
 
 const getAgeingBucket = (days) => {
   if (days <= 30) return '0–30 days';
@@ -12,151 +20,118 @@ const getAgeingBucket = (days) => {
 };
 
 const SupplierOutstandingPage = () => {
-  const { rows, suppliers, buckets, summary } = useMemo(() => {
-    const rawList = readLocalStorageList('supplierInvoiceHistory');
-    const now = Date.now();
-
-    let totalPayable = 0;
-    let totalPaid = 0;
-    let totalOutstanding = 0;
-    let overdueCount = 0;
-
-    const list = rawList.map((si) => {
-      const supplierName =
-        si.vendor ||
-        si.payload?.vendorDetails?.companyName ||
-        si.payload?.vendorDetails?.vendorName ||
-        '-';
-      const invoiceNumber =
-        si.reference ||
-        si.payload?.invoiceDetails?.supplierInvoiceNumber ||
-        '-';
-      const date =
-        si.date ||
-        si.payload?.invoiceDetails?.supplierInvoiceDate ||
-        '';
-      const dueDate =
-        si.dueDate ||
-        si.payload?.invoiceDetails?.paymentDueDate ||
-        '-';
-      const invoiceAmount =
-        Number(si.payload?.totals?.grandTotal) ||
-        Number(String(si.total || '').replace(/[^0-9.-]/g, '')) ||
-        0;
-      const amountPaid =
-        Number(si.payload?.invoiceDetails?.amountPaid) ||
-        (si.status === 'Paid' ? invoiceAmount : 0);
-      const outstandingAmount = Math.max(0, invoiceAmount - amountPaid);
-      const paymentStatus =
-        si.status ||
-        si.payload?.invoiceDetails?.paymentStatus ||
-        (outstandingAmount === 0 ? 'Paid' : amountPaid > 0 ? 'Partially Paid' : 'Pending');
-
-      // Age calculation from invoice date (or due date if preferred)
-      let ageDays = 0;
-      if (date) {
-        const invTime = new Date(date).getTime();
-        if (!Number.isNaN(invTime)) {
-          ageDays = Math.max(0, Math.floor((now - invTime) / 86400000));
-        }
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  useEffect(() => {
+    let active = true;
+    Promise.all([listSupplierInvoicesApi(), listAdvances('supplier')]).then(([invoices, advances]) => {
+      const reportRows = buildSupplierOutstandingRows(invoices, advances)
+        .map((row) => ({ ...row, ageingBucket: getAgeingBucket(row.ageDays) }));
+      if (active) { setRows(reportRows); setLoadError(''); setLoading(false); }
+    }).catch((error) => {
+      if (active) {
+        setRows([]);
+        setLoadError(`Supplier Outstanding data could not be reconciled from PostgreSQL: ${error.message}`);
+        setLoading(false);
       }
-      const ageingBucket = getAgeingBucket(ageDays);
-
-      totalPayable += invoiceAmount;
-      totalPaid += amountPaid;
-      totalOutstanding += outstandingAmount;
-      if (outstandingAmount > 0 && ageDays > 30) overdueCount += 1;
-
-      return {
-        supplierName,
-        invoiceNumber,
-        date,
-        dueDate,
-        invoiceAmount,
-        amountPaid,
-        outstandingAmount,
-        ageDays,
-        ageingBucket,
-        paymentStatus
-      };
     });
-
-    const suppSet = [...new Set(list.map((r) => r.supplierName).filter((s) => s && s !== '-'))].sort();
-    const bucketSet = ['0–30 days', '31–60 days', '61–90 days', '90+ days'];
-
-    return {
-      rows: list,
-      suppliers: suppSet,
-      buckets: bucketSet,
-      summary: {
-        totalInvoices: list.length,
-        totalPayable,
-        totalPaid,
-        totalOutstanding,
-        overdueCount
-      }
-    };
+    return () => { active = false; };
   }, []);
+
+  const suppliers = useMemo(() => [...new Set(rows.map((row) => row.supplierName))].sort(), [rows]);
+  const statuses = useMemo(() => [...new Set(rows.map((row) => row.paymentStatus))].sort(), [rows]);
+  const buckets = ['0–30 days', '31–60 days', '61–90 days', '90+ days'];
+
+  if (loading) return <div className="page-container" style={{ padding: '20px 24px' }}><div role="status">Loading Supplier Invoice and Advance balances from PostgreSQL…</div></div>;
+  if (loadError) return <div className="page-container" style={{ padding: '20px 24px' }}><div role="alert" className="form-error">{loadError}</div></div>;
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
       <ReportRegister
         title="Supplier Outstanding"
-        subTitle="Aged creditor ledger: supplier bills, payments, outstanding balances and ageing breakdown"
+        subTitle="Aged creditor ledger: invoice payments and active supplier advance allocations are reconciled from PostgreSQL"
         filename={`Supplier-Outstanding-${new Date().toISOString().slice(0, 10)}`}
         dateField="date"
         dateFilters={true}
         landscape
         enableCSV={true}
-        excludeCommonFilterKeys={['status']}
-        summaryCards={(rs) => [
-          { label: 'Supplier Bills', value: rs.length, color: '#0369a1', bg: '#f0f9ff' },
-          { label: 'Total Payable (₹)', value: `₹ ${inr(rs.reduce((sum, row) => sum + row.invoiceAmount, 0))}`, color: '#0f172a', bg: '#f8fafc' },
-          { label: 'Total Paid (₹)', value: `₹ ${inr(rs.reduce((sum, row) => sum + row.amountPaid, 0))}`, color: '#166534', bg: '#f0fdf4' },
-          { label: 'Total Outstanding (₹)', value: `₹ ${inr(rs.reduce((sum, row) => sum + row.outstandingAmount, 0))}`, color: '#b91c1c', bg: '#fef2f2' },
-          { label: 'Overdue Bills (> 30 Days)', value: rs.filter((row) => row.paymentStatus !== 'Paid' && row.ageDays > 30).length, color: '#b45309', bg: '#fffbeb', subtitle: 'Pending creditor dues' }
-        ]}
+        summaryCards={(filteredRows) => buildSupplierOutstandingSummary(filteredRows).flatMap((summary) => [
+          { label: `Payable (${summary.currency})`, value: formatAmount(summary.invoiceAmount, summary.currency), color: '#0f172a', bg: '#f8fafc' },
+          { label: `Paid (${summary.currency})`, value: formatAmount(summary.amountPaid, summary.currency), color: '#166534', bg: '#f0fdf4' },
+          { label: `Advances Applied (${summary.currency})`, value: formatAmount(summary.advanceAllocated, summary.currency), color: '#1d4ed8', bg: '#eff6ff' },
+          { label: `Outstanding (${summary.currency})`, value: formatAmount(summary.outstandingAmount, summary.currency), color: '#b91c1c', bg: '#fef2f2' }
+        ])}
+        summaryContent={(filteredRows) => {
+          const partyRows = buildSupplierOutstandingPartySummary(filteredRows);
+          if (!partyRows.length) return null;
+          return (
+            <div className="content-block" style={{ marginBottom: 12 }}>
+              <div className="block-header"><h3 className="block-title">Supplier Totals</h3></div>
+              <div className="history-table-wrapper">
+                <table className="history-table report-table">
+                  <thead><tr>
+                    <th>Supplier</th><th>Supplier ID</th><th>Currency</th><th>Invoices</th>
+                    <th>Payable</th><th>Paid</th><th>Advances Applied</th><th>Outstanding</th>
+                  </tr></thead>
+                  <tbody>{partyRows.map((row) => (
+                    <tr key={`${row.supplierName}:${row.supplierId}:${row.currency}`}>
+                      <td>{row.supplierName}</td><td>{row.supplierId || '—'}</td><td>{row.currency}</td>
+                      <td>{filteredRows.filter((item) => item.supplierName === row.supplierName && item.currency === row.currency).length}</td>
+                      <td>{formatAmount(row.invoiceAmount, row.currency)}</td>
+                      <td>{formatAmount(row.amountPaid, row.currency)}</td>
+                      <td>{formatAmount(row.advanceAllocated, row.currency)}</td>
+                      <td>{formatAmount(row.outstandingAmount, row.currency)}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </div>
+          );
+        }}
         columns={[
-          { key: 'supplierName', label: 'Supplier Name', width: 39 },
-          { key: 'invoiceNumber', label: 'Supplier Bill No.', width: 32 },
-          { key: 'date', label: 'Bill Date', width: 22 },
-          { key: 'dueDate', label: 'Due Date', width: 22 },
-          { key: 'invoiceAmount', label: 'Bill Amount (₹)', width: 32, align: 'right', render: (r) => inr(r.invoiceAmount) },
-          { key: 'amountPaid', label: 'Paid (₹)', width: 25, align: 'right', render: (r) => inr(r.amountPaid) },
-          { key: 'outstandingAmount', label: 'Outstanding (₹)', width: 35, align: 'right', render: (r) => inr(r.outstandingAmount) },
+          { key: 'supplierName', label: 'Supplier Name', width: 34 },
+          { key: 'supplierId', label: 'Supplier ID', width: 20 },
+          { key: 'invoiceNumber', label: 'Supplier Bill No.', width: 30 },
+          { key: 'date', label: 'Bill Date', width: 20 },
+          { key: 'dueDate', label: 'Due Date', width: 20 },
+          { key: 'currency', label: 'Currency', width: 14 },
+          { key: 'invoiceAmount', label: 'Invoice Amount', width: 28, align: 'right', render: (row) => formatAmount(row.invoiceAmount, row.currency) },
+          { key: 'amountPaid', label: 'Payments Applied', width: 28, align: 'right', render: (row) => formatAmount(row.amountPaid, row.currency) },
+          { key: 'advanceAllocated', label: 'Advance Allocated', width: 28, align: 'right', render: (row) => formatAmount(row.advanceAllocated, row.currency) },
+          { key: 'outstandingAmount', label: 'Outstanding', width: 28, align: 'right', render: (row) => formatAmount(row.outstandingAmount, row.currency) },
+          { key: 'paymentStatus', label: 'Invoice Status', width: 20 },
           {
             key: 'ageingBucket',
             label: 'Ageing Bucket',
-            width: 32,
-            render: (r) => (
-              <span
-                style={{
-                  fontWeight: 600,
-                  color:
-                    r.ageingBucket === '90+ days'
-                      ? '#b91c1c'
-                      : r.ageingBucket === '61–90 days'
-                      ? '#c2410c'
-                      : r.ageingBucket === '31–60 days'
-                      ? '#b45309'
-                      : '#166534'
-                }}
-              >
-                {r.ageingBucket}
-              </span>
+            width: 30,
+            render: (row) => (
+              <span style={{
+                fontWeight: 600,
+                color: row.ageingBucket === '90+ days' ? '#b91c1c'
+                  : row.ageingBucket === '61–90 days' ? '#c2410c'
+                    : row.ageingBucket === '31–60 days' ? '#b45309' : '#166534'
+              }}>{row.ageingBucket}</span>
             ),
-            renderText: (r) => r.ageingBucket
-          },
+            renderText: (row) => row.ageingBucket
+          }
         ]}
         rows={rows}
         filters={[
-          { key: 'supplierName', placeholder: 'All Suppliers', options: suppliers.map((s) => ({ value: s, label: s })) },
-          { key: 'ageingBucket', placeholder: 'All Ageing Buckets', options: buckets.map((b) => ({ value: b, label: b })) }
+          { key: 'supplierName', placeholder: 'All Suppliers', options: suppliers.map((supplier) => ({ value: supplier, label: supplier })) },
+          { key: 'paymentStatus', placeholder: 'All Invoice Statuses', options: statuses.map((status) => ({ value: status, label: status })) },
+          { key: 'currency', placeholder: 'All Currencies', options: [...new Set(rows.map((row) => row.currency))].sort().map((currency) => ({ value: currency, label: currency })) },
+          { key: 'ageingBucket', placeholder: 'All Ageing Buckets', options: buckets.map((bucket) => ({ value: bucket, label: bucket })) }
         ]}
         totals={[
-          { colKey: 'invoiceAmount', render: (rs) => inr(rs.reduce((a, r) => a + r.invoiceAmount, 0)) },
-          { colKey: 'amountPaid', render: (rs) => inr(rs.reduce((a, r) => a + r.amountPaid, 0)) },
-          { colKey: 'outstandingAmount', render: (rs) => inr(rs.reduce((a, r) => a + r.outstandingAmount, 0)) }
+          { colKey: 'invoiceAmount', render: (filteredRows) => [...new Set(filteredRows.map((row) => row.currency))]
+            .map((currency) => `${currency} ${sumSupplierOutstanding(filteredRows.filter((row) => row.currency === currency), 'invoiceAmount').toLocaleString('en-IN', { maximumFractionDigits: 4 })}`).join(' | ') },
+          { colKey: 'amountPaid', render: (filteredRows) => [...new Set(filteredRows.map((row) => row.currency))]
+            .map((currency) => `${currency} ${sumSupplierOutstanding(filteredRows.filter((row) => row.currency === currency), 'amountPaid').toLocaleString('en-IN', { maximumFractionDigits: 4 })}`).join(' | ') },
+          { colKey: 'advanceAllocated', render: (filteredRows) => [...new Set(filteredRows.map((row) => row.currency))]
+            .map((currency) => `${currency} ${sumSupplierOutstanding(filteredRows.filter((row) => row.currency === currency), 'advanceAllocated').toLocaleString('en-IN', { maximumFractionDigits: 4 })}`).join(' | ') },
+          { colKey: 'outstandingAmount', render: (filteredRows) => [...new Set(filteredRows.map((row) => row.currency))]
+            .map((currency) => `${currency} ${sumSupplierOutstanding(filteredRows.filter((row) => row.currency === currency), 'outstandingAmount').toLocaleString('en-IN', { maximumFractionDigits: 4 })}`).join(' | ') }
         ]}
       />
     </div>

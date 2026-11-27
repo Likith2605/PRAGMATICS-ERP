@@ -356,7 +356,7 @@ const enrichDispatch = (dispatch, employees) => {
   const employee = employees.get(dispatch.dispatched_by);
   return {
     ...dispatch,
-    dispatcher_name: employee?.name ?? '',
+    dispatcher_name: employee?.name ?? dispatch.dispatched_by ?? '',
     dispatcher_employee_id: employee?.employee_id ?? ''
   };
 };
@@ -393,14 +393,14 @@ export const listDispatches = () => {
 /* Report payloads (mirrors repo.ts)                                   */
 /* ------------------------------------------------------------------ */
 
-export const buildCheckReport = (checkId) => {
-  const data = { ...emptySnapshot(), ...(getSnapshot() || {}) };
+export const buildCheckReport = (checkId, snapshot = getSnapshot()) => {
+  const data = { ...emptySnapshot(), ...(snapshot || {}) };
   const employees = index(data.employees);
   const drawings = index(data.drawings);
   const dimensions = index(data.dimensions);
   const checksById = index(data.checks);
 
-  const rawCheck = checksById.get(Number(checkId));
+  const rawCheck = checksById.get(checkId);
   if (!rawCheck) return null;
 
   const check = enrichCheck(rawCheck, employees, drawings);
@@ -423,9 +423,9 @@ export const buildCheckReport = (checkId) => {
   return { check, rows, dims };
 };
 
-export const buildDrawingReport = (drawingId) => {
-  const data = { ...emptySnapshot(), ...(getSnapshot() || {}) };
-  const id = Number(drawingId);
+export const buildDrawingReport = (drawingId, snapshot = getSnapshot()) => {
+  const data = { ...emptySnapshot(), ...(snapshot || {}) };
+  const id = drawingId;
   const employees = index(data.employees);
   const drawings = index(data.drawings);
   const dimensions = index(data.dimensions);
@@ -452,10 +452,10 @@ export const buildDrawingReport = (drawingId) => {
   return { drawing, checks, rows, dims };
 };
 
-export const buildDispatchReport = (dispatchId) => {
-  const data = { ...emptySnapshot(), ...(getSnapshot() || {}) };
+export const buildDispatchReport = (dispatchId, snapshot = getSnapshot()) => {
+  const data = { ...emptySnapshot(), ...(snapshot || {}) };
   const employees = index(data.employees);
-  const dispatch = (data.dispatches || []).find((entry) => entry.id === Number(dispatchId));
+  const dispatch = (data.dispatches || []).find((entry) => entry.id === dispatchId);
   if (!dispatch) return null;
   return enrichDispatch(dispatch, employees);
 };

@@ -1,17 +1,102 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
 import {
   getAdvanceShipmentRows, getAvailableIssuedStockRows, getCustomerMaterialStatusRows,
   getGRNPOPRRows, getInwardRows, getMRNDetailRows, getSupplierDirectoryRows,
   trackAFilterOptions, qtyByUnit
 } from '../../utils/trackAReportData.js';
+import { listMaterialReceiptQualityChecksApi, listMaterialReceiptsApi } from '../../services/materialReceiptApi.js';
+import { listPurchaseOrders, listProcurementRecords, listSupplierInvoicesApi } from '../../services/procurementIntakeApi.js';
+import { listPurchaseRequestsApi } from '../../services/purchaseRequestApi.js';
+import { listMasters } from '../../services/masterApi.js';
+import { listAllStockLedger, listInventoryItems, listInventoryLots } from '../../services/inventoryApi.js';
+import { getMaterialRequests, getMaterialReturns, getStoreIssues } from '../../services/storeApi.js';
+import { listHtOutsource, listJobCards } from '../../services/productionApi.js';
+import { listSalesOrders } from '../../services/salesOrderApi.js';
+import { listDeliveryChallans } from '../../services/deliveryChallanApi.js';
+import { listPurchaseIndentQualityChecks } from '../../services/procurementIntakeApi.js';
+import { listModuleRecords } from '../../services/moduleRecordsApi.js';
+import { normalizeInventoryBatch, normalizeInventoryItem, normalizeStockLedgerEntry } from '../../utils/reportApiData.js';
 
 const amount = (value) => value == null ? '' : Number(value).toLocaleString('en-IN', { maximumFractionDigits: 3 });
 const date = () => new Date().toISOString().slice(0, 10);
+const emptyData = { inventoryItems: [], stockLedger: [], arrivals: [], receipts: [], qualityChecks: [], grns: [], purchaseOrders: [], purchaseRequests: [], purchaseIndents: [], supplierInvoices: [], vendors: [], htOutsource: [], salesOrders: [], jobCards: [], deliveryChallans: [], requests: [], issues: [], returns: [] };
+const uniqueChecks = (...groups) => {
+  const checks = groups.flat();
+  return [...new Map(checks.map((record) => [String(record.qcNumber || record.id || ''), record])).values()];
+};
+const grnsFromBatches = (batches) => {
+  const grouped = new Map();
+  batches.forEach((batch) => {
+    const number = batch.grnNumber || batch.payload?.grnNumber;
+    if (!number) return;
+    const grn = grouped.get(number) || {
+      grnNumber: number, grnDate: batch.receivedDate || batch.created_at || '',
+      poRef: batch.poNumber || batch.poRef || '', supplier: batch.supplier || '',
+      qcNumber: batch.qcNumber || '', items: []
+    };
+    grn.items.push({
+      itemCode: batch.itemCode, itemName: batch.itemName,
+      acceptedQty: Number(batch.qtyReceived) || 0, unit: batch.unit
+    });
+    grouped.set(number, grn);
+  });
+  return [...grouped.values()];
+};
+const loadTrackAData = async (reportType) => {
+  if (reportType === 'suppliers') {
+    const [vendors, purchaseOrders, receipts, supplierInvoices, htOutsource] = await Promise.all([
+      listMasters('vendors'), listPurchaseOrders(), listMaterialReceiptsApi(),
+      listSupplierInvoicesApi(), listHtOutsource()
+    ]);
+    return { ...emptyData, vendors, purchaseOrders, receipts, supplierInvoices, htOutsource };
+  }
+  if (reportType === 'stock') {
+    const [items, ledger] = await Promise.all([listInventoryItems(), listAllStockLedger()]);
+    return { ...emptyData, inventoryItems: items.map(normalizeInventoryItem), stockLedger: ledger.map(normalizeStockLedgerEntry) };
+  }
+  if (reportType === 'inward') {
+    const [arrivals, receipts, checks, receiptChecks, batches] = await Promise.all([
+      listModuleRecords('materialArrivals'), listMaterialReceiptsApi(),
+      listModuleRecords('qualityChecks'), listMaterialReceiptQualityChecksApi(), listInventoryLots()
+    ]);
+    const normalizedBatches = batches.map(normalizeInventoryBatch);
+    return {
+      ...emptyData, arrivals, receipts, qualityChecks: uniqueChecks(checks, receiptChecks),
+      grns: grnsFromBatches(normalizedBatches)
+    };
+  }
+  if (reportType === 'grnPoPr') {
+    const [receipts, purchaseOrders, purchaseRequests, purchaseIndents, checks, receiptChecks, indentChecks, batches] = await Promise.all([
+      listMaterialReceiptsApi(), listPurchaseOrders(), listPurchaseRequestsApi(),
+      listProcurementRecords('purchaseIndent'), listModuleRecords('qualityChecks'),
+      listMaterialReceiptQualityChecksApi(), listPurchaseIndentQualityChecks(), listInventoryLots()
+    ]);
+    return {
+      ...emptyData, receipts, purchaseOrders, purchaseRequests, purchaseIndents,
+      qualityChecks: uniqueChecks(checks, receiptChecks, indentChecks),
+      grns: grnsFromBatches(batches.map(normalizeInventoryBatch))
+    };
+  }
+  if (reportType === 'customerMaterialStatus') {
+    const [salesOrders, jobCards, deliveryChallans] = await Promise.all([listSalesOrders(), listJobCards(), listDeliveryChallans()]);
+    return { ...emptyData, salesOrders, jobCards, deliveryChallans };
+  }
+  if (reportType === 'mrnDetail') {
+    const [requests, issues, returns, purchaseRequests, purchaseIndents] = await Promise.all([
+      getMaterialRequests(), getStoreIssues(), getMaterialReturns(),
+      listPurchaseRequestsApi(), listProcurementRecords('purchaseIndent')
+    ]);
+    return { ...emptyData, requests, issues, returns, purchaseRequests, purchaseIndents };
+  }
+  return emptyData;
+};
 
 const REPORTS = {
   suppliers: {
-    title: 'List of Supplier', filename: 'Supplier-List', dateFilters: false, getRows: getSupplierDirectoryRows,
+    title: 'List of Supplier', filename: 'Supplier-List', dateFilters: false, getRows: (data) => getSupplierDirectoryRows(data),
     columns: [
       { key: 'supplierName', label: 'Supplier Name' }, { key: 'contact', label: 'Contact' },
       { key: 'phone', label: 'Phone' }, { key: 'email', label: 'Email' }, { key: 'address', label: 'Address' },
@@ -38,7 +123,7 @@ const REPORTS = {
     ], filterKeys: ['category', 'reconciliation']
   },
   inward: {
-    title: 'Inward Report', filename: 'Inward-Report', dateFilters: true, dateField: 'date', getRows: getInwardRows,
+    title: 'Inward Report', filename: 'Inward-Report', dateFilters: true, dateField: 'date', getRows: (data) => getInwardRows(data),
     note: 'Arrival, material receipt and GRN posting are shown as separate event types. Do not sum them as separate physical deliveries.',
     columns: [
       { key: 'date', label: 'Date' }, { key: 'eventType', label: 'Event Type' }, { key: 'reference', label: 'Reference' },
@@ -50,7 +135,7 @@ const REPORTS = {
     ], filterKeys: ['eventType', 'supplier', 'poNumber']
   },
   grnPoPr: {
-    title: 'GRN – PO – PR Report', filename: 'GRN-PO-PR-Report', dateFilters: true, dateField: 'date', getRows: getGRNPOPRRows,
+    title: 'GRN – PO – PR Report', filename: 'GRN-PO-PR-Report', dateFilters: true, dateField: 'date', getRows: (data) => getGRNPOPRRows(data),
     note: 'Only explicit PR/Indent and document references are shown. Missing source links remain blank; PO line order is retained when matching progress lines.',
     columns: [
       { key: 'date', label: 'PO Date' }, { key: 'prNumber', label: 'PR No' }, { key: 'indentNumber', label: 'Indent No' },
@@ -106,8 +191,13 @@ const REPORTS = {
 
 const TrackAReportPage = ({ reportType }) => {
   const [supplierSearch, setSupplierSearch] = useState('');
+  const load = React.useCallback(() => loadTrackAData(reportType), [reportType]);
+  const { data, loading, error } = useAuthoritativeData(load, reportType, emptyData);
   const config = REPORTS[reportType];
-  const rows = useMemo(() => config?.getRows ? config.getRows() : [], [config]);
+  const rows = useMemo(
+    () => (config?.getRows ? config.getRows(data) : []),
+    [config, data]
+  );
   const displayRows = useMemo(() => {
     if (reportType !== 'suppliers') return rows;
     const query = supplierSearch.trim().toLocaleLowerCase();
@@ -133,6 +223,8 @@ const TrackAReportPage = ({ reportType }) => {
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
+      {(loading || error) && <ReportLoadState loading={loading} error={error} />}
+      {!loading && !error && <>
       {reportType !== 'suppliers' && config.note && <div className="content-block" style={{ marginBottom: 14, color: '#475569', fontSize: 13 }}>{config.note}</div>}
       <ReportRegister
         title={config.title}
@@ -147,7 +239,6 @@ const TrackAReportPage = ({ reportType }) => {
         landscape={reportType === 'mrnDetail' ? true : undefined}
         totals={totals}
         hideFilterActions={reportType === 'suppliers'}
-        pdfOnly={reportType === 'suppliers'}
         showPrint={reportType === 'suppliers'}
         hidePagination={reportType === 'suppliers'}
         defaultPageSize={reportType === 'suppliers' ? 'all' : 50}
@@ -157,6 +248,7 @@ const TrackAReportPage = ({ reportType }) => {
         toolbarSearchPlaceholder="Search supplier name or GSTIN"
         enableCSV
       />
+      </>}
     </div>
   );
 };

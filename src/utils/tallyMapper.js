@@ -16,6 +16,7 @@
  */
 
 import { calculateTotals } from './calculations.js';
+import { getCompanyProfile } from './companyBranding.js';
 
 // ---------------------------------------------------------------------------
 // Constants — Tally groups / ledgers
@@ -94,14 +95,7 @@ export const tallyDate = (dateStr) => {
 /** Round to 2 decimals. */
 export const r2 = (n) => Number(Number(n || 0).toFixed(2));
 
-/** Get company settings from localStorage. */
-const getCompany = () => {
-  try {
-    const raw = localStorage.getItem('companySettings');
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return {};
-};
+const getCompany = () => getCompanyProfile();
 
 /** Determine CGST/SGST/IGST from taxMode. */
 const splitGST = (taxMode, totalGST) => {

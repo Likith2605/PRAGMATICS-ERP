@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import { hasPermission } from '../utils/permissions.js';
-import { getPurchaseOrders, getPOProgress, getReceiptsForPO } from '../utils/workflowService.js';
+import { listPurchaseOrders } from '../services/procurementIntakeApi.js';
+import { listMaterialReceiptsApi } from '../services/materialReceiptApi.js';
 import { ReceiptForm } from './MaterialReceiptsPage.jsx';
 import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterVendorPurchaseOrders } from '../utils/historySearch.js';
@@ -25,6 +26,19 @@ const VendorSupplierRecordPage = () => {
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
   const [search, setSearch] = useState('');
+  const [serverReceipts, setServerReceipts] = useState([]);
+  const [serverPOs, setServerPOs] = useState([]);
+  const [poLoadError, setPoLoadError] = useState('');
+  const [receiptLoadError, setReceiptLoadError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    listPurchaseOrders().then((rows) => { if (active) { setServerPOs(rows); setPoLoadError(''); } })
+      .catch((error) => { if (active) { setServerPOs([]); setPoLoadError(`Purchase Orders could not be loaded from PostgreSQL: ${error.message}`); } });
+    listMaterialReceiptsApi().then((rows) => { if (active) { setServerReceipts(rows); setReceiptLoadError(''); } })
+      .catch((error) => { if (active) { setServerReceipts([]); setReceiptLoadError(`Material Receipts could not be loaded from PostgreSQL: ${error.message}`); } });
+    return () => { active = false; };
+  }, [tick]);
 
   useEffect(() => {
     const refresh = () => setTick((current) => current + 1);
@@ -48,13 +62,14 @@ const VendorSupplierRecordPage = () => {
 
   const canCreate = hasPermission('receipt.create');
 
+  /* PostgreSQL rows carry reconciled progress; no browser history is read. */
   const pos = useMemo(
-    () => getPurchaseOrders().filter((p) => !['Cancelled'].includes(p.status)),
-    [tick]
+    () => serverPOs.filter((p) => !['Cancelled'].includes(p.status)),
+    [serverPOs]
   );
   const orderRows = useMemo(
-    () => pos.map((po) => ({ po, progress: getPOProgress(po.reference) })),
-    [pos, tick]
+    () => pos.map((po) => ({ po, progress: po.progress || { ordered: 0, received: 0, pending: 0, status: po.status } })),
+    [pos]
   );
   const filteredPOs = useMemo(
     () => filterVendorPurchaseOrders(orderRows, search),
@@ -68,11 +83,8 @@ const VendorSupplierRecordPage = () => {
   };
 
   const selected = selectedPO ? pos.find((p) => String(p.reference) === String(selectedPO)) || null : null;
-  const progress = selected ? getPOProgress(selected.reference) : null;
-  const receipts = useMemo(
-    () => (selectedPO ? getReceiptsForPO(selectedPO) : []),
-    [selectedPO, tick]
-  );
+  const progress = selected ? (selected.progress || { ordered: 0, received: 0, pending: 0, status: selected.status }) : null;
+  const receipts = useMemo(() => selectedPO ? serverReceipts.filter((receipt) => String(receipt.poNumber) === String(selectedPO)) : [], [selectedPO, serverReceipts]);
 
   const messageBox = message && (
     <div
@@ -108,6 +120,8 @@ const VendorSupplierRecordPage = () => {
         </div>
 
         {messageBox}
+        {poLoadError && <div role="alert" className="form-error">{poLoadError}</div>}
+        {receiptLoadError && <div role="alert" className="form-error">{receiptLoadError}</div>}
 
         <div className="content-block">
           <div className="block-header">
@@ -228,6 +242,8 @@ const VendorSupplierRecordPage = () => {
       </div>
 
       {messageBox}
+      {poLoadError && <div role="alert" className="form-error">{poLoadError}</div>}
+        {receiptLoadError && <div role="alert" className="form-error">{receiptLoadError}</div>}
 
       <div className="content-block">
         <div className="block-header">

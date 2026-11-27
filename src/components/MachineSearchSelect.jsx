@@ -1,16 +1,24 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { getMachines } from '../utils/storeService.js';
+import { listMasters } from '../services/masterApi.js';
 
 const MachineSearchSelect = ({ value = null, onChange, placeholder = 'Search machine by name or ID...', portalMenu = false, compact = false }) => {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [pos, setPos] = useState(null);
+  const [machines, setMachines] = useState([]);
+  const [loadError, setLoadError] = useState('');
   const wrapRef = useRef(null);
   const inputRef = useRef(null);
   const listRef = useRef(null);
-  const machines = getMachines();
+  useEffect(() => {
+    let activeRequest = true;
+    listMasters('machines')
+      .then((records) => { if (activeRequest) { setMachines(records); setLoadError(''); } })
+      .catch((error) => { if (activeRequest) { setMachines([]); setLoadError(`Machine master could not be loaded from PostgreSQL: ${error.message}`); } });
+    return () => { activeRequest = false; };
+  }, []);
 
   const filtered = useMemo(() => {
     const q = query.toLowerCase().trim();
@@ -229,9 +237,11 @@ const MachineSearchSelect = ({ value = null, onChange, placeholder = 'Search mac
             onClick={() => setOpen(true)}
             onKeyDown={onKeyDown}
           />
+          {loadError && <span role="alert" className="employee-search-empty">{loadError}</span>}
           {portalMenu && dropdown ? createPortal(dropdown, document.body) : dropdown}
         </>
       )}
+      {value && loadError && <span role="alert" className="employee-search-empty">{loadError}</span>}
     </div>
   );
 };

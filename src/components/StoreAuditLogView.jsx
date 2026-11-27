@@ -1,11 +1,30 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getAuditLog } from '../utils/storeService.js';
 
 const StoreAuditLogView = ({ limit = 200 }) => {
   const [search, setSearch] = useState('');
   const [actionFilter, setActionFilter] = useState('All');
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
 
-  const logs = getAuditLog();
+  const refresh = useCallback(async () => {
+    try {
+      setError('');
+      setLogs(await getAuditLog(undefined, limit));
+    } catch (requestError) {
+      setLogs([]);
+      setError(requestError.message || 'Store audit history could not be loaded.');
+    } finally {
+      setLoading(false);
+    }
+  }, [limit]);
+
+  useEffect(() => {
+    refresh();
+    window.addEventListener('erp-store-audit-updated', refresh);
+    return () => window.removeEventListener('erp-store-audit-updated', refresh);
+  }, [refresh]);
 
   const actions = useMemo(() => {
     const set = new Set(logs.map((l) => l.action));
@@ -49,6 +68,7 @@ const StoreAuditLogView = ({ limit = 200 }) => {
         </select>
       </div>
 
+      {error && <div className="error-banner" role="alert">{error}</div>}
       <div className="history-table-wrapper">
         <table className="history-table">
           <thead>
@@ -63,7 +83,9 @@ const StoreAuditLogView = ({ limit = 200 }) => {
             </tr>
           </thead>
           <tbody>
-            {filtered.length === 0 ? (
+            {loading ? (
+              <tr><td colSpan="7" className="no-history-row">Loading audit entries...</td></tr>
+            ) : filtered.length === 0 ? (
               <tr>
                 <td colSpan="7" className="no-history-row">No audit entries found.</td>
               </tr>

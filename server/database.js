@@ -10,20 +10,27 @@ const migrationsDir = fileURLToPath(new URL('../migrations',
     import.meta.url));
 let pool;
 
+// Integration tests can opt into a separate URL without reading, changing or
+// passing through the normal DATABASE_URL configuration.
+const configuredDatabaseUrl = () => process.env.ERP_TEST_MODE === '1'
+    ? process.env.ERP_TEST_DATABASE_URL
+    : process.env.DATABASE_URL;
+export const hasDatabaseConfiguration = () => Boolean(configuredDatabaseUrl());
+
 /**
  * Returns the shared connection pool, creating it on first call.
  * Throws if DATABASE_URL is not configured.
  */
 export const getPool = () => {
-    if (!process.env.DATABASE_URL) {
+    const connectionString = configuredDatabaseUrl();
+    if (!connectionString) {
         throw new Error(
-            'DATABASE_URL is not configured. ' +
-            'Copy .env.example to .env and set DATABASE_URL=postgresql://postgres:PASSWORD@localhost:5432/newDB'
+            'No PostgreSQL database URL is configured for the current runtime.'
         );
     }
     if (!pool) {
         pool = new Pool({
-            connectionString: process.env.DATABASE_URL,
+            connectionString,
             max: Number(process.env.DB_POOL_MAX || 10),
             connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 5000),
             idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS || 30000),
@@ -51,8 +58,15 @@ export const checkDatabase = async () => {
  * Each migration runs in a transaction; a failure rolls back the individual
  * migration and re-throws so the caller can abort startup cleanly.
  */
-export const runMigrations = async () => {
-    const db = getPool();
+export const runMigrations = async (targetPool = getPool()) => {
+    const db = targetPool;
+
+    if (process.env.ERP_TEST_MODE === '1') {
+        const identity = await db.query('SELECT current_database() AS name');
+        if (identity.rows[0]?.name !== 'vyavastha_test') {
+            throw new Error('Refusing test-mode database operation: current_database() must be exactly vyavastha_test.');
+        }
+    }
 
     // Ensure the tracking table exists before anything else.
     await db.query(`

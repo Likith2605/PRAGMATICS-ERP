@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { getCompanyLegalName, getCompanyProfile } from '../utils/companyBranding.js';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { generateQuotationPDF } from '../services/pdfGenerator.js';
+import { getProcurementRecord } from '../services/procurementIntakeApi.js';
 import VendorQuotationPreview from '../components/VendorQuotationPreview.jsx';
 
 const PdfDownloadIcon = () => (
@@ -41,28 +42,39 @@ const EmailIcon = () => (
 );
 
 const VendorQuotationPreviewPage = () => {
-  const location = useLocation();
   const navigate = useNavigate();
+  const { quotationNumber: routeQuotationNumber } = useParams();
   const [vqData, setVqData] = useState(null);
   const [shareOpen, setShareOpen] = useState(false);
   const [message, setMessage] = useState('');
   const [downloading, setDownloading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const requestedQuotationNumber = routeQuotationNumber || '';
 
   useEffect(() => {
-    if (location.state?.vendorQuotation) {
-      setVqData(location.state.vendorQuotation);
-      return;
+    let active = true;
+    setVqData(null);
+    setLoadError('');
+    if (!requestedQuotationNumber) {
+      setLoadError('A persistent Vendor Quotation number is required to load this preview.');
+      setLoading(false);
+      return () => { active = false; };
     }
-    const localData = localStorage.getItem('currentVendorQuotation');
-    if (localData) {
-      try {
-        setVqData(JSON.parse(localData));
-      } catch (error) {
-        console.error('Unable to parse saved vendor quotation', error);
-        setVqData(null);
-      }
-    }
-  }, [location.state]);
+    setLoading(true);
+    getProcurementRecord('vendorQuotation', requestedQuotationNumber)
+      .then((record) => {
+        if (!active) return;
+        if (!record) throw new Error('Quotation not found.');
+        setVqData(record);
+      })
+      .catch((error) => {
+        if (!active) return;
+        setLoadError(`Vendor Quotation could not be loaded from PostgreSQL: ${error.message}`);
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [requestedQuotationNumber]);
 
   const handleDownloadPDF = async () => {
     if (!vqData) return;
@@ -101,7 +113,7 @@ Please find attached the vendor quotation received.
 VQ No: ${vqData.quotationNumber || 'N/A'}
 Enquiry Ref: ${vqData.enquiryNumber || 'N/A'}
 Vendor: ${vqData.vendorName || 'N/A'}
-Total: ₹${Number(vqData.totalAmount || 0).toFixed(2)}
+Total: ₹${Number(vqData.totalWithTax ?? vqData.totalAmount ?? 0).toFixed(2)}
 Delivery: ${vqData.deliveryDays || '-'} days
 
 Kindly review the attached vendor quotation.
@@ -135,7 +147,7 @@ Please find attached the vendor quotation received.
 VQ No: ${vqData.quotationNumber || 'N/A'}
 Enquiry Ref: ${vqData.enquiryNumber || 'N/A'}
 Vendor: ${vqData.vendorName || 'N/A'}
-Total: ₹${Number(vqData.totalAmount || 0).toFixed(2)}
+Total: ₹${Number(vqData.totalWithTax ?? vqData.totalAmount ?? 0).toFixed(2)}
 Delivery: ${vqData.deliveryDays || '-'} days
 
 Kindly review the attached vendor quotation.
@@ -156,14 +168,16 @@ ${getCompanyProfile().email}`;
     window.open(url, '_blank', 'noopener');
   };
 
-  if (!vqData) {
+  if (loading || loadError || !vqData) {
     return (
       <div className="page-section">
         <div className="page-header">
           <div>
-            <p className="eyebrow">Preview unavailable</p>
+            <p className="eyebrow">{loading ? 'Loading quotation' : 'Preview unavailable'}</p>
             <h1>Vendor Quotation Preview</h1>
-            <p className="page-description">No vendor quotation data found. Please receive a quotation first.</p>
+            <p className="page-description">
+              {loading ? 'Loading Vendor Quotation from PostgreSQL…' : loadError || 'Vendor Quotation was not found.'}
+            </p>
           </div>
         </div>
         <div className="content-block">

@@ -1,5 +1,6 @@
 ﻿import { SAMPLE_COUNT } from "./types.js";
 import { COMPANY_NAME } from "../config.js";
+import { getCompanyLegalName } from "../../utils/companyBranding.js";
 import { QUALITY_REPORT_FOOTER } from "./footer.js";
 import { fmt, isInTolerance, isNumericSpec, parseStatuses, samplesOf, toleranceText } from "./format.js";
 function isTextSpec(value) {
@@ -26,7 +27,7 @@ function companyLines(company = {}) {
     company.gstin && `GSTIN: ${company.gstin}`, company.pan && `PAN: ${company.pan}`].filter(Boolean).join(" | ");
 }
 function buildReportHtml(report, logoUri = "", company = {}, generatedBy = "User") {
-  const companyName = company.companyName || COMPANY_NAME;
+  const companyName = company.companyName || getCompanyLegalName() || COMPANY_NAME;
   const companyInfo = companyLines(company);
   const { check, rows, dims } = report;
   const pending = dims.filter((d) => !d.checked);
@@ -189,7 +190,7 @@ ${pendingRows}` : "");
 </html>`;
 }
 function buildOverallReportHtml(report, logoUri = "", company = {}, generatedBy = "User") {
-  const companyName = company.companyName || COMPANY_NAME;
+  const companyName = company.companyName || getCompanyLegalName() || COMPANY_NAME;
   const companyInfo = companyLines(company);
   const { drawing, checks, rows, dims } = report;
   const pending = dims.filter((d) => !d.checked);

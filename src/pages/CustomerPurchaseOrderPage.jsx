@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import AddableSelect from '../components/AddableSelect.jsx';
 import { DEFAULT_UNITS } from '../utils/addableMasters.js';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -10,16 +10,13 @@ import { generateQuotationPDF } from '../services/pdfGenerator.js';
 import { getAllProjectsSummary, getFullProjectData } from '../utils/projectTracker.js';
 import WorkflowNavigator from '../components/WorkflowNavigator.jsx';
 import ProjectIdAutocomplete from '../components/ProjectIdAutocomplete.jsx';
-import { getNextSequentialNumber, saveDocSequence } from '../utils/sequenceGenerator.js';
+import { listQuotations } from '../services/quotationApi.js';
 import ExcelImportDialog from '../components/ExcelImportDialog.jsx';
-import { importCustomerPurchaseOrders, getCustomerPurchaseOrders, getCustomerPurchaseOrder, createCustomerPurchaseOrder } from '../services/customerPurchaseOrderApi.js';
+import { importCustomerPurchaseOrders, getCustomerPurchaseOrders, getCustomerPurchaseOrder, createCustomerPurchaseOrder, updateCustomerPurchaseOrder, deleteCustomerPurchaseOrder, reserveNextCustomerPONumber } from '../services/customerPurchaseOrderApi.js';
+import { isAdmin } from '../utils/auth.js';
 import { CUSTOMER_PO_EXCEL_COLUMNS, validateCustomerPOExcelRecord } from '../utils/customerPOExcelImport.js';
 import { Upload } from 'lucide-react';
 import { getFinancialYearInfo } from '../utils/financialYear.js';
-
-const generateCustomerPONumber = () => {
-  return getNextSequentialNumber('CPO', 'customerPOSequence', null, 'reference');
-};
 
 const emptyItem = {
   itemCode: '',
@@ -41,6 +38,9 @@ const CustomerPurchaseOrderPage = () => {
   const [history, setHistory] = useState([]);
   const [quotationList, setQuotationList] = useState([]);
   const [selectedPO, setSelectedPO] = useState(null);
+  const [selectedPOVersion, setSelectedPOVersion] = useState(null);
+  const [editingPOVersion, setEditingPOVersion] = useState(null);
+  const createToken = useRef(globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
   const [showExcelImport, setShowExcelImport] = useState(false);
 
   // Filter & Pagination States
@@ -48,6 +48,7 @@ const CustomerPurchaseOrderPage = () => {
   const [fyFilter, setFyFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
+  const [loadError, setLoadError] = useState('');
   const pageSize = 30;
 
   const customerPOImportColumns = CUSTOMER_PO_EXCEL_COLUMNS;
@@ -66,12 +67,11 @@ const CustomerPurchaseOrderPage = () => {
     } catch (error) {
       console.error('Customer PO import committed, but the dashboard refresh failed', error);
     }
-    for (const outcome of result.outcomes.filter((item) => item.status === 'imported')) saveDocSequence('customerPOSequence', outcome.poNumber);
     return { ...result, success: result.newHeaders ?? result.imported, skipped: result.skippedItems ?? 0, outcomes: result.outcomes };
   };
   // Form states
   const [poDetails, setPoDetails] = useState({
-    customerPoNumber: generateCustomerPONumber(),
+    customerPoNumber: '',
     customerPoDate: new Date().toISOString().slice(0, 10),
     deliveryDueDate: new Date(Date.now() + 20 * 86400000).toISOString().slice(0, 10),
     quotationRef: '',
@@ -98,38 +98,29 @@ const CustomerPurchaseOrderPage = () => {
     state: ''
   });
 
-  const [companyDetails, setCompanyDetails] = useState(() => {
-    try {
-      const stored = localStorage.getItem('companySettings');
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    const profile = getCompanyProfile();
-    return {
-      companyName: profile.companyName || '',
-      phone: profile.phone || '',
-      email: profile.email || '',
-      address: profile.address || '',
-      gstin: profile.gstin || '',
-      state: profile.state || ''
-    };
-  });
+  const [companyDetails, setCompanyDetails] = useState(() => getCompanyProfile());
 
   const [items, setItems] = useState([{ ...emptyItem }]);
+
+  useEffect(() => {
+    if (poDetails.customerPoNumber) return;
+    let active = true;
+    reserveNextCustomerPONumber()
+      .then((customerPoNumber) => { if (active) setPoDetails((current) => current.customerPoNumber ? current : { ...current, customerPoNumber }); })
+      .catch((error) => { if (active) setLoadError(`Could not reserve a Customer PO number from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
+  }, [poDetails.customerPoNumber]);
 
   // Customer PO records are stored centrally in PostgreSQL.
   useEffect(() => {
     let active = true;
     const refreshCustomerPOs = () => getCustomerPurchaseOrders()
-      .then((records) => { if (active) setHistory(records); })
-      .catch((error) => console.error('Failed to load Customer POs from PostgreSQL', error));
+      .then((records) => { if (active) { setHistory(records); setLoadError(''); } })
+      .catch((error) => { if (active) setLoadError(`Could not load current Customer POs from PostgreSQL: ${error.message}`); });
     refreshCustomerPOs();
     const refreshTimer = window.setInterval(refreshCustomerPOs, 15000);
-    try {
-      const storedQuotes = localStorage.getItem('quotationHistory');
-      setQuotationList(storedQuotes ? JSON.parse(storedQuotes) : []);
-    } catch {
-      setQuotationList([]);
-    }
+    listQuotations().then((records) => { if (active) setQuotationList(records); })
+      .catch((error) => { if (active) setLoadError(`Could not load quotations from PostgreSQL: ${error.message}`); });
     return () => { active = false; window.clearInterval(refreshTimer); };
   }, []);
 
@@ -242,7 +233,7 @@ const CustomerPurchaseOrderPage = () => {
     if (location.state?.fromQuotation && location.state?.quotation) {
       const q = location.state.quotation;
       setPoDetails({
-        customerPoNumber: generateCustomerPONumber(),
+        customerPoNumber: '',
         customerPoDate: new Date().toISOString().slice(0, 10),
         deliveryDueDate: new Date(Date.now() + 20 * 86400000).toISOString().slice(0, 10),
         quotationRef: q.quotationDetails?.quotationNumber || '',
@@ -265,8 +256,7 @@ const CustomerPurchaseOrderPage = () => {
 
       setMode('create');
     } else if (location.state?.viewPO) {
-      setSelectedPO(location.state.viewPO);
-      setMode('view');
+      handleViewPO(location.state.viewPO);
     }
   }, [location.state]);
 
@@ -366,16 +356,20 @@ const CustomerPurchaseOrderPage = () => {
     };
 
     try {
-      const entry = await createCustomerPurchaseOrder({
+      const record = {
         date: poDetails.customerPoDate,
         reference: poDetails.customerPoNumber,
         company: customerDetails.companyName || customerDetails.customerName || '-',
         status: poDetails.poStatus || 'Received',
         payload
-      });
-      saveDocSequence('customerPOSequence', poDetails.customerPoNumber);
+      };
+      const entry = editingPOVersion
+        ? await updateCustomerPurchaseOrder(poDetails.customerPoNumber, record, editingPOVersion)
+        : await createCustomerPurchaseOrder(record, createToken.current);
       setHistory((current) => [entry, ...current.filter((record) => record.reference !== entry.reference)]);
       setSelectedPO(entry.payload);
+      setSelectedPOVersion(entry.version);
+      setEditingPOVersion(null);
       setMode('view');
     } catch (err) {
       console.error('Failed to save Customer PO', err);
@@ -421,6 +415,7 @@ const CustomerPurchaseOrderPage = () => {
     try {
       const record = await getCustomerPurchaseOrder(po.reference);
       setSelectedPO(record.payload);
+      setSelectedPOVersion(record.version);
       setMode('view');
     } catch (error) {
       alert(error.message || 'Could not retrieve this Customer PO from PostgreSQL.');
@@ -485,11 +480,13 @@ const CustomerPurchaseOrderPage = () => {
                 className="button-primary"
                 onClick={() => {
                   setPoDetails({
-                    customerPoNumber: generateCustomerPONumber(),
+                    customerPoNumber: '',
                     customerPoDate: new Date().toISOString().slice(0, 10),
                     deliveryDueDate: new Date(Date.now() + 20 * 86400000).toISOString().slice(0, 10),
                     quotationRef: '', projectId: '', placeOfSupply: '', poStatus: 'Received', discount: '', currency: 'INR', exchangeRate: '', rateDate: '', rateAtConversion: '', taxMode: 'intra', notes: '', termsAndConditions: ''
                   });
+                  setEditingPOVersion(null);
+                  createToken.current = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
                   setItems([{ ...emptyItem }]);
                   setMode('create');
                 }}
@@ -512,6 +509,7 @@ const CustomerPurchaseOrderPage = () => {
       )}
 
       <div className="content-block">
+        {loadError && <div role="alert" className="error-message">{loadError}</div>}
         {mode === 'list' && (
           <>
             <div className="block-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
@@ -1137,8 +1135,8 @@ const CustomerPurchaseOrderPage = () => {
               <button type="button" className="button-secondary" onClick={() => setMode('list')}>
                 Cancel
               </button>
-              <button type="submit" className="button-primary">
-                Save Customer PO
+              <button type="submit" className="button-primary" disabled={!poDetails.customerPoNumber}>
+                {editingPOVersion ? 'Update Customer PO' : 'Save Customer PO'}
               </button>
             </div>
           </form>
@@ -1171,11 +1169,21 @@ const CustomerPurchaseOrderPage = () => {
                         setCustomerDetails(selectedPO.customerDetails);
                         setCompanyDetails(selectedPO.companyDetails);
                         setItems(selectedPO.items);
+                        setEditingPOVersion(selectedPOVersion);
                         setMode('create');
                       }}
                     >
                       Edit PO
                     </button>
+                    {isAdmin() && <button className="button-delete" onClick={async () => {
+                      if (!window.confirm(`Move Customer PO ${selectedPO.poDetails?.customerPoNumber} to the Recycle Bin?`)) return;
+                      try {
+                        await deleteCustomerPurchaseOrder(selectedPO.poDetails.customerPoNumber, selectedPOVersion, 'Admin soft-deleted Customer PO');
+                        setHistory((current) => current.filter((item) => item.reference !== selectedPO.poDetails.customerPoNumber));
+                        setSelectedPO(null);
+                        setMode('list');
+                      } catch (error) { alert(`Customer PO was not deleted: ${error.message}`); }
+                    }}>Delete PO</button>}
                     <button
                       className="button-primary"
                       style={{ background: '#2563eb' }}

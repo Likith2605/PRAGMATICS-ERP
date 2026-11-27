@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
+import { listDebitNotes } from '../services/debitNoteApi.js';
 import { generatePurchaseIndentPDF } from '../services/pdfGenerator.js';
 import { getCurrentUserInfo, hasPermission, isAdmin } from '../utils/permissions.js';
 import {
@@ -23,7 +24,6 @@ import {
   getRejectionReportsForIndent,
   getDebitNoteContext,
   getDebitNoteSummaryForRejection,
-  getDebitNotes,
   getProcurementChainForIndent,
   DEBIT_NOTE_STATUS,
   createRepurchaseIndent,
@@ -32,6 +32,8 @@ import {
   INDENT_STATUS,
   INDENT_QC_STATUS
 } from '../utils/workflowService.js';
+import { listProcurementRecords } from '../services/procurementIntakeApi.js';
+import ProcurementMigrationReview from '../components/ProcurementMigrationReview.jsx';
 
 /**
  * Store Department staff don't raise vendor enquiries from this menu — the
@@ -137,7 +139,10 @@ const PurchaseIndentsPage = () => {
   const [search, setSearch] = useState('');
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
+  const [recordsLoaded, setRecordsLoaded] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const [actionMenu, setActionMenu] = useState(null);
+  const [debitNotes, setDebitNotes] = useState([]);
 
   /* Notifications deep-link with /purchase-indents?indent=IND-xxxx */
   useEffect(() => {
@@ -149,12 +154,27 @@ const PurchaseIndentsPage = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, location.state]);
 
+  useEffect(() => {
+    let active = true;
+    Promise.all([listProcurementRecords('purchaseIndent'), listDebitNotes()])
+      .then(([, notes]) => {
+      if (!active) return;
+      setDebitNotes(notes);
+      setLoadError(''); setRecordsLoaded(true); setTick((value) => value + 1);
+    }).catch((error) => {
+      if (!active) return;
+      setLoadError(`Purchase Indents could not be loaded from PostgreSQL: ${error.message}`);
+      setRecordsLoaded(false);
+    });
+    return () => { active = false; };
+  }, []);
+
   const info = getCurrentUserInfo();
   const userDept = info.employee?.department || '';
   // Hidden for anyone working under the Production Department (admin login still sees everything).
   const isAdminAccount = info.auth?.roleKey === 'admin' || info.auth?.role === 'Administrator';
   const productionOnly = userDept === 'Production Department' && !isAdminAccount;
-  const indents = useMemo(() => getIndents(), [tick]);
+  const indents = useMemo(() => recordsLoaded ? getIndents() : [], [tick, recordsLoaded]);
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
     return indents.filter((i) => {
@@ -164,7 +184,7 @@ const PurchaseIndentsPage = () => {
     });
   }, [indents, statusFilter, search, tick]);
 
-  const indent = openIndent ? getIndent(openIndent) : null;
+  const indent = recordsLoaded && openIndent ? getIndent(openIndent) : null;
   const editable = indent ? canEditIndent(indent) : false;
 
   const flash = (type, text) => {
@@ -173,9 +193,9 @@ const PurchaseIndentsPage = () => {
     setTimeout(() => setMessage(null), 6000);
   };
 
-  const run = (fn) => {
+  const run = async (fn) => {
     try {
-      fn();
+      await fn();
       setTick((t) => t + 1);
     } catch (err) {
       flash('err', err.message);
@@ -196,13 +216,15 @@ const PurchaseIndentsPage = () => {
     }
   };
 
-  const reviewIndent = (indentNumber) => run(() => {
-    startPurchaseIndentReview(indentNumber);
-    flash('ok', `Indent ${indentNumber} is now under Purchase review.`);
-  });
+  const reviewIndent = async (indentNumber) => {
+    try {
+      await startPurchaseIndentReview(indentNumber);
+      flash('ok', `Indent ${indentNumber} is now under Purchase review.`);
+    } catch (err) { flash('err', err.message); }
+  };
 
   /** Send the indent (and its PO) to Quality for material inspection. */
-  const sendToQualityCheck = (indentNumber) => {
+  const sendToQualityCheck = async (indentNumber) => {
     try {
       const indent = getIndent(indentNumber);
       if (!indent) throw new Error(`Purchase Indent ${indentNumber} not found.`);
@@ -214,7 +236,7 @@ const PurchaseIndentsPage = () => {
         return;
       }
 
-      sendIndentToQualityCheck(indentNumber);
+      await sendIndentToQualityCheck(indentNumber);
       setTick((t) => t + 1);
       navigate('/quality-checks');
     } catch (err) {
@@ -224,8 +246,8 @@ const PurchaseIndentsPage = () => {
 
   /** Raise a repurchase indent for the rejected quantity of a rejection report. */
   const raiseRepurchase = (rejectionNumber) => {
-    run(() => {
-      const created = createRepurchaseIndent(rejectionNumber);
+    run(async () => {
+      const created = await createRepurchaseIndent(rejectionNumber);
       flash(
         'ok',
         `Repurchase indent ${created.indentNumber} raised for ${rejectionNumber} — it now appears under Purchase Order for conversion to PO.`
@@ -334,6 +356,11 @@ const PurchaseIndentsPage = () => {
         </div>
       </div>
 
+      <ProcurementMigrationReview kinds={['purchaseIndent', 'vendorEnquiry', 'vendorQuotation']} onImported={async (kind) => {
+        if (kind === 'purchaseIndent') { await listProcurementRecords(kind); setRecordsLoaded(true); setTick((value) => value + 1); }
+      }} />
+
+      {loadError && <div className="content-block" role="alert">{loadError}</div>}
       {message && (
         <div
           style={{
@@ -538,9 +565,9 @@ const IndentDetail = ({ indent, editable, userDept, productionOnly = false, mess
     ]);
 
   const save = () =>
-    run(() => {
+    run(async () => {
       const wasDraft = indent.status === INDENT_STATUS.DRAFT;
-      updatePurchaseIndent(indent.indentNumber, {
+      await updatePurchaseIndent(indent.indentNumber, {
         items: items.map((it) => ({ ...it, purchaseQty: num(it.purchaseQty) })),
         reason,
         storeRemarks,
@@ -548,7 +575,7 @@ const IndentDetail = ({ indent, editable, userDept, productionOnly = false, mess
       });
       // Saving a Draft indent hands it over to Purchase (appears under Purchase Order → indents awaiting conversion).
       if (wasDraft && canSubmitIndent(indent)) {
-        submitPurchaseIndent(indent.indentNumber, 'Submitted on save');
+        await submitPurchaseIndent(indent.indentNumber, 'Submitted on save');
         onMessage({
           type: 'ok',
           text: `Indent ${indent.indentNumber} saved and submitted — it now appears in the Purchase Department for conversion to PO.`
@@ -738,9 +765,9 @@ const IndentDetail = ({ indent, editable, userDept, productionOnly = false, mess
             <div className="form-actions" style={{ justifyContent: 'flex-start', marginTop: '14px' }}>
               <button
                 className="button-primary"
-                onClick={() => {
+                onClick={async () => {
                   try {
-                    postApprovedMaterialToInventory(qc.qcNumber);
+                    await postApprovedMaterialToInventory(qc.qcNumber);
                     onMessage({ type: 'ok', text: `Approved quantity of ${qc.qcNumber} added to inventory.` });
                   } catch (err) {
                     onMessage({ type: 'err', text: err.message });
@@ -861,7 +888,7 @@ const IndentDetail = ({ indent, editable, userDept, productionOnly = false, mess
 
       {(() => {
         const pendingReview = rejections.flatMap((r) =>
-          getDebitNotes().filter(
+          debitNotes.filter(
             (d) =>
               d.rejectionNumber === r.rejectionNumber &&
               [DEBIT_NOTE_STATUS.REQUESTED, DEBIT_NOTE_STATUS.PURCHASE_REVIEW, DEBIT_NOTE_STATUS.ADMIN_REVIEW].includes(d.status)
@@ -1121,8 +1148,8 @@ const IndentDetail = ({ indent, editable, userDept, productionOnly = false, mess
               className="button-primary"
               style={{ background: '#16a34a' }}
               onClick={() =>
-                run(() => {
-                  submitPurchaseIndent(indent.indentNumber, submitRemarks);
+                run(async () => {
+                  await submitPurchaseIndent(indent.indentNumber, submitRemarks);
                   onMessage({ type: 'ok', text: `Indent ${indent.indentNumber} submitted to Purchase.` });
                 })
               }
@@ -1145,8 +1172,8 @@ const IndentDetail = ({ indent, editable, userDept, productionOnly = false, mess
               onClick={() => {
                 const reasonText = window.prompt('Cancel indent reason?');
                 if (reasonText === null || !reasonText.trim()) return;
-                run(() => {
-                  cancelIndent(indent.indentNumber, reasonText);
+                run(async () => {
+                  await cancelIndent(indent.indentNumber, reasonText);
                   onMessage({ type: 'ok', text: `Indent ${indent.indentNumber} cancelled.` });
                 });
               }}

@@ -1,7 +1,12 @@
 import { authHeaders, isAdmin } from '../utils/auth.js';
 import { hasPermission } from '../utils/permissions.js';
 import { canAccessStateKey } from '../../shared/stateAccess.js';
-import { stableDepartmentId, stableRoleId, permissionAssignmentKey } from '../../shared/roleIdentity.js';
+import { stableDepartmentId, stableRoleId } from '../../shared/roleIdentity.js';
+import {
+    getDepartment, getRole, deleteDepartment as deleteDepartmentApi, deleteRole as deleteRoleApi,
+    updateDepartment, listDepartments, listRoles,
+    getRolePermissions as getCatalogRolePermissions, saveRolePermissions as saveCatalogRolePermissions
+} from './departmentRoleCatalogApi.js';
 
 const getApiBase = () => {
     if (typeof window !== 'undefined' && window.location) {
@@ -17,9 +22,82 @@ const API_BASE = String(getApiBase()).replace(/\/$/, '');
 const SYNC_INTERVAL_MS = 1500;
 const LOCAL_ONLY_KEYS = new Set([
     'erp_auth',
+    // Employee Master uses /api/employees; this browser value is preserved
+    // only as legacy import input and is never synchronized as live state.
+    'employees',
+    // Department, role, and scoped permission records use dedicated catalog APIs.
+    // Their previous browser values are preserved only as legacy import input.
+    'departmentCatalog',
+    'roleCatalog',
+    'rolePermissions',
     'currentQuotation',
+    // Quotation records are owned by /api/quotations; keep legacy browser
+    // history available for explicit migration preview without mirroring it.
+    'quotationHistory',
+    'quotationSequence',
+    // Customer PO transactions are owned by /api/customer-purchase-orders;
+    // keep the previous mirror copy only as a migration/reconciliation source.
+    'customerPOHistory',
+    'salesOrderHistory',
+    'deliveryChallanHistory',
+    'customerInvoiceHistory',
+    'customerInvoiceSequence',
+    'exportInvoiceHistory',
+    'exportInvoiceSequence',
     'currentVendorEnquiry',
     'currentVendorQuotation',
+    // Vendor Enquiries and Vendor Quotations are now owned by /api/procurement.
+    // Their browser copies are refreshed only from confirmed database results.
+    'vendorEnquiries',
+    'vendorQuotations',
+    // Purchase Indents are owned by the versioned /api/procurement routes.
+    // The old browser copy is migration input/cache only; never mirror it.
+    'purchaseIndents',
+    // Purchase Requests use their own versioned API; the old browser copy is
+    // retained only for the explicit Admin migration preview/import flow.
+    'storePurchaseRequests',
+    // Supplier Invoices are now persisted through /api/procurement; the browser
+    // list is only a server-confirmed display cache and legacy import source.
+    'supplierInvoiceHistory',
+    // Advances are now owned by /api/advances. Keep their old browser values
+    // only as preserved migration input, never as an authority or mirror.
+    'customerAdvanceHistory',
+    'supplierAdvanceHistory',
+    // Master records are owned by /api/masters. These browser values remain
+    // available for the explicit Admin reconciliation flow, never generic sync.
+    'companySettings',
+    'customerDirectory',
+    'customerMaster',
+    'vendorMaster',
+    'vendorMasterSequence',
+    'supplierMaster',
+    'machines',
+    // Production Requirements are owned by /api/production/requirements.
+    // Sequence aliases and legacy snapshots are not generic sync authorities.
+    'productionRequirements',
+    'productionRequirementSequence',
+    'productionRequirementsSequence',
+    'productionJobCards',
+    'jobCards',
+    // BOM records are owned by /api/bom. The browser key and legacy
+    // bomMasterList snapshot are not synchronization authorities.
+    'boms',
+    'bomMasterList',
+    // Material Receipts are owned by /api/material-receipts: the browser list
+    // is a server-confirmed display cache and migration source only, and the
+    // preserved legacy copy stays on the server for the Admin preview.
+    'materialReceipts',
+    // Purchase Orders are owned by /api/procurement/purchase-orders.
+    'supplierPOHistory',
+    // Debit Notes are owned by /api/debit-notes. Keep browser copies only for
+    // legacy reconciliation/export compatibility, never generic synchronization.
+    'debitNotes',
+    'debitNoteSequence',
+    // Enquiries now use the versioned /api/enquiries backend. localStorage is
+    // a client cache/migration source only and must never be mirrored back.
+    'projectRequests',
+    'projectRequestSequence',
+    'projectRequests_localConflictArchive',
     'erpDailySnapshots',
     'erpBackupAuditLogs',
     'erp_record_versions' // per-record sync bookkeeping (recordsSync.js)
@@ -28,7 +106,11 @@ const LOCAL_ONLY_KEYS = new Set([
 // Modules that graduated to per-record storage (/api/records): the generic
 // mirror must not touch them (one authority per module), but their local
 // changes still dispatch events so recordsSync.js can push them.
-const MODULE_OWNED_KEYS = new Set(['inventoryItems', 'stockTransactions', 'productionDispatchRequests']);
+const MODULE_OWNED_KEYS = new Set([
+    'inventoryItems', 'stockTransactions', 'productionDispatchRequests',
+    'materialArrivals', 'qualityChecks', 'rejectionReports',
+    'soMaterialAvailabilityChecks'
+]);
 
 const isSyncableKey = (key) => {
     const value = String(key || '');
@@ -49,22 +131,6 @@ const isEmptyValue = (value) =>
     Array.isArray(value) ?
         value.length === 0 :
         Boolean(value) && typeof value === 'object' && Object.keys(value).length === 0;
-
-/** True when this browser holds a newer, not-yet-confirmed copy of a key.
- *  Used so a late PostgreSQL hydration can never overwrite freshly entered
- *  company settings (including an uploaded logo) with an older server copy. */
-const hasUnsyncedLocalValue = (key) => {
-    if (pendingKeys.has(key)) return true;
-    if (!lastSnapshot) return false;
-    try {
-        const raw = localStorage.getItem(key);
-        if (raw === null) return false;
-        const baseline = JSON.parse(lastSnapshot);
-        return JSON.stringify(JSON.parse(raw)) !== JSON.stringify(baseline[key]);
-    } catch {
-        return false;
-    }
-};
 
 const localRecords = () => {
     const records = {};
@@ -158,14 +224,8 @@ let isHydrating = false;
 const hydrate = (records) => {
     isHydrating = true;
     try {
-        const localEmployees = (() => {
-            try { return JSON.parse(localStorage.getItem('employees') || '[]'); } catch { return []; }
-        })();
         Object.entries(records || {}).forEach(([key, value]) => {
             if (!isSyncableKey(key)) return;
-            // Never let a late hydration replace the newer company record this
-            // browser just saved (the logo is part of that single record).
-            if (key === 'companySettings' && hasUnsyncedLocalValue(key)) return;
             // Fail-safe: an empty server copy ([] / {}) must never wipe local
             // work — e.g. a fresh browser that seeded empty defaults, or a
             // device that never held this module's data. The local copy is
@@ -177,13 +237,6 @@ const hydrate = (records) => {
                 } catch {
                     /* local unparsable — adopt the server value */
                 }
-            }
-            if (key === 'employees' && Array.isArray(value)) {
-                const byId = new Map(localEmployees.map((employee) => [employee.id || employee.employeeId, employee]));
-                value = value.map((employee) => ({
-                    ...employee,
-                    password: employee.password || byId.get(employee.id || employee.employeeId)?.password || ''
-                }));
             }
             localStorage.setItem(key, JSON.stringify(value));
         });
@@ -314,6 +367,10 @@ export const flushERPState = async() => {
 
 export const saveERPRecord = async(key, value, options = {}) => {
     const withError = options.withError === true;
+    if (['departmentCatalog', 'roleCatalog', 'rolePermissions'].includes(key)) {
+        const error = 'Department and role catalogs must be changed through their record-specific API.';
+        return withError ? { ok: false, error } : false;
+    }
     if (!isSyncableKey(key)) return withError ? { ok: false, error: 'This record key cannot be synchronised.' } : false;
     pendingKeys.add(key);
     emitStatus();
@@ -348,36 +405,26 @@ export const deleteCustomerDirectoryRecord = async(customerId) => {
 
 export const deleteCustomRole = async(id) => {
     if (!id || !String(id).trim() || ['undefined', 'null'].includes(String(id).trim().toLowerCase())) return { success: false, error: 'Cannot delete role: a valid role ID is missing.' };
-    if (!id || ['undefined', 'null'].includes(String(id).trim().toLowerCase())) return { success: false, error: 'Cannot delete role: a valid role ID is missing.' };
     try {
-        const result = await request(`/state/roleCatalog/${encodeURIComponent(id)}`, { method: 'DELETE' });
-        try {
-            const catalog = JSON.parse(window.localStorage.getItem('roleCatalog') || '[]');
-            if (Array.isArray(catalog)) window.localStorage.setItem('roleCatalog', JSON.stringify(catalog.filter((item) => String(item.id) !== String(id))));
-        } catch { /* The server deletion is authoritative even if the local cache is malformed. */ }
-        pendingKeys.delete('roleCatalog');
-        setStatus({ connected: true, lastSyncAt: new Date().toISOString(), lastError: null });
+        const record = await getRole(id);
+        const reason = window.prompt(`Reason for deleting role "${record.name}":`)?.trim();
+        if (!reason) return { success: false, error: 'A deletion reason is required.' };
+        const result = await deleteRoleApi(id, record.version, reason);
         return { success: true, ...result };
     } catch (error) {
-        markUnsynced(error);
         return { success: false, error: error.message };
     }
 };
 
 export const deleteCustomDepartment = async(id) => {
     if (!id || !String(id).trim() || ['undefined', 'null'].includes(String(id).trim().toLowerCase())) return { success: false, error: 'Cannot delete department: a valid department ID is missing.' };
-    if (!id || ['undefined', 'null'].includes(String(id).trim().toLowerCase())) return { success: false, error: 'Cannot delete department: a valid department ID is missing.' };
     try {
-        const result = await request(`/state/departmentCatalog/${encodeURIComponent(id)}`, { method: 'DELETE' });
-        try {
-            const catalog = JSON.parse(window.localStorage.getItem('departmentCatalog') || '[]');
-            if (Array.isArray(catalog)) window.localStorage.setItem('departmentCatalog', JSON.stringify(catalog.filter((item) => String(item.id) !== String(id))));
-        } catch { /* The server deletion is authoritative even if the local cache is malformed. */ }
-        pendingKeys.delete('departmentCatalog');
-        setStatus({ connected: true, lastSyncAt: new Date().toISOString(), lastError: null });
+        const record = await getDepartment(id);
+        const reason = window.prompt(`Reason for deleting department "${record.name}":`)?.trim();
+        if (!reason) return { success: false, error: 'A deletion reason is required.' };
+        const result = await deleteDepartmentApi(id, record.version, reason);
         return { success: true, ...result };
     } catch (error) {
-        markUnsynced(error);
         return { success: false, error: error.message };
     }
 };
@@ -385,22 +432,20 @@ export const deleteCustomDepartment = async(id) => {
 export const deactivateCustomDepartment = async(id) => {
     if (!id || !String(id).trim() || ['undefined', 'null'].includes(String(id).trim().toLowerCase())) return { success: false, error: 'Cannot deactivate department: a valid department ID is missing.' };
     try {
-        const result = await request(`/state/departmentCatalog/${encodeURIComponent(id)}/deactivate`, { method: 'POST' });
-        try {
-            const catalog = JSON.parse(window.localStorage.getItem('departmentCatalog') || '[]');
-            if (Array.isArray(catalog)) window.localStorage.setItem('departmentCatalog', JSON.stringify(catalog.map((item) => String(item.id) === String(id) ? { ...item, active: false } : item)));
-        } catch { /* The server state is authoritative if the local cache is malformed. */ }
-        pendingKeys.delete('departmentCatalog');
-        setStatus({ connected: true, lastSyncAt: new Date().toISOString(), lastError: null });
+        const record = await getDepartment(id);
+        const reason = window.prompt(`Reason for deactivating department "${record.name}":`)?.trim();
+        if (!reason) return { success: false, error: 'A deactivation reason is required.' };
+        const result = await updateDepartment(id, { name: record.name, active: false }, record.version, reason);
         return { success: true, ...result };
     } catch (error) {
-        markUnsynced(error);
         return { success: false, error: error.message };
     }
 };
 
 /** Fetch the current shared value for a module from PostgreSQL. */
 export const getERPRecord = async(key) => {
+    if (key === 'departmentCatalog') return listDepartments({ includeDeleted: true });
+    if (key === 'roleCatalog') return listRoles({ includeDeleted: true });
     const payload = await request(`/state/${encodeURIComponent(key)}`);
     return payload.data;
 };
@@ -410,24 +455,13 @@ export const saveRolePermissions = async({ department, roleKey, permissions }) =
     if (!isAdmin()) return { success: false, error: 'Administrator access is required.' };
     try {
         const [departments, roles] = await Promise.all([
-            getERPRecord('departmentCatalog').catch(() => []),
-            getERPRecord('roleCatalog').catch(() => [])
+            getERPRecord('departmentCatalog'),
+            getERPRecord('roleCatalog')
         ]);
         const departmentId = stableDepartmentId(department, departments);
         const roleId = stableRoleId(department, roleKey, roles, departments);
-        const response = await request(`/state/rolePermissions/${encodeURIComponent(departmentId)}/${encodeURIComponent(roleId)}`, {
-            method: 'PUT', body: JSON.stringify({ permissions })
-        });
-        const auth = JSON.parse(localStorage.getItem('erp_auth') || 'null');
-        if (auth && Array.isArray(auth.assignments)) {
-            auth.assignments = auth.assignments.map((assignment) =>
-                permissionAssignmentKey(assignment.departmentId, assignment.roleId) === permissionAssignmentKey(departmentId, roleId)
-                    ? { ...assignment, permissions: response.permissions }
-                    : assignment
-            );
-            localStorage.setItem('erp_auth', JSON.stringify(auth));
-            window.dispatchEvent(new CustomEvent('erp-auth-permissions-updated'));
-        }
+        const current = await getCatalogRolePermissions(departmentId, roleId);
+        const response = await saveCatalogRolePermissions({ departmentId, roleId, permissions, version: current.version });
         setStatus({ connected: true, permissionDenied: false, lastSyncAt: new Date().toISOString(), lastError: null });
         return { success: true, ...response };
     } catch (error) {
@@ -435,31 +469,7 @@ export const saveRolePermissions = async({ department, roleKey, permissions }) =
     }
 };
 
-export const getRolePermissions = async(departmentId, roleId) => request(`/state/rolePermissions/${encodeURIComponent(departmentId)}/${encodeURIComponent(roleId)}`);
-
-/** Permanently remove an eligible employee by Employee ID from PostgreSQL. */
-export const deleteEmployee = async(employeeId) => {
-    const id = String(employeeId || '').trim();
-    if (!id || ['undefined', 'null'].includes(id.toLowerCase())) return { success: false, error: 'A valid Employee ID is required.' };
-    try {
-        const result = await request(`/state/employees/${encodeURIComponent(id)}`, { method: 'DELETE' });
-        const serverEmployees = await getERPRecord('employees');
-        const localEmployees = (() => { try { return JSON.parse(localStorage.getItem('employees') || '[]'); } catch { return []; } })();
-        const cachedByEmployeeId = new Map(localEmployees.map((employee) => [String(employee.employeeId || '').toLowerCase(), employee]));
-        const withCredentials = (Array.isArray(serverEmployees) ? serverEmployees : []).map((employee) => ({
-            ...employee,
-            password: employee.password || cachedByEmployeeId.get(String(employee.employeeId || '').toLowerCase())?.password || ''
-        }));
-        localStorage.setItem('employees', JSON.stringify(withCredentials));
-        markSynced(['employees']);
-        window.dispatchEvent(new CustomEvent('erp-state-hydrated'));
-        return { success: true, ...result };
-    } catch (error) {
-        // A protected-history conflict or validation error is a business response,
-        // not a connection failure. Leave the ERP sync indicator untouched.
-        return { success: false, error: error.message, status: error.status };
-    }
-};
+export const getRolePermissions = async(departmentId, roleId) => getCatalogRolePermissions(departmentId, roleId);
 
 export const deleteERPRecord = async(key) => {
     if (!isSyncableKey(key)) return false;
@@ -476,6 +486,26 @@ export const deleteERPRecord = async(key) => {
 };
 
 let storageHookInstalled = false;
+/** Set while the mirror is running; used by flushErpStateSync. */
+let activeTriggerSync = null;
+
+/**
+ * Push every pending local record to PostgreSQL immediately and resolve only
+ * once the server has answered. Screens use this so a success message is shown
+ * only after the server confirmed the transaction, never after a local write.
+ * Returns { ok, pending, error? } — `pending` is 0 when the server confirmed
+ * everything this browser still holds.
+ */
+export const flushErpStateSync = async() => {
+    if (!activeTriggerSync) return { ok: true, pending: 0 };
+    await activeTriggerSync();
+    // A first pass can be skipped while another push is in flight; run once
+    // more when changes are still queued so callers observe the final state.
+    if (pendingKeys.size > 0) await activeTriggerSync();
+    return pendingKeys.size === 0 ?
+        { ok: true, pending: 0 } :
+        { ok: false, pending: pendingKeys.size, error: status.lastError || 'The server has not confirmed this change yet.' };
+};
 
 export const installStorageHook = () => {
     if (storageHookInstalled || typeof window === 'undefined' || !window.localStorage) return;
@@ -511,7 +541,7 @@ export const installStorageHook = () => {
 export const startERPStateMirror = () => {
     installStorageHook();
     let debounceTimer = null;
-    const triggerSync = async() => {
+    const runSync = async() => {
         if (permissionBlocked) return;
         const records = localRecords();
         const snapshot = JSON.stringify(records);
@@ -531,6 +561,14 @@ export const startERPStateMirror = () => {
             inFlight = false;
         }
     };
+    /* Serialised so an immediate flush (below) can never race the debounced or
+     * interval-triggered push for the same key. */
+    let syncChain = Promise.resolve();
+    const triggerSync = () => {
+        syncChain = syncChain.then(runSync, runSync);
+        return syncChain;
+    };
+    activeTriggerSync = triggerSync;
 
     const intervalTimer = window.setInterval(triggerSync, SYNC_INTERVAL_MS);
 

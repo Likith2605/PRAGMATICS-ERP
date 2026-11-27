@@ -3,23 +3,35 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import { hasPermission, isAdmin } from '../utils/permissions.js';
 import MaterialNameSelector from '../components/MaterialNameSelector.jsx';
+import { computeRequirementLines, getRequirementIndents } from '../utils/productionRequirementService.js';
 import {
-  REQUIREMENT_STATUS,
-  getRequirements,
-  getRequirement,
-  computeRequirementLines,
-  getRequirementIndents,
-  createRequirement,
-  updateRequirement,
-  deleteRequirement,
-  submitRequirement,
-  cancelRequirement
-} from '../utils/productionRequirementService.js';
-import { getSalesOrders, getSalesOrderByRef } from '../utils/workflowService.js';
+  listRequirements,
+  getRequirement as fetchRequirement,
+  createRequirement as createRequirementApi,
+  updateRequirement as updateRequirementApi,
+  deleteRequirement as deleteRequirementApi,
+  requirementAction
+} from '../services/productionApi.js';
+import { getSalesOrder, listSalesOrders, normalizeSalesOrderItemLines } from '../services/salesOrderApi.js';
 import { getFullProjectData } from '../utils/projectTracker.js';
-import { getInventoryItems } from '../utils/storeService.js';
+import { listInventoryItems } from '../services/inventoryApi.js';
 import { saveWorkflowDocument, deleteWorkflowDocument, openWorkflowDocument } from '../utils/workflowFiles.js';
 import { getDrawingInfo, openDrawing, attachDrawing, hasEnquiryDrawing } from '../utils/drawingLookup.js';
+
+const REQUIREMENT_STATUS = Object.freeze({
+  DRAFT: 'Draft',
+  PENDING_REVIEW: 'Pending Review',
+  STOCK_AVAILABLE: 'Stock Available',
+  SHORTAGE_IDENTIFIED: 'Shortage Identified',
+  PURCHASE_REQUIRED: 'Purchase Required',
+  PURCHASE_COMPLETED: 'Purchase Completed',
+  MATERIAL_AVAILABLE: 'Material Available',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled'
+});
+
+const newCreateToken = () =>
+  globalThis.crypto?.randomUUID?.() || `pr-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
 
 const badgeClass = (status) =>
   `status-badge st-${String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
@@ -104,6 +116,12 @@ const ProductionItemRequirementsPage = () => {
   const [statusFilter, setStatusFilter] = useState('All');
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [inventoryRecords, setInventoryRecords] = useState([]);
+  const [salesOrders, setSalesOrders] = useState([]);
+  const [salesOrdersLoading, setSalesOrdersLoading] = useState(true);
+  const [salesOrderError, setSalesOrderError] = useState('');
 
   /* Defence in depth: the route Guard and the sidebar already hide this screen
      from a Production Employee — this keeps the mutations safe if either is
@@ -111,9 +129,48 @@ const ProductionItemRequirementsPage = () => {
   const canManage = hasPermission('production.requirement.manage');
   const denyManage = () => flash('err', 'Only the Production Manager (or an Admin) can manage Item Requirements.');
 
-  const salesOrders = useMemo(() => getSalesOrders(), [tick]);
-  const requirements = useMemo(() => getRequirements(), [tick]);
-  const inventoryRecords = useMemo(() => getInventoryItems(), [tick, mode]);
+  const [requirements, setRequirements] = useState([]);
+  useEffect(() => {
+    let active = true;
+    setSalesOrdersLoading(true);
+    setSalesOrderError('');
+    listSalesOrders()
+      .then((records) => { if (active) setSalesOrders(records); })
+      .catch((error) => {
+        if (!active) return;
+        setSalesOrders([]);
+        setSalesOrderError(`Sales Orders could not be loaded from PostgreSQL: ${error.message}`);
+      })
+      .finally(() => { if (active) setSalesOrdersLoading(false); });
+    return () => { active = false; };
+  }, [tick]);
+
+  useEffect(() => {
+    let active = true;
+    listInventoryItems()
+      .then((rows) => { if (active) setInventoryRecords(rows); })
+      .catch((err) => { if (active) setLoadError(err.message || 'Could not load Inventory for the requirement form.'); });
+    return () => { active = false; };
+  }, [tick, mode]);
+
+  const refresh = async () => {
+    setLoading(true);
+    setLoadError('');
+    try {
+      setRequirements(await listRequirements());
+      setTick((t) => t + 1);
+    } catch (err) {
+      setLoadError(err.message || 'Could not load item requirements from PostgreSQL.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void refresh(); }, []);
+
+  /** PostgreSQL-issued records are authoritative; this is a local lookup only. */
+  const findRequirement = (no) =>
+    requirements.find((r) => r.requirementNumber === no || r.id === no) || null;
 
   /* Drawings of the selected project: several → user picks one, one → read-only. */
   const drawingOptions = useMemo(() => {
@@ -137,31 +194,43 @@ const ProductionItemRequirementsPage = () => {
 
   /* Deep links: /production/item-requirements?req=PR-0001 (?edit=PR-0001 opens the form) or location state. */
   useEffect(() => {
-    const wanted =
-      searchParams.get('req') ||
-      location.state?.openRequirement ||
-      location.state?.requirementNumber;
-    if (wanted && getRequirement(wanted)) {
-      setViewNo(wanted);
-      setMode('view');
-      if (searchParams.get('req')) setSearchParams({}, { replace: true });
-    }
-    const wantedEdit = searchParams.get('edit');
-    if (wantedEdit && getRequirement(wantedEdit)) {
-      handleEditClick(wantedEdit);
-      setSearchParams({}, { replace: true });
-    }
-    if (location.state?.newRequirement) openCreate();
+    (async () => {
+      const wanted =
+        searchParams.get('req') ||
+        location.state?.openRequirement ||
+        location.state?.requirementNumber;
+      if (wanted) {
+        try {
+          const rec = await fetchRequirement(wanted);
+          if (rec) {
+            setViewNo(rec.requirementNumber);
+            setMode('view');
+            if (searchParams.get('req')) setSearchParams({}, { replace: true });
+          }
+        } catch { /* a missing deep-linked requirement simply falls back to the list */ }
+      }
+      const wantedEdit = searchParams.get('edit');
+      if (wantedEdit) {
+        try {
+          const rec = await fetchRequirement(wantedEdit);
+          if (rec) {
+            await refresh();
+            await handleEditClick(wantedEdit);
+            setSearchParams({}, { replace: true });
+          }
+        } catch { /* ignore invalid deep links */ }
+      }
+      if (location.state?.newRequirement) openCreate();
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const flash = (type, text) => {
     setMessage({ type, text });
-    setTick((t) => t + 1);
     setTimeout(() => setMessage(null), 6000);
   };
 
-  const requirement = mode === 'view' && viewNo ? getRequirement(viewNo) : null;
+  const requirement = mode === 'view' && viewNo ? findRequirement(viewNo) : null;
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -285,23 +354,65 @@ const ProductionItemRequirementsPage = () => {
     });
   };
 
-  const handleSOChange = (ref) => {
-    const so = ref ? getSalesOrderByRef(ref) : null;
-    const projectId = (so && so.payload?.soDetails?.projectId) || form.projectId;
-    setForm((f) => ({
-      ...f,
-      soNumber: ref,
-      projectId,
-      customer:
-        so?.payload?.customerDetails?.companyName ||
-        so?.payload?.customerDetails?.customerName ||
-        so?.company ||
-        f.customer,
-      requiredDate: f.requiredDate || so?.payload?.soDetails?.deliveryDate || '',
-      partName: f.partName || (so?.payload?.items?.[0]?.itemName || ''),
-      ...enquiryDrawingInfo(projectId)
-    }));
-    syncDrawingPdf(projectId, enquiryDrawingInfo(projectId).drawingNo);
+  const handleSOChange = async (ref) => {
+    setSalesOrderError('');
+    if (!ref) {
+      setForm((current) => ({ ...current, soNumber: '' }));
+      return;
+    }
+    try {
+      const so = await getSalesOrder(ref);
+      if (!so?.payload) {
+        throw new Error(`Sales Order ${ref} could not be retrieved from PostgreSQL.`);
+      }
+      const lines = normalizeSalesOrderItemLines(so);
+      if (lines.length === 0) {
+        throw new Error(`Sales Order ${ref} has no retrievable item lines in PostgreSQL.`);
+      }
+      const projectId = so.payload.soDetails?.projectId || form.projectId;
+      const drawingNo = lines.map((item) => String(item.drawingNo || '').trim()).find(Boolean) || '';
+      const orderQuantity = lines.reduce((total, item) => total + (Number(item.quantity) || 0), 0);
+      const itemInventoryByCode = new Map(
+        inventoryRecords.map((item) => [String(item.item_code || item.itemCode || '').trim().toLowerCase(), item])
+      );
+      const requirementItems = lines.map((line, index) => {
+        const code = String(line.itemCode || '').trim();
+        const inventory = code ? itemInventoryByCode.get(code.toLowerCase()) : null;
+        return {
+          lineId: String(line.lineId || '').trim() || `SO:${ref}:LINE:${line.lineNumber || index + 1}`,
+          itemId: String(inventory?.item_code || inventory?.itemCode || line.itemId || '').trim(),
+          itemName: String(line.itemName || '').trim(),
+          itemCode: code,
+          description: String(line.description || line.itemName || '').trim(),
+          specification: String(line.specification || '').trim(),
+          size: String(line.size || line.sizeDimensions || '').trim(),
+          purpose: String(line.purpose || '').trim(),
+          quantity: String(Number(line.quantity) || ''),
+          unit: String(line.unit || 'Nos').trim() || 'Nos',
+          requiredDate: String(so.payload.soDetails?.deliveryDate || '').trim(),
+          remarks: ''
+        };
+      });
+      setForm((current) => ({
+        ...current,
+        soNumber: ref,
+        projectId,
+        customer:
+          so.payload.customerDetails?.companyName ||
+          so.payload.customerDetails?.customerName ||
+          so.company ||
+          current.customer,
+        requiredDate: current.requiredDate || so.payload.soDetails?.deliveryDate || '',
+        partName: current.partName || requirementItems[0]?.itemName || '',
+        drawingNo: drawingNo || current.drawingNo,
+        qty: orderQuantity > 0 ? String(orderQuantity) : current.qty,
+        items: requirementItems
+      }));
+      syncDrawingPdf(projectId, drawingNo);
+    } catch (error) {
+      setForm((current) => ({ ...current, soNumber: '' }));
+      setSalesOrderError(`Sales Order could not be loaded from PostgreSQL: ${error.message}`);
+    }
   };
 
   /** Project ID typed → pull Drawing No & Qty from the enquiry automatically. */
@@ -338,7 +449,7 @@ const ProductionItemRequirementsPage = () => {
 
   /** Files uploaded while editing but never saved are removed from storage. */
   const discardUnsavedAttachments = () => {
-    const saved = editingNo ? getRequirement(editingNo) : null;
+    const saved = editingNo ? findRequirement(editingNo) : null;
     const savedIds = new Set((saved?.attachments || []).map((d) => d && d.id));
     (form.attachments || []).forEach((d) => {
       if (d && d.id && !savedIds.has(d.id)) deleteWorkflowDocument(d.id);
@@ -347,6 +458,7 @@ const ProductionItemRequirementsPage = () => {
 
   const validate = () => {
     if (!form.projectId.trim()) return 'Project ID is required.';
+    if (qty(form.qty) <= 0) return 'Total required quantity must be greater than zero.';
     if (!form.items.length) return 'Add at least one item.';
     for (let i = 0; i < form.items.length; i += 1) {
       const it = form.items[i];
@@ -402,7 +514,7 @@ const ProductionItemRequirementsPage = () => {
 
   const openEdit = (no) => {
     if (!canManage) return denyManage();
-    const rec = getRequirement(no);
+    const rec = findRequirement(no);
     if (!rec) return;
     setForm({
       projectId: rec.projectId || '',
@@ -430,7 +542,7 @@ const ProductionItemRequirementsPage = () => {
     setMessage(null);
   };
 
-  const handleSave = (thenSubmit = false) => {
+  const handleSave = async (thenSubmit = false) => {
     if (!canManage) return denyManage();
     const err = validate();
     if (err) {
@@ -438,26 +550,28 @@ const ProductionItemRequirementsPage = () => {
       return;
     }
     try {
-      const rec = editingNo
-        ? updateRequirement(editingNo, payload())
-        : createRequirement(payload());
-      if (thenSubmit) {
-        submitRequirement(rec.requirementNumber);
-        flash('ok', `Item Requirement ${rec.requirementNumber} submitted to Store.`);
+      let rec;
+      if (editingNo) {
+        const current = findRequirement(editingNo);
+        rec = (await updateRequirementApi(editingNo, Number(current?.version) || 1, payload())).record;
       } else {
-        flash('ok', `Item Requirement ${rec.requirementNumber} saved as draft.`);
+        rec = (await createRequirementApi(payload(), newCreateToken())).record;
       }
+      if (thenSubmit) {
+        await requirementAction(rec.requirementNumber, 'submit', Number(rec.version) || 1);
+      }
+      await refresh();
+      flash('ok', `Item Requirement ${rec.requirementNumber} ${thenSubmit ? 'submitted to Store' : 'saved as draft'}.`);
       setMode('list');
       setEditingNo(null);
-      setTick((t) => t + 1);
     } catch (e) {
-      flash('err', e.message);
+      flash('err', e.message || 'Could not save the item requirement.');
     }
   };
 
-  const handleSubmitOnly = () => {
+  const handleSubmitOnly = async () => {
     if (!editingNo) {
-      handleSave(true);
+      await handleSave(true);
       return;
     }
     try {
@@ -466,20 +580,22 @@ const ProductionItemRequirementsPage = () => {
         flash('err', err);
         return;
       }
-      updateRequirement(editingNo, payload());
-      submitRequirement(editingNo);
+      const current = findRequirement(editingNo);
+      const saved = (await updateRequirementApi(editingNo, Number(current?.version) || 1, payload())).record;
+      await requirementAction(editingNo, 'submit', Number(saved.version) || 1);
+      await refresh();
       flash('ok', `Item Requirement ${editingNo} submitted to Store.`);
       setMode('list');
       setEditingNo(null);
-      setTick((t) => t + 1);
     } catch (e) {
-      flash('err', e.message);
+      flash('err', e.message || 'Could not submit the item requirement.');
     }
   };
 
-  const handleDelete = (no) => {
+  const handleDelete = async (no) => {
     if (!canManage) return denyManage();
-    const rec = getRequirement(no);
+    if (!isAdmin()) return flash('err', 'Only an Admin can delete an Item Requirement.');
+    const rec = findRequirement(no);
     if (!rec) return;
     if (rec.status === REQUIREMENT_STATUS.COMPLETED) {
       flash('err', `${no} is Completed and cannot be deleted.`);
@@ -495,21 +611,27 @@ const ProductionItemRequirementsPage = () => {
       ? `Delete ${no}? This cannot be undone.`
       : `${no} is "${rec.status}".\n\nThe requirement will be cancelled and then deleted.\n\nContinue?`;
     if (!window.confirm(confirmMsg)) return;
+    const reason = window.prompt(`Reason for deleting ${no}:`)?.trim();
+    if (!reason) return;
     try {
-      if (!editable) cancelRequirement(no, 'Cancelled before deletion');
-      deleteRequirement(no);
+      let version = Number(rec.version) || 1;
+      if (!editable) {
+        const cancelled = await requirementAction(no, 'cancel', version, { reason: 'Cancelled before deletion' });
+        version = Number(cancelled.record.version) || version + 1;
+      }
+      await deleteRequirementApi(no, version, reason);
+      await refresh();
       flash('ok', `Item Requirement ${no} deleted.`);
       setMode('list');
-      setTick((t) => t + 1);
     } catch (e) {
-      flash('err', e.message);
-      setTick((t) => t + 1);
+      flash('err', e.message || 'Could not delete the item requirement.');
+      await refresh();
     }
   };
 
-  const handleEditClick = (no) => {
+  const handleEditClick = async (no) => {
     if (!canManage) return denyManage();
-    const rec = getRequirement(no);
+    const rec = findRequirement(no);
     if (!rec) return;
     if (isRequirementEditable(rec)) {
       openEdit(no);
@@ -524,36 +646,37 @@ const ProductionItemRequirementsPage = () => {
     );
     if (!ok) return;
     try {
-      cancelRequirement(no, 'Editing started - re-opened for revision');
-      updateRequirement(no, {});
+      await requirementAction(no, 'cancel', Number(rec.version) || 1, { reason: 'Editing started - re-opened for revision' });
+      await refresh();
       openEdit(no);
-      setTick((t) => t + 1);
     } catch (e) {
-      flash('err', e.message);
+      flash('err', e.message || 'Could not re-open the item requirement.');
     }
   };
 
-  const handleSubmit = (no) => {
+  const handleSubmit = async (no) => {
     try {
-      submitRequirement(no);
+      const rec = findRequirement(no);
+      await requirementAction(no, 'submit', Number(rec?.version) || 1);
+      await refresh();
       flash('ok', `Item Requirement ${no} submitted to Store.`);
       setMode('list');
-      setTick((t) => t + 1);
     } catch (e) {
-      flash('err', e.message);
+      flash('err', e.message || 'Could not submit the item requirement.');
     }
   };
 
-  const handleCancelRequirement = (no) => {
+  const handleCancelRequirement = async (no) => {
     if (!isAdmin()) return;
     const reason = window.prompt(`Reason for cancelling Item Requirement ${no}:`)?.trim();
     if (!reason) return;
     try {
-      cancelRequirement(no, reason);
+      const rec = findRequirement(no);
+      await requirementAction(no, 'cancel', Number(rec?.version) || 1, { reason });
+      await refresh();
       flash('ok', `Item Requirement ${no} cancelled.`);
-      setTick((t) => t + 1);
     } catch (e) {
-      flash('err', e.message);
+      flash('err', e.message || 'Could not cancel the item requirement.');
     }
   };
 
@@ -570,6 +693,13 @@ const ProductionItemRequirementsPage = () => {
     >
       {message.text}
     </div>
+  );
+
+  const statusBanner = (
+    <>
+      {loading && <div className="form-error" style={{ marginBottom: '12px' }}>Loading item requirements from PostgreSQL…</div>}
+      {loadError && <div className="form-error" style={{ marginBottom: '12px' }}>{loadError}</div>}
+    </>
   );
 
   /* --------------------------------- form view --------------------------------- */
@@ -591,6 +721,7 @@ const ProductionItemRequirementsPage = () => {
         </div>
 
         {messageBox}
+        {statusBanner}
 
         <div className="content-block">
           <div className="block-header">
@@ -609,14 +740,15 @@ const ProductionItemRequirementsPage = () => {
             </div>
             <div className="field-group">
               <label>Sales Order Ref</label>
-              <select value={form.soNumber} onChange={(e) => handleSOChange(e.target.value)}>
-                <option value="">— Select Sales Order —</option>
+              <select value={form.soNumber} onChange={(e) => void handleSOChange(e.target.value)} disabled={salesOrdersLoading}>
+                <option value="">{salesOrdersLoading ? 'Loading Sales Orders…' : '— Select Sales Order —'}</option>
                 {salesOrders.map((so) => (
                   <option key={so.reference} value={so.reference}>
                     {so.reference} — {so.company}
                   </option>
                 ))}
               </select>
+              {salesOrderError && <p className="form-error" role="alert">{salesOrderError}</p>}
             </div>
             <div className="field-group">
               <label>Customer</label>
@@ -744,6 +876,7 @@ const ProductionItemRequirementsPage = () => {
                     <td>
                       <MaterialNameSelector
                         value={it.itemName || ''}
+                        items={inventoryRecords}
                         onSelect={(item) => handleMaterialSelect(idx, item)}
                         onClear={() => handleMaterialClear(idx)}
                         showAvailability={false}
@@ -763,7 +896,7 @@ const ProductionItemRequirementsPage = () => {
                         className="action-select form-input"
                         value={it.unit}
                         disabled={Boolean(it.itemId)}
-                        title={it.itemId ? 'From Inventory Item Master' : ''}
+                        title={it.itemId ? 'From Inventory' : ''}
                         style={it.itemId ? READONLY_CELL : undefined}
                         onChange={(e) => setLine(idx, 'unit', e.target.value)}
                       >
@@ -782,7 +915,7 @@ const ProductionItemRequirementsPage = () => {
                         className="action-select form-input"
                         value={it.specification}
                         readOnly={specFromMaster}
-                        title={specFromMaster ? 'From Inventory Item Master' : ''}
+                        title={specFromMaster ? 'From Inventory' : ''}
                         style={specFromMaster ? READONLY_CELL : undefined}
                         placeholder="e.g. EN8"
                         onChange={(e) => setLine(idx, 'specification', e.target.value)}
@@ -885,6 +1018,7 @@ const ProductionItemRequirementsPage = () => {
         </div>
 
         {messageBox}
+        {statusBanner}
 
         <div className="content-block">
           <div className="block-header">
@@ -1100,6 +1234,7 @@ const ProductionItemRequirementsPage = () => {
       </div>
 
       {messageBox}
+      {statusBanner}
 
       <div className="content-block">
         <div className="block-header">

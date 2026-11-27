@@ -1,5 +1,18 @@
 import legacyPOData from '../constants/legacyPOData.json';
 import { enrichCustomerDetails } from './customerMaster.js';
+import { getCachedJobCards } from '../services/productionAuthorityCache.js';
+import { listSalesOrders } from '../services/salesOrderApi.js';
+import { listCustomerInvoices } from '../services/customerInvoiceApi.js';
+
+let authoritySalesOrders = [];
+let authorityCustomerInvoices = [];
+
+export const hydrateProjectAuthorityData = async () => {
+  const [salesOrders, invoices] = await Promise.all([listSalesOrders(), listCustomerInvoices()]);
+  authoritySalesOrders = Array.isArray(salesOrders) ? salesOrders : [];
+  authorityCustomerInvoices = Array.isArray(invoices) ? invoices : [];
+  return { salesOrders: authoritySalesOrders, customerInvoices: authorityCustomerInvoices };
+};
 
 /**
  * Centralized Project Lifecycle Tracker for the ERP.
@@ -117,7 +130,7 @@ export const getProjectNameForId = (projectId) => {
   if (!cleanId) return '';
 
   const projectRequests = getStoredList('projectRequests');
-  const salesOrders = getStoredList('salesOrderHistory');
+  const salesOrders = authoritySalesOrders;
 
   const pr = projectRequests.find((p) => p.projectId?.trim().toUpperCase() === cleanId);
   const so = salesOrders.find((it) => it.payload?.soDetails?.projectId?.trim().toUpperCase() === cleanId);
@@ -142,10 +155,10 @@ export const getAllProjectsSummary = () => {
   const projectRequests = getStoredList('projectRequests');
   const quotations = getStoredList('quotationHistory');
   const customerPOs = getStoredList('customerPOHistory');
-  const salesOrders = getStoredList('salesOrderHistory');
-  const jobCards = getStoredList('productionJobCards');
+  const salesOrders = authoritySalesOrders;
+  const jobCards = getCachedJobCards();
   const challans = getStoredList('deliveryChallanHistory');
-  const invoices = getStoredList('customerInvoiceHistory');
+  const invoices = authorityCustomerInvoices;
 
   const projectMap = new Map();
 
@@ -310,10 +323,10 @@ export const getFullProjectData = (projectId, sourceDocument = null) => {
   const projectRequests = getStoredList('projectRequests');
   const quotations = getStoredList('quotationHistory');
   const customerPOs = getStoredList('customerPOHistory');
-  const salesOrders = getStoredList('salesOrderHistory');
-  const jobCards = getStoredList('productionJobCards');
+  const salesOrders = authoritySalesOrders;
+  const jobCards = getCachedJobCards();
   const challans = getStoredList('deliveryChallanHistory');
-  const invoices = getStoredList('customerInvoiceHistory');
+  const invoices = authorityCustomerInvoices;
 
   // Match origin
   const pr = projectRequests.find((p) => p.projectId?.trim().toUpperCase() === cleanId);
@@ -342,7 +355,6 @@ export const getFullProjectData = (projectId, sourceDocument = null) => {
       itemName: it.itemName || '',
       drawingNo: it.drawingNo || '',
       drawingFileName: it.drawingFileName || '',
-      drawingDataUrl: it.drawingDataUrl || '',
       materialSpec: it.materialSpec || '',
       notes: it.notes || '',
       hsnSac: '8483',

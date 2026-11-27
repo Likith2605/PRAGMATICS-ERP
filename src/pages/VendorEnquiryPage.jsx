@@ -5,12 +5,7 @@ import { useCompanyBranding } from '../utils/companyBranding.js';
 import { isAdmin } from '../utils/auth.js';
 import { hasPermission } from '../utils/permissions.js';
 import {
-  getPurchaseRequests,
-  getAllVendorEnquiries,
   getAllVendorQuotations,
-  createVendorEnquiry,
-  updateVendorEnquiry,
-  deleteVendorEnquiry,
   dateOnly
 } from '../utils/storeService.js';
 import {
@@ -22,8 +17,10 @@ import VendorEnquiryTermsSection from '../components/VendorEnquiryTermsSection.j
 import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterMaterialRecords } from '../utils/historySearch.js';
 import { hasPendingEnquiryVendor } from '../utils/vendorQuotationVendor.js';
-import { getERPRecord } from '../services/erpStateSync.js';
 import { getIndentReferenceDetails } from '../utils/indentReferenceDetails.js';
+import { createProcurementRecord, deleteProcurementRecord, listProcurementRecords, reserveProcurementNumber, updateProcurementRecord } from '../services/procurementIntakeApi.js';
+import ProcurementMigrationReview from '../components/ProcurementMigrationReview.jsx';
+import { listPurchaseRequestsApi } from '../services/purchaseRequestApi.js';
 
 const STATUS_COLORS = {
   Draft: { bg: '#f1f5f9', color: '#475569' },
@@ -86,8 +83,11 @@ const VendorEnquiryPage = () => {
   // which starved React's route transition and froze navigation away from
   // this page (the + VQ click changed the URL but never re-rendered).
   useEffect(() => {
-    setApprovedPRs(getPurchaseRequests().filter((p) => p.status === 'Approved'));
-    setEnquiries(getAllVendorEnquiries());
+    let active = true;
+    Promise.all([listProcurementRecords('vendorEnquiry'), listProcurementRecords('purchaseIndent'), listProcurementRecords('vendorQuotation'), listPurchaseRequestsApi()])
+      .then(([records, , , purchaseRequests]) => { if (active) { setApprovedPRs(purchaseRequests.filter((p) => p.status === 'Approved')); setEnquiries(records); } })
+      .catch((error) => { if (active) alert(`Vendor Enquiries could not be loaded from PostgreSQL: ${error.message}`); });
+    return () => { active = false; };
   }, []);
 
   // Refresh from PostgreSQL when Purchase opens this page and when the tab
@@ -96,11 +96,19 @@ const VendorEnquiryPage = () => {
     let active = true;
     const refreshIndents = async () => {
       try {
-        const latest = await getERPRecord('purchaseIndents');
+        const latest = await listProcurementRecords('purchaseIndent');
         if (!active) return;
         if (Array.isArray(latest)) localStorage.setItem('purchaseIndents', JSON.stringify(latest));
-      } catch {
-        // Keep the last hydrated copy available during a temporary outage.
+      } catch (error) {
+        if (active) alert(`Purchase Indents could not be refreshed from PostgreSQL: ${error.message}`);
+        return;
+      }
+      if (!active) return;
+      try {
+        const purchaseRequests = await listPurchaseRequestsApi();
+        if (active) setApprovedPRs(purchaseRequests.filter((request) => request.status === 'Approved'));
+      } catch (error) {
+        if (active) alert(`Purchase Requests could not be refreshed from PostgreSQL: ${error.message}`);
       }
       if (!active) return;
       try {
@@ -187,31 +195,37 @@ const VendorEnquiryPage = () => {
     ? { ...v, [field]: val, ...(field === 'name' ? { vendorId: '' } : {}) }
     : v));
 
-  const handleCreate = () => {
+  const handleCreate = async () => {
     if (!selectedPR) return;
     const validVendors = vendors.filter((v) => v.name.trim());
     if (validVendors.length === 0) return alert('Add at least one vendor.');
     try {
       setBusy(true);
-      const record = createVendorEnquiry({
-        prNumber: selectedPR.prNumber,
+      const enquiryNumber = await reserveProcurementNumber('vendorEnquiry');
+      const info = JSON.parse(localStorage.getItem('erp_auth') || '{}');
+      const record = {
+        enquiryNumber,
+        prNumber: selectedPR.prNumber || '',
         indentNumber: selectedPR.indentNumber || '',
         soNumber: selectedPR.soNumber || '',
-        customer: selectedPR.customer || '',
-        requiredDate: selectedPR.requiredDate || '',
-        projectId: selectedPR.projectId,
-        projectName: selectedPR.projectName,
-        partName: selectedPR.partName,
-        jobCardNumber: selectedPR.jobCardNumber,
-        items: selectedPR.items,
-        vendors: validVendors,
-        remarks,
-        termsAndConditions,
-        validUntil
-      });
+        sourceType: selectedPR.indentNumber ? 'Purchase Indent' : 'Purchase Request',
+        projectId: selectedPR.projectId || '', projectName: selectedPR.projectName || '',
+        partName: selectedPR.partName || '', jobCardNumber: selectedPR.jobCardNumber || '',
+        customer: selectedPR.customer || '', requiredDate: selectedPR.requiredDate || '',
+        requestedBy: info.user?.name || info.username || 'Purchase', department: 'Purchase Department',
+        items: (selectedPR.items || []).filter((it) => Number(it.requiredQty || it.shortageQty) > 0).map((it) => ({
+          materialId: it.materialId || '', materialCode: it.materialCode || '', materialName: it.materialName || '',
+          description: it.description || '', unit: it.unit || 'Nos', requiredQty: Number(it.requiredQty) || 0,
+          shortageQty: Number(it.shortageQty) || 0, specification: it.specification || it.specifications || '', remarks: it.remarks || ''
+        })),
+        vendors: validVendors.map((v) => ({ vendorId: v.vendorId || v.vendorMasterId || v.seq || '', name: v.name || '', contact: v.contact || '', email: v.email || '', phone: v.phone || '', status: 'Invited' })),
+        remarks, termsAndConditions, validUntil, status: 'Draft', quotationNumbers: [], poNumber: '', createdAt: new Date().toISOString()
+      };
+      const saved = await createProcurementRecord('vendorEnquiry', record, `vendor-enquiry:${crypto.randomUUID()}`);
+      const confirmed = saved.record;
       setBusy(false);
-      alert(`Vendor Enquiry ${record.enquiryNumber} created. Send it to the vendors manually.`);
-      setEnquiries(getAllVendorEnquiries());
+      alert(`Vendor Enquiry ${confirmed.enquiryNumber} saved to PostgreSQL. Send it to the vendors manually.`);
+      setEnquiries(await listProcurementRecords('vendorEnquiry'));
       setView('list');
     } catch (err) {
       setBusy(false);
@@ -219,11 +233,12 @@ const VendorEnquiryPage = () => {
     }
   };
 
-  const handleSend = (enquiryNumber) => {
+  const handleSend = async (enquiryNumber) => {
     if (!window.confirm(`Mark ${enquiryNumber} as Sent to vendors?`)) return;
     try {
-      updateVendorEnquiry(enquiryNumber, { status: 'Sent', sentAt: new Date().toISOString() });
-      setEnquiries(getAllVendorEnquiries());
+      const record = enquiries.find((e) => e.enquiryNumber === enquiryNumber);
+      await updateProcurementRecord('vendorEnquiry', enquiryNumber, { status: 'Sent', sentAt: new Date().toISOString() }, record.version);
+      setEnquiries(await listProcurementRecords('vendorEnquiry'));
     } catch (err) {
       alert(err.message);
     }
@@ -243,21 +258,25 @@ const VendorEnquiryPage = () => {
     });
   };
 
-  const handleClose = (enquiryNumber) => {
+  const handleClose = async (enquiryNumber) => {
     if (!window.confirm(`Close enquiry ${enquiryNumber}? No more quotations will be accepted.`)) return;
     try {
-      updateVendorEnquiry(enquiryNumber, { status: 'Closed', closedAt: new Date().toISOString() });
-      setEnquiries(getAllVendorEnquiries());
+      const record = enquiries.find((e) => e.enquiryNumber === enquiryNumber);
+      await updateProcurementRecord('vendorEnquiry', enquiryNumber, { status: 'Closed', closedAt: new Date().toISOString() }, record.version);
+      setEnquiries(await listProcurementRecords('vendorEnquiry'));
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleDelete = (enquiryNumber) => {
+  const handleDelete = async (enquiryNumber) => {
     if (!window.confirm(`Delete enquiry ${enquiryNumber}?`)) return;
     try {
-      deleteVendorEnquiry(enquiryNumber);
-      setEnquiries(getAllVendorEnquiries());
+      const reason = window.prompt(`Reason for deleting ${enquiryNumber}?`);
+      if (!reason?.trim()) return;
+      const record = enquiries.find((e) => e.enquiryNumber === enquiryNumber);
+      await deleteProcurementRecord('vendorEnquiry', enquiryNumber, record.version, reason);
+      setEnquiries(await listProcurementRecords('vendorEnquiry'));
     } catch (err) {
       alert(err.message);
     }
@@ -278,7 +297,9 @@ const VendorEnquiryPage = () => {
         <div className="page-header">
           <div>
             <h1>Create Vendor Enquiry</h1>
-            <p className="page-description">Purchase Request: {selectedPR.prNumber}</p>
+            <p className="page-description">
+              {selectedPR.indentNumber ? `Purchase Indent: ${selectedPR.indentNumber}` : `Purchase Request: ${selectedPR.prNumber}`}
+            </p>
           </div>
           <div className="header-actions">
             <img className="page-header-logo" src={logoUrl} alt={`${brandName} logo`} />
@@ -291,12 +312,12 @@ const VendorEnquiryPage = () => {
         <div className="content-block">
           <div className="form-section">
             <div className="section-heading">
-              <h3>PR Reference Details</h3>
+              <h3>{selectedPR.indentNumber ? 'Purchase Indent Reference Details' : 'PR Reference Details'}</h3>
             </div>
             <div className="section-grid pr-reference-grid">
               <div className="field-group">
-                <label>PR Number</label>
-                <input type="text" className="action-select" value={selectedPR.prNumber} readOnly />
+                <label>{selectedPR.indentNumber ? 'Purchase Indent Number' : 'PR Number'}</label>
+                <input type="text" className="action-select" value={selectedPR.indentNumber || selectedPR.prNumber} readOnly />
               </div>
               <div className="field-group">
                 <label>Origin</label>
@@ -497,6 +518,10 @@ const VendorEnquiryPage = () => {
             </div>
 </div>
     </div>
+      <ProcurementMigrationReview kinds={['purchaseIndent', 'vendorEnquiry', 'vendorQuotation']} onImported={async (kind) => {
+        if (kind === 'vendorEnquiry') setEnquiries(await listProcurementRecords(kind));
+        if (kind === 'purchaseIndent') await listProcurementRecords(kind);
+      }} />
 
     {/* Shared by Store, awaiting Admin approval */}
     {awaitingApproval.length > 0 && (

@@ -8,6 +8,7 @@
  */
 import { numberToWords } from './numberToWords.js';
 import { isAdmin } from './auth.js';
+import { getCompanyProfile } from './companyBranding.js';
 
 const HISTORY_KEY = 'exportInvoiceHistory';
 const SEQ_KEY = 'exportInvoiceSequence';
@@ -114,12 +115,7 @@ export const validateExportInvoice = (data = {}) => {
 const buildPayload = (data) => {
   const { rows, amountUSD } = computeExportTotals(data.items || []);
   const profile = getExportProfile();
-  let company = {};
-  try {
-    company = JSON.parse(localStorage.getItem('companySettings') || '{}');
-  } catch {
-    company = {};
-  }
+  const company = getCompanyProfile();
   const bank = company.bankDetails || {};
 
   return {

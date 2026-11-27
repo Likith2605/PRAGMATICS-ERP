@@ -1,6 +1,13 @@
 import { hasPermission, getCurrentUserInfo } from './permissions.js';
 import { appendAuditLog, pushNotification } from './storeService.js';
-import { createRecordOnServer, getRecordsStatus, pullRecordsFromServer, updateRecordOnServer } from '../services/recordsSync.js';
+import {
+  listDispatchRequests,
+  getJobCard,
+  requestJobCardDispatch,
+  linkDispatchRequestToChallan as linkDispatchRequestApi,
+  markDispatchRequestDispatched as markDispatchRequestApi,
+  releaseDispatchRequestChallan as releaseDispatchRequestApi
+} from '../services/productionApi.js';
 
 export const PRODUCTION_DISPATCH_KEY = 'productionDispatchRequests';
 
@@ -28,20 +35,9 @@ const userInfo = () => {
 export const getProductionDispatchRequests = () => readRequests();
 
 export const refreshProductionDispatchRequests = async() => {
-  await pullRecordsFromServer();
-  const status = getRecordsStatus(PRODUCTION_DISPATCH_KEY);
-  if (status.connected === false && status.lastError)
-    throw new Error(`ERP backend sync failed: ${status.lastError}`);
-  return readRequests();
-};
-
-const getJobCard = (jobCardNumber) => {
-  try {
-    const rows = JSON.parse(localStorage.getItem('productionJobCards') || '[]');
-    return (Array.isArray(rows) ? rows : []).find((row) => String(row.jobCardNumber) === String(jobCardNumber)) || null;
-  } catch {
-    return null;
-  }
+  const records = await listDispatchRequests();
+  writeRequests(records);
+  return records;
 };
 
 const requestIdFor = (jobCardNumber) => `dispatch-${String(jobCardNumber).replace(/[^A-Za-z0-9._:-]/g, '-')}`;
@@ -49,56 +45,15 @@ const requestIdFor = (jobCardNumber) => `dispatch-${String(jobCardNumber).replac
 export const requestProductionDispatch = async(jobCardNumber) => {
   if (!hasPermission('job_card.dispatch_request'))
     throw new Error('Permission denied: only Production users can request Job Card dispatch.');
-  const jc = getJobCard(jobCardNumber);
-  if (!jc) throw new Error(`Job Card ${jobCardNumber} was not found.`);
-  if (String(jc.status || '').trim().toLowerCase() !== 'completed')
-    throw new Error(`Job Card ${jobCardNumber} is not completed.`);
-  const qc = jc.qualityControl?.finalQC || {};
-  if (String(qc.disposition || '').trim().toLowerCase() !== 'pass')
-    throw new Error(`Job Card ${jobCardNumber} final QC must PASS before dispatch.`);
-  const orderQty = Number(jc.orderQuantity) || 0;
-  const acceptedQty = Number(qc.acceptedQty);
-  const eligibleQuantity = Math.min(orderQty, Number.isFinite(acceptedQty) ? acceptedQty : 0);
-  if (eligibleQuantity <= 0)
-    throw new Error(`Job Card ${jobCardNumber} has no QC-approved production quantity eligible for dispatch.`);
-
-  const projectId = cleanText(jc.projectId);
-  const salesOrderNo = cleanText(jc.salesOrderRef);
-  const customerName = cleanText(jc.customerName || jc.customer);
-  if (!projectId || !salesOrderNo || !customerName)
-    throw new Error('The Job Card must have a Project ID, Sales Order and Customer before dispatch can be requested.');
-
-  // Pull the authoritative shared record before checking, then rely on the
-  // database's unique (storage_key, record_id) key for the cross-device guard.
-  await pullRecordsFromServer();
-  const id = requestIdFor(jc.jobCardNumber);
-  if (readRequests().some((request) => String(request.id) === id))
-    throw new Error(`A dispatch request already exists for Job Card ${jc.jobCardNumber}.`);
-
-  const user = userInfo();
-  const requestedAt = dateTime();
-  const request = {
-    id,
-    jobCardNumber: cleanText(jc.jobCardNumber),
-    projectId,
-    salesOrderNo,
-    customerName,
-    partName: cleanText(jc.partName),
-    drawingNumber: cleanText(jc.drawingNumber),
-    productionQuantity: eligibleQuantity,
-    eligibleQuantity,
-    qcStatus: 'PASS',
-    status: 'Pending',
-    dispatchRequestedBy: user.name,
-    dispatchRequestedByEmployeeId: user.employeeId,
-    dispatchRequestedByDepartment: user.department,
-    requestedAt,
-    createdAt: requestedAt,
-    audit: [{ action: 'Dispatch request created', user: user.name, employeeId: user.employeeId, at: requestedAt }]
-  };
-  await createRecordOnServer(PRODUCTION_DISPATCH_KEY, request);
-  // Refresh merges the committed server row into this device's local copy.
-  if (!readRequests().some((row) => String(row.id) === id)) writeRequests([request, ...readRequests()]);
+  const jc = await getJobCard(jobCardNumber);
+  const result = await requestJobCardDispatch(jobCardNumber, Number(jc.version) || 1);
+  if (result.duplicate) throw new Error(`A dispatch request already exists for Job Card ${jobCardNumber}.`);
+  const request = result.request || result.record;
+  if (!request) throw new Error('PostgreSQL did not return the created dispatch request.');
+  const eligibleQuantity = Number(request.eligibleQuantity || request.productionQuantity || 0);
+  const projectId = cleanText(request.projectId);
+  const salesOrderNo = cleanText(request.salesOrderNo);
+  writeRequests([request, ...readRequests().filter((row) => String(row.id) !== String(request.id))]);
   appendAuditLog({ action: 'PRODUCTION DISPATCH REQUESTED', reference: jc.jobCardNumber, details: `${eligibleQuantity} ${jc.partName || 'unit(s)'} | ${salesOrderNo} | ${projectId}` });
   pushNotification({
     title: 'Production dispatch ready',
@@ -114,22 +69,10 @@ export const requestProductionDispatch = async(jobCardNumber) => {
 export const linkDispatchRequestToChallan = async({ requestId, challanNumber, quantity }) => {
   if (!hasPermission('delivery.create'))
     throw new Error('Permission denied: only Sales users can create a Delivery Challan from a dispatch request.');
-  const qty = Number(quantity);
-  const updated = await updateRecordOnServer(PRODUCTION_DISPATCH_KEY, requestId, (current) => {
-    if (current.status !== 'Pending' || current.challanNumber)
-      throw new Error(`Dispatch request ${current.jobCardNumber} already has a Delivery Challan.`);
-    if (!Number.isFinite(qty) || qty <= 0 || qty > Number(current.eligibleQuantity))
-      throw new Error(`Dispatch quantity must be greater than zero and no more than ${current.eligibleQuantity}.`);
-    const user = userInfo();
-    const at = dateTime();
-    return {
-      ...current,
-      status: 'Challan Created',
-      challanNumber: cleanText(challanNumber),
-      challanQuantity: qty,
-      audit: [...(current.audit || []), { action: 'Delivery Challan created', user: user.name, employeeId: user.employeeId, at, reference: challanNumber, quantity: qty }]
-    };
-  });
+  const current = readRequests().find((row) => String(row.id) === String(requestId));
+  if (!current) throw new Error('Dispatch request not found in the latest PostgreSQL data.');
+  const updated = (await linkDispatchRequestApi(requestId, Number(current.version) || 1, cleanText(challanNumber), Number(quantity))).record;
+  writeRequests([updated, ...readRequests().filter((row) => String(row.id) !== String(requestId))]);
   appendAuditLog({ action: 'DELIVERY CHALLAN CREATED FROM DISPATCH REQUEST', reference: challanNumber, details: `${updated.jobCardNumber} | ${quantity} unit(s)` });
   return updated;
 };
@@ -137,19 +80,10 @@ export const linkDispatchRequestToChallan = async({ requestId, challanNumber, qu
 export const markDispatchRequestDispatched = async({ requestId, challanNumber }) => {
   if (!hasPermission('delivery.create'))
     throw new Error('Permission denied: only Sales users can confirm dispatch.');
-  const updated = await updateRecordOnServer(PRODUCTION_DISPATCH_KEY, requestId, (current) => {
-    if (current.status !== 'Challan Created' || String(current.challanNumber) !== String(challanNumber))
-      throw new Error('This dispatch request does not have a matching pending Delivery Challan.');
-    const user = userInfo();
-    const at = dateTime();
-    return {
-      ...current,
-      status: 'Dispatched',
-      dispatchedAt: at,
-      dispatchedBy: user.name,
-      audit: [...(current.audit || []), { action: 'Dispatch confirmed', user: user.name, employeeId: user.employeeId, at, reference: challanNumber }]
-    };
-  });
+  const current = readRequests().find((row) => String(row.id) === String(requestId));
+  if (!current) throw new Error('Dispatch request not found in the latest PostgreSQL data.');
+  const updated = (await markDispatchRequestApi(requestId, Number(current.version) || 1, cleanText(challanNumber))).record;
+  writeRequests([updated, ...readRequests().filter((row) => String(row.id) !== String(requestId))]);
   appendAuditLog({ action: 'PRODUCTION DISPATCH CONFIRMED', reference: updated.jobCardNumber, details: `Dispatched under ${challanNumber}` });
   return updated;
 };
@@ -157,12 +91,9 @@ export const markDispatchRequestDispatched = async({ requestId, challanNumber })
 export const releaseDispatchRequestChallan = async({ requestId, challanNumber }) => {
   if (!hasPermission('delivery.create'))
     throw new Error('Permission denied: only Sales users can manage a Delivery Challan from a dispatch request.');
-  return updateRecordOnServer(PRODUCTION_DISPATCH_KEY, requestId, (current) => {
-    if (current.status !== 'Challan Created' || String(current.challanNumber) !== String(challanNumber))
-      throw new Error('The dispatch request can no longer be released for this challan.');
-    const user = userInfo();
-    const at = dateTime();
-    const { challanNumber: _challanNumber, challanQuantity: _challanQuantity, ...rest } = current;
-    return { ...rest, status: 'Pending', audit: [...(current.audit || []), { action: 'Challan creation rolled back', user: user.name, employeeId: user.employeeId, at, reference: challanNumber }] };
-  });
+  const current = readRequests().find((row) => String(row.id) === String(requestId));
+  if (!current) throw new Error('Dispatch request not found in the latest PostgreSQL data.');
+  const updated = (await releaseDispatchRequestApi(requestId, Number(current.version) || 1, cleanText(challanNumber))).record;
+  writeRequests([updated, ...readRequests().filter((row) => String(row.id) !== String(requestId))]);
+  return updated;
 };

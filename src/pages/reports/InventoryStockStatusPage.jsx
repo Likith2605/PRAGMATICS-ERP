@@ -1,6 +1,9 @@
 import React, { useMemo } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getInventoryItems, getReorderList } from '../../utils/storeService.js';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { listInventoryItems } from '../../services/inventoryApi.js';
+import { normalizeInventoryItem } from '../../utils/reportApiData.js';
 import { formatQuantityByUnit } from '../../utils/reportFilters.js';
 
 /**
@@ -12,13 +15,24 @@ import { formatQuantityByUnit } from '../../utils/reportFilters.js';
  * calculation, only presentation and filters.
  */
 
+const loadInventoryItems = async () => (await listInventoryItems()).map(normalizeInventoryItem);
+
 const InventoryStockStatusPage = () => {
+  const { data: inventoryItems, loading, error } = useAuthoritativeData(loadInventoryItems);
   const { rows, categories } = useMemo(() => {
     const reorderMap = {};
-    getReorderList().forEach((r) => {
-      if (r?.item?.itemCode) reorderMap[r.item.itemCode] = r;
+    inventoryItems.forEach((item) => {
+      const current = Number(item.currentQty) || 0;
+      const reorderLevel = Number(item.reorderLevel) > 0 ? Number(item.reorderLevel) : Number(item.minReorderLevel) || 0;
+      const shortfall = Math.max(0, reorderLevel - current);
+      if (current <= reorderLevel) reorderMap[item.itemCode] = {
+        reorderLevel,
+        requiredQty: shortfall,
+        suggestedPurchaseQty: Math.max(0, reorderLevel * 2 - current),
+        status: current <= 0 ? 'OUT OF STOCK' : 'LOW STOCK'
+      };
     });
-    const list = getInventoryItems().map((it) => {
+    const list = inventoryItems.map((it) => {
       const r = reorderMap[it.itemCode];
       const current = Number(it.currentQty) || 0;
       const reserved = Number(it.reservedQty) || 0;
@@ -37,8 +51,9 @@ const InventoryStockStatusPage = () => {
     });
     const cats = [...new Set(list.map((r) => r.category))].sort();
     return { rows: list, categories: cats };
-  }, []);
+  }, [inventoryItems]);
 
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>
       <ReportRegister

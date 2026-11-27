@@ -1,48 +1,438 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { hasPermission } from '../utils/permissions.js';
+import { hasPermission, getCurrentUserInfo } from '../utils/permissions.js';
 import { isAdmin } from '../utils/auth.js';
 import {
   STATUS,
   SOURCE_TYPE,
   SOURCE_TYPE_LABEL,
-  decorateMR,
-  getInventoryItems,
-  getInventoryBatches,
-  getMaterialRequests,
-  getMaterialShortages,
-  issueMaterial,
-  markPendingStore,
-  rejectMaterialRequest,
-  closeMaterialRequest,
-  createPurchaseRequestForShortage,
-  approvePurchaseRequest,
-  rejectPurchaseRequest,
-  updateMaterialRequest,
-  deleteMaterialRequest,
-  isMRStatusEditable,
   resolveSourceType,
-  getExpiryWatchList,
+  isMRStatusEditable,
+  getExpiryStatus,
+  pushNotification,
   todayStr,
-  nowTimeStr
+  nowTimeStr,
+  nowDateTimeStr
 } from '../utils/storeService.js';
+import { INDENT_STATUS } from '../utils/workflowService.js';
 import {
   ACK_STATUS,
   ACK_FILTERS,
   ackStatusForLines,
-  computeAckLines,
   getAcknowledgement,
-  getAckQueue,
   matchesAckFilter,
-  submitAcknowledgement,
-  linkPurchaseIndent,
-  findIndentForMR,
-  getLinkableIndents,
   lineStatusFor
 } from '../utils/materialAckService.js';
+import {
+  getMaterialRequests as getMaterialRequestsApi,
+  getStoreIssues as getStoreIssuesApi,
+  getMaterialReturns as getMaterialReturnsApi,
+  updateMaterialRequest as updateMaterialRequestApi,
+  rejectMaterialRequest as rejectMaterialRequestApi,
+  markRequestPendingStore as markRequestPendingStoreApi,
+  closeMaterialRequest as closeMaterialRequestApi,
+  issueMaterial as issueMaterialApi
+} from '../services/storeApi.js';
+import {
+  listInventoryItems,
+  listStockLedger,
+  listInventoryLots
+} from '../services/inventoryApi.js';
+import {
+  listProcurementRecords,
+  reserveProcurementNumber,
+  createProcurementRecord
+} from '../services/procurementIntakeApi.js';
+import {
+  listPurchaseRequestsApi,
+  createPurchaseRequestApi,
+  approvePurchaseRequestApi,
+  rejectPurchaseRequestApi
+} from '../services/purchaseRequestApi.js';
 import NotificationsPanel from '../components/NotificationsPanel.jsx';
 import StoreAuditLogView from '../components/StoreAuditLogView.jsx';
 import EmployeeSearchSelect from '../components/EmployeeSearchSelect.jsx';
+import PurchaseRequestMigrationReview from '../components/PurchaseRequestMigrationReview.jsx';
+
+/* ---------------------------------------------------------------------------
+   PostgreSQL row adapters + page-local calculations.
+
+   Material Requests, Store Issues, Returns, inventory items and stock ledger
+   rows come from the authenticated APIs. The legacy storeService helpers are
+   deliberately not used for data here: they read localStorage. Only pure
+   helpers (status constants, date/expiry helpers, notification cache) remain.
+--------------------------------------------------------------------------- */
+const num = (value) => Number(value) || 0;
+const MR_ALLOWED_EDIT = new Set([STATUS.CANCELLED, STATUS.REJECTED, STATUS.CLOSED]);
+const ACK_ELIGIBLE = new Set([STATUS.SUBMITTED, STATUS.APPROVED, STATUS.PENDING, STATUS.PARTIAL, STATUS.FULL]);
+
+const mapRequestRow = (row = {}) => {
+  const payload = row.payload || {};
+  const items = (Array.isArray(row.items) ? row.items : []).map((item = {}) => {
+    const itemPayload = item.payload || {};
+    return {
+      ...itemPayload,
+      ...item,
+      materialId: item.materialId || item.material_id || itemPayload.materialId || '',
+      materialName: item.materialName || item.material_name || itemPayload.materialName || '',
+      requiredQty: num(item.requiredQty ?? item.required_qty ?? itemPayload.requiredQty),
+      issuedQty: num(item.issuedQty ?? item.issued_qty ?? 0),
+      balanceQty: num(item.balanceQty ?? item.balance_qty ?? 0),
+      unit: item.unit || itemPayload.unit || 'Nos',
+      sourceType: resolveSourceType({ ...itemPayload, ...item })
+    };
+  });
+  return {
+    ...payload,
+    ...row,
+    mrNumber: row.mrNumber || row.mr_number || payload.mrNumber || '',
+    requestDate: row.requestDate || row.date || row.mrDate || row.mr_date || '',
+    productionDepartment: row.productionDepartment || row.department || payload.productionDepartment || '',
+    requestedBy: row.requestedBy || row.requested_by || payload.requestedBy || '',
+    jobCardNumber: row.jobCardNumber || row.job_card_number || payload.jobCardNumber || '',
+    salesOrderRef: row.salesOrderRef || row.sales_order_ref || payload.salesOrderRef || '',
+    projectId: row.projectId || row.project_id || payload.projectId || '',
+    projectName: row.projectName || row.project_name || payload.projectName || '',
+    status: row.status || STATUS.DRAFT,
+    recordVersion: num(row.recordVersion ?? row.version) || 1,
+    acknowledgement: row.acknowledgement || payload.acknowledgement || null,
+    items
+  };
+};
+
+const mapInventoryRow = (row = {}) => {
+  const payload = row.payload || {};
+  return {
+    ...payload,
+    ...row,
+    id: row.item_code || row.id || payload.itemCode || '',
+    itemCode: row.item_code || payload.itemCode || row.id || '',
+    itemName: row.material_name || payload.itemName || row.item_code || '',
+    itemDesc: payload.itemDesc || payload.description || '',
+    grade: payload.grade || '',
+    spec: payload.spec || '',
+    sizeDimensions: payload.sizeDimensions || '',
+    unit: row.unit || payload.unit || 'Nos',
+    currentQty: num(row.current_qty ?? payload.currentQty),
+    reservedQty: num(payload.reservedQty),
+    minReorderLevel: num(row.reorder_level ?? payload.minReorderLevel),
+    shelfLifeManaged: Boolean(row.shelf_life_managed ?? payload.shelfLifeManaged),
+    recordVersion: num(row.version)
+  };
+};
+
+const mapIssueRow = (row = {}) => {
+  const payload = row.payload || {};
+  return {
+    ...payload,
+    ...row,
+    issueNumber: row.issueNumber || row.issue_number || payload.issueNumber || '',
+    mrNumber: row.mrNumber || row.mr_number || payload.mrNumber || '',
+    items: (Array.isArray(row.items) ? row.items : []).map((item = {}) => ({
+      ...(item.payload || {}),
+      ...item,
+      materialId: item.materialId || item.material_id || item.payload?.materialId || '',
+      currentIssueQty: num(item.currentIssueQty ?? item.quantity ?? item.payload?.currentIssueQty)
+    }))
+  };
+};
+
+const mapReturnRow = (row = {}) => {
+  const payload = row.payload || {};
+  return {
+    ...payload,
+    ...row,
+    returnNumber: row.returnNumber || row.return_number || payload.returnNumber || '',
+    mrNumber: row.mrNumber || row.mr_number || payload.mrNumber || '',
+    items: (Array.isArray(row.items) ? row.items : []).map((item = {}) => ({
+      ...(item.payload || {}),
+      ...item,
+      materialId: item.materialId || item.material_id || item.payload?.materialId || '',
+      quantityReturned: num(item.quantityReturned ?? item.quantity ?? item.payload?.quantityReturned)
+    }))
+  };
+};
+
+const mapLedgerRow = (row = {}) => {
+  const payload = row.payload || {};
+  const isOutbound = ['OUT', 'ISSUE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT'].includes(String(row.movement_type || '').toUpperCase());
+  return {
+    ...payload,
+    ...row,
+    id: row.id || payload.id || '',
+    date: String(row.entry_date || '').slice(0, 10) || payload.date || '',
+    itemCode: row.item_code || payload.itemCode || '',
+    itemName: payload.itemName || row.material_name || row.item_code || '',
+    unit: row.unit || payload.unit || 'Nos',
+    type: isOutbound ? 'OUT' : 'IN',
+    quantity: num(row.quantity),
+    balanceAfter: num(row.balance_after),
+    reason: row.reason || payload.reason || '',
+    reference: payload.reference || row.source_doc_ref || '-'
+  };
+};
+
+const mapLotRow = (row = {}) => {
+  const payload = row.payload || {};
+  return {
+    ...payload,
+    ...row,
+    id: row.id || payload.id || '',
+    itemCode: row.item_code || payload.itemCode || '',
+    batchNumber: row.batch_number || payload.batchNumber || '',
+    supplierBatchNumber: payload.supplierBatchNumber || row.batch_number || '',
+    internalBatchId: row.id || payload.internalBatchId || '',
+    availableQty: num(row.available_qty ?? payload.availableQty),
+    expiryDate: row.expiry_date ? String(row.expiry_date).slice(0, 10) : payload.expiryDate || '',
+    lotNumber: row.lot_number || payload.lotNumber || ''
+  };
+};
+
+const totalsFor = (mrNumber, issues, returns) => {
+  const issued = {};
+  const returned = {};
+  issues.filter((i) => i.mrNumber === mrNumber).forEach((issue) => {
+    (issue.items || []).forEach((it) => { issued[it.materialId] = (issued[it.materialId] || 0) + num(it.currentIssueQty); });
+  });
+  returns.filter((r) => r.mrNumber === mrNumber).forEach((ret) => {
+    (ret.items || []).forEach((it) => { returned[it.materialId] = (returned[it.materialId] || 0) + num(it.quantityReturned); });
+  });
+  return { issued, returned };
+};
+
+const mrLineStatus = (required, issued) => {
+  const rq = num(required);
+  const isd = num(issued);
+  if (rq <= 0) return 'Pending';
+  if (isd >= rq) return 'Issued';
+  if (isd > 0) return 'Partially Issued';
+  return 'Pending';
+};
+
+const decorateRequest = (mr, ctx) => {
+  const totals = totalsFor(mr.mrNumber, ctx.issues, ctx.returns);
+  if (!MR_ALLOWED_EDIT.has(mr.status)) {
+    const totalRequired = (mr.items || []).reduce((a, it) => a + num(it.requiredQty), 0);
+    const totalIssued = (mr.items || []).reduce((a, it) => a + (totals.issued[it.materialId] || 0), 0);
+    if (totalRequired > 0 && totalIssued >= totalRequired) mr = { ...mr, status: STATUS.FULL };
+    else if (totalIssued > 0) mr = { ...mr, status: STATUS.PARTIAL };
+  }
+  const items = (mr.items || []).map((it) => {
+    const issued = totals.issued[it.materialId] || 0;
+    const invItem = ctx.inventory.find((i) => i.itemCode === it.materialId);
+    return {
+      ...it,
+      issuedQty: issued,
+      returnedQty: totals.returned[it.materialId] || 0,
+      balanceQty: Math.max(0, num(it.requiredQty) - issued),
+      lineStatus: mrLineStatus(it.requiredQty, issued),
+      unit: it.unit || invItem?.unit || 'Nos'
+    };
+  });
+  return { ...mr, items };
+};
+
+const shortagesFor = (mr, ctx) => {
+  const totals = totalsFor(mr.mrNumber, ctx.issues, ctx.returns);
+  return (mr.items || []).map((it) => {
+    const issued = totals.issued[it.materialId] || 0;
+    const required = num(it.requiredQty);
+    const balance = Math.max(0, required - issued);
+    const invItem = ctx.inventory.find((i) => i.itemCode === it.materialId);
+    const available = invItem ? num(invItem.currentQty) : 0;
+    const shortage = Math.max(0, balance - available);
+    return {
+      materialId: it.materialId,
+      materialName: it.materialName,
+      unit: it.unit || invItem?.unit || 'Nos',
+      required,
+      issued,
+      balance,
+      available,
+      shortage,
+      hasShortage: shortage > 0,
+      canIssuePartially: balance > 0 && available > 0
+    };
+  });
+};
+
+const scopeQtyMaps = ({ salesOrderRef = '', jobCardNumber = '', excludeMrNumber = '' } = {}, ctx) => {
+  const so = String(salesOrderRef || '').trim();
+  const jc = String(jobCardNumber || '').trim();
+  if (!so && !jc) return { requested: {}, issued: {} };
+  const inScope = ctx.requests.filter((m) =>
+    m &&
+    String(m.mrNumber || '') !== String(excludeMrNumber || '') &&
+    ![STATUS.CANCELLED, STATUS.REJECTED].includes(m.status) &&
+    ((jc && String(m.jobCardNumber || '') === jc) || (so && String(m.salesOrderRef || '') === so))
+  );
+  const requested = {};
+  inScope.forEach((m) => (m.items || []).forEach((it) => {
+    const key = String(it.materialId || '');
+    requested[key] = (requested[key] || 0) + num(it.requiredQty);
+  }));
+  const scopeNos = new Set(inScope.map((m) => m.mrNumber));
+  const issued = {};
+  ctx.issues.filter((i) => scopeNos.has(i.mrNumber)).forEach((i) => (i.items || []).forEach((it) => {
+    const key = String(it.materialId || '');
+    issued[key] = (issued[key] || 0) + num(it.currentIssueQty);
+  }));
+  return { requested, issued };
+};
+
+const assertItemsValid = (items, { inv, salesOrderRef, jobCardNumber, excludeMrNumber }, ctx) => {
+  const progress = scopeQtyMaps({ salesOrderRef, jobCardNumber, excludeMrNumber }, ctx);
+  const seen = new Set();
+  items.forEach((it) => {
+    const key = String(it.materialId || '').trim();
+    const label = it.materialName || key;
+    if (!inv.find((i) => i.itemCode === key)) throw new Error(`Invalid material "${label}" — it is not in the inventory master.`);
+    if (!(num(it.requiredQty) > 0)) throw new Error(`Invalid required quantity for "${label}".`);
+    if (seen.has(key)) throw new Error(`"${label}" is already included in the Material Request. Please update the existing request quantity.`);
+    seen.add(key);
+    if (it.sourceType === SOURCE_TYPE.ADDITIONAL && !String(it.reason || '').trim()) {
+      throw new Error(`"${label}": an Additional Item needs a reason (why it was not in Terms & Requirement).`);
+    }
+    const termsRequired = num(it.termsRequiredQty);
+    if (termsRequired > 0) {
+      const alreadyReq = num(progress.requested[key]);
+      const alreadyIss = num(progress.issued[key]);
+      const balance = Math.max(0, termsRequired - alreadyReq - alreadyIss);
+      if (num(it.requiredQty) > balance) {
+        throw new Error(
+          `"${label}": request quantity ${num(it.requiredQty)} exceeds the remaining balance ${balance} ` +
+          `(Required ${termsRequired} − Requested ${alreadyReq} − Issued ${alreadyIss}).`
+        );
+      }
+    }
+  });
+};
+
+const mapMRItems = (items, inv, info) => items.map((it) => {
+  const invItem = inv.find((i) => i.itemCode === it.materialId) || null;
+  return {
+    materialId: it.materialId,
+    itemId: String(it.itemId || invItem?.id || ''),
+    materialName: it.materialName,
+    materialDesc: it.materialDesc || '',
+    grade: it.grade || '',
+    spec: it.spec || '',
+    sizeDimensions: it.sizeDimensions || '',
+    unit: it.unit || invItem?.unit || 'Nos',
+    requiredQty: num(it.requiredQty),
+    issuedQty: num(it.issuedQty),
+    termsRequiredQty: num(it.termsRequiredQty),
+    sourceType: resolveSourceType(it),
+    termsRequirementItemId: String(it.termsRequirementItemId || ''),
+    reason: String(it.reason || ''),
+    addedBy: String(it.addedBy || ''),
+    addedDate: String(it.addedDate || ''),
+    purpose: it.purpose || '',
+    batchNo: it.batchNo || '',
+    heatNumber: it.heatNumber || '',
+    serialNumber: it.serialNumber || '',
+    createdBy: info.employee?.name || info.auth?.username || 'User'
+  };
+});
+
+const anyIssuedFor = (mrNumber, ctx) => Object.values(totalsFor(mrNumber, ctx.issues, ctx.returns).issued).some((qty) => qty > 0);
+
+/* --- acknowledgement calculations (mirror of materialAckService, API data) --- */
+const committedToOtherRequests = (materialId, excludeMrNumber, ctx) => {
+  const key = String(materialId || '');
+  const exclude = String(excludeMrNumber || '');
+  let total = 0;
+  for (const mr of ctx.requests) {
+    if (!mr || String(mr.mrNumber || '') === exclude) continue;
+    if (!ACK_ELIGIBLE.has(mr.status)) continue;
+    const ack = getAcknowledgement(mr);
+    if (!ack || ack.status === ACK_STATUS.PENDING || ack.status === ACK_STATUS.NONE) continue;
+    const line = (ack.lines || {})[key];
+    if (!line) continue;
+    const promised = Math.max(0, num(line.acknowledgedQty));
+    if (promised <= 0) continue;
+    const alreadyIssued = num(totalsFor(mr.mrNumber, ctx.issues, ctx.returns).issued[key]);
+    total += Math.max(0, promised - alreadyIssued);
+  }
+  return total;
+};
+
+const computeAckLines = (mr, ctx, excludeMrNumber = '') => {
+  const exclude = String(excludeMrNumber || mr?.mrNumber || '');
+  return (mr?.items || []).map((it) => {
+    const materialId = String(it.materialId || '');
+    const invItem = ctx.inventory.find((i) => i.itemCode === materialId) || null;
+    const currentQty = num(invItem?.currentQty);
+    const reservedQty = num(invItem?.reservedQty);
+    const blockedQty = committedToOtherRequests(materialId, exclude, ctx);
+    const effectiveAvailable = Math.max(0, currentQty - reservedQty - blockedQty);
+    const requiredQty = num(it.requiredQty);
+    const availableQty = Math.min(requiredQty, effectiveAvailable);
+    return {
+      materialId,
+      materialName: it.materialName || materialId,
+      unit: it.unit || invItem?.unit || 'Nos',
+      requiredQty,
+      currentQty,
+      reservedQty,
+      blockedQty,
+      effectiveAvailable,
+      availableQty,
+      shortageQty: Math.max(0, requiredQty - availableQty),
+      status: lineStatusFor(requiredQty, availableQty)
+    };
+  });
+};
+
+const findIndentForMR = (mrNumber, indents) => {
+  const target = String(mrNumber || '');
+  return (
+    indents.find((i) =>
+      i &&
+      i.sourceType === 'materialRequest' &&
+      String(i.requirementNumber || '') === target &&
+      i.status !== INDENT_STATUS.CANCELLED
+    ) || null
+  );
+};
+
+const procurementPhase = (mrNumber, indents) => {
+  const indent = findIndentForMR(mrNumber, indents);
+  if (!indent || indent.status === INDENT_STATUS.COMPLETED) return '';
+  if (indent.poNumber || indent.status === INDENT_STATUS.CONVERTED || indent.status === INDENT_STATUS.PO_CREATED) {
+    return 'Awaiting Material Receipt';
+  }
+  return 'Purchase Indent Pending';
+};
+
+const getAckQueueRows = (ctx) => ctx.requests
+  .filter((m) => m && ACK_ELIGIBLE.has(m.status))
+  .map((mr) => {
+    const ack = getAcknowledgement(mr);
+    return {
+      mr,
+      ack,
+      lines: computeAckLines(mr, ctx),
+      phase: procurementPhase(mr.mrNumber, ctx.indents),
+      indentNumber: ack.purchaseIndentNumber || findIndentForMR(mr.mrNumber, ctx.indents)?.indentNumber || ''
+    };
+  });
+
+const getLinkableIndents = (mrNumber, ctx) => {
+  const exclude = String(mrNumber || '');
+  const claimedElsewhere = new Set(
+    ctx.requests
+      .filter((m) => m && String(m.mrNumber || '') !== exclude)
+      .map((m) => String(getAcknowledgement(m).purchaseIndentNumber || ''))
+      .filter(Boolean)
+  );
+  return ctx.indents.filter((i) =>
+    i &&
+    i.status !== INDENT_STATUS.CANCELLED &&
+    String(i.indentNumber || '') !== exclude &&
+    !claimedElsewhere.has(String(i.indentNumber || ''))
+  );
+};
 
 const StatusChip = ({ status }) => {
   const cls = (status || '').toLowerCase().replace(/\s+/g, '-');
@@ -86,6 +476,51 @@ const StoreMaterialRequestsPage = () => {
   const [ackBusy, setAckBusy] = useState(false);
   const [ackError, setAckError] = useState('');
   const [ackFlash, setAckFlash] = useState('');
+  const [indentSyncReady, setIndentSyncReady] = useState(false);
+
+  /* All workflow data is loaded from the authenticated PostgreSQL APIs.
+     localStorage copies, where present, are only display caches and are never
+     consulted by this page. */
+  const [storeData, setStoreData] = useState({
+    requests: [], issues: [], returns: [], inventory: [], lots: [], ledger: [], indents: []
+  });
+  const [loadError, setLoadError] = useState('');
+
+  const loadStoreData = async () => {
+    const [requests, issues, returns, inventory, ledger, lots, indents] = await Promise.all([
+      getMaterialRequestsApi(),
+      getStoreIssuesApi(),
+      getMaterialReturnsApi(),
+      listInventoryItems(),
+      listStockLedger(),
+      listInventoryLots(),
+      listProcurementRecords('purchaseIndent')
+    ]);
+    return {
+      requests: (Array.isArray(requests) ? requests : []).map(mapRequestRow),
+      issues: (Array.isArray(issues) ? issues : []).map(mapIssueRow),
+      returns: (Array.isArray(returns) ? returns : []).map(mapReturnRow),
+      inventory: (Array.isArray(inventory) ? inventory : []).map(mapInventoryRow),
+      ledger: (Array.isArray(ledger) ? ledger : []).map(mapLedgerRow),
+      lots: (Array.isArray(lots) ? lots : []).map(mapLotRow),
+      indents: Array.isArray(indents) ? indents : []
+    };
+  };
+
+  useEffect(() => {
+    let active = true;
+    loadStoreData()
+      .then((data) => {
+        if (!active) return;
+        setStoreData(data);
+        setIndentSyncReady(true);
+        setLoadError('');
+      })
+      .catch((error) => {
+        if (active) setLoadError(`Store records could not be loaded from PostgreSQL: ${error.message}`);
+      });
+    return () => { active = false; };
+  }, [refreshTick]);
 
   const refresh = () => {
     setRefreshTick((t) => t + 1);
@@ -101,13 +536,22 @@ const StoreMaterialRequestsPage = () => {
     setAckError('');
   };
 
-  const allMrs = getMaterialRequests();
+  const ctx = useMemo(() => ({
+    requests: storeData.requests,
+    issues: storeData.issues,
+    returns: storeData.returns,
+    inventory: storeData.inventory,
+    ledger: storeData.ledger,
+    lots: storeData.lots,
+    indents: storeData.indents
+  }), [storeData]);
+
+  const allMrs = ctx.requests;
   const decorated = useMemo(() => {
-    const dec = allMrs.map((m) => decorateMR(m));
-    dec.sort((a, b) => (b.requestDate.localeCompare(a.requestDate)));
+    const dec = allMrs.map((m) => decorateRequest(m, ctx));
+    dec.sort((a, b) => String(b.requestDate || '').localeCompare(String(a.requestDate || '')));
     return dec;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allMrs, refreshTick]);
+  }, [allMrs, ctx]);
 
   const active = decorated.filter((m) => QUEUE_STATUSES.includes(m.status));
 
@@ -136,17 +580,22 @@ const StoreMaterialRequestsPage = () => {
     return ['All', ...Array.from(set).sort()];
   }, [active]);
 
-  /* Rebuilt whenever anything writes to the ERP state (refreshTick). */
-  const ackQueueRows = useMemo(() => getAckQueue(), [refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
+  /* Rebuilt from the API-loaded snapshot whenever refreshTick changes. */
+  const ackQueueRows = useMemo(() => getAckQueueRows(ctx), [ctx, refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
   const pendingAckCount = ackQueueRows.filter((r) => r.ack.status === ACK_STATUS.PENDING).length;
 
-  const openDetail = (mr) => {
-    if (mr.status === STATUS.SUBMITTED) {
-      markPendingStore(mr.mrNumber);
-      setRefreshTick((t) => t + 1);
+  const openDetail = async (mr) => {
+    try {
+      if (mr.status === STATUS.SUBMITTED) {
+        if (!hasPermission('material_issue.confirm')) throw new Error('Permission denied: material_issue.confirm');
+        await markRequestPendingStoreApi(mr.mrNumber, mr.recordVersion);
+        setRefreshTick((t) => t + 1);
+      }
+      setViewNumber(mr.mrNumber);
+      setMode('detail');
+    } catch (err) {
+      window.alert(err.message);
     }
-    setViewNumber(mr.mrNumber);
-    setMode('detail');
   };
 
   /* ------------------- edit / delete request state ------------------- */
@@ -160,7 +609,7 @@ const StoreMaterialRequestsPage = () => {
   const setFormField = (field, val) => setForm((prev) => ({ ...prev, [field]: val }));
 
   const startEdit = (mr) => {
-    const raw = getMaterialRequests().find((m) => m.mrNumber === mr.mrNumber) || mr;
+    const raw = allMrs.find((m) => m.mrNumber === mr.mrNumber) || mr;
     setForm({
       jobCardNumber: raw.jobCardNumber || '',
       salesOrderRef: raw.salesOrderRef || '',
@@ -237,7 +686,7 @@ const StoreMaterialRequestsPage = () => {
   };
 
   const pickMaterial = (idx, itemCode) => {
-    const inv = getInventoryItems().find((i) => i.itemCode === itemCode);
+    const inv = ctx.inventory.find((i) => i.itemCode === itemCode);
     setLines((prev) => prev.map((l, i) => (i === idx ? {
       ...l,
       materialId: itemCode,
@@ -251,14 +700,39 @@ const StoreMaterialRequestsPage = () => {
     } : l)));
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!editMr) return;
     setFormError('');
     if (!String(form.partName || '').trim()) return setFormError('Part Name is required.');
     if (lines.length === 0) return setFormError('At least one material line is required.');
     try {
+      if (!hasPermission('material_request.edit')) throw new Error('Permission denied: material_request.edit');
+      if (!isMRStatusEditable(editMr.status)) throw new Error(`This Material Request cannot be edited. Current status: ${editMr.status}`);
+      assertItemsValid(lines, {
+        inv: ctx.inventory,
+        salesOrderRef: form.salesOrderRef || editMr.salesOrderRef,
+        jobCardNumber: String(form.jobCardNumber || '').trim(),
+        excludeMrNumber: editMr.mrNumber
+      });
       setEditBusy(true);
-      updateMaterialRequest(editMr.mrNumber, { ...form, items: lines });
+      const info = getCurrentUserInfo();
+      const payload = {
+        ...form,
+        projectId: String(form.projectId || editMr.projectId || '').trim().toUpperCase(),
+        jobCardId: String(form.jobCardNumber || '').trim(),
+        salesOrderId: form.salesOrderRef || '',
+        items: mapMRItems(lines, ctx.inventory, info),
+        updatedAt: nowDateTimeStr(),
+        updatedBy: info.employee?.name || info.auth?.username || 'User'
+      };
+      await updateMaterialRequestApi(editMr.mrNumber, payload, editMr.recordVersion);
+      pushNotification({
+        title: 'Material Request Updated',
+        message: `${editMr.mrNumber} was updated by ${payload.updatedBy}.`,
+        type: 'info',
+        reference: editMr.mrNumber,
+        targetDept: 'Production Department'
+      });
       setEditBusy(false);
       setFlash(`Material Request ${editMr.mrNumber} updated.`);
       setEditMr(null);
@@ -274,13 +748,9 @@ const StoreMaterialRequestsPage = () => {
 
   const handleDeleteMR = (mr) => {
     if (!window.confirm(`Delete ${mr.mrNumber}? This cannot be undone.`)) return;
-    try {
-      deleteMaterialRequest(mr.mrNumber);
-      setFlash(`Material Request ${mr.mrNumber} deleted.`);
-      setRefreshTick((t) => t + 1);
-    } catch (err) {
-      window.alert(err.message);
-    }
+    /* INCOMPLETE: server/storeRoutes.js has no delete route for a Material
+       Request. Never write the localStorage business key as a substitute. */
+    window.alert(`INCOMPLETE: Material Request ${mr.mrNumber} cannot be deleted through the PostgreSQL API. Nothing was deleted.`);
   };
 
   /* ------------------- issue form state ------------------- */
@@ -294,7 +764,7 @@ const StoreMaterialRequestsPage = () => {
 
   useEffect(() => {
     if (mode !== 'detail' || !selected) return;
-    const shortages = getMaterialShortages(selected);
+    const shortages = shortagesFor(selected, ctx);
     const prefill = {};
     shortages.forEach((s) => {
       prefill[s.materialId] = s.balance > 0 ? Math.min(s.balance, s.available) : 0;
@@ -321,27 +791,28 @@ const StoreMaterialRequestsPage = () => {
      batch (the one that MUST go out first) right under the batch input. */
   const fefoByItem = useMemo(() => {
     const map = {};
-    try {
-      // getExpiryWatchList is already FEFO-sorted (soonest expiry first).
-      getExpiryWatchList().forEach((b) => {
-        if (!b.expiryDate) return;
-        const key = String(b.itemCode || '').toLowerCase();
-        if (key && !map[key]) map[key] = b;
+    ctx.lots
+      .filter((lot) => lot.expiryDate)
+      .slice()
+      .sort((a, b) => String(a.expiryDate).localeCompare(String(b.expiryDate)))
+      .forEach((lot) => {
+        const key = String(lot.itemCode || '').toLowerCase();
+        if (!key || map[key]) return;
+        const expiry = getExpiryStatus(lot.expiryDate);
+        map[key] = { ...lot, status: expiry.status, daysLeft: expiry.daysLeft };
       });
-    } catch {
-      /* shelf-life data unavailable — no hints */
-    }
     return map;
-  }, []);
+  }, [ctx.lots]);
 
-  const handleIssue = () => {
+  const handleIssue = async () => {
     if (!selected) return;
     setIssueError('');
     if (!receiver) return setIssueError('Select the employee who is receiving the material (from Employee Master).');
     if (!acknowledged) return setIssueError('The receiver must tick the acknowledgement checkbox before material is issued.');
     try {
+      if (!canIssue) throw new Error('Permission denied: material_issue.confirm');
       setBusy(true);
-      const si = issueMaterial({
+      const si = await issueMaterialApi({
         mrNumber: selected.mrNumber,
         issueQtyById: issueQty,
         receiver: { ...receiver, acknowledged },
@@ -356,66 +827,94 @@ const StoreMaterialRequestsPage = () => {
     }
   };
 
-  const handleCreatePR = () => {
+  const handleCreatePR = async () => {
     if (!selected) return;
-    const shortages = getMaterialShortages(selected).filter((s) => s.shortage > 0);
+    const shortages = shortagesFor(selected, ctx).filter((s) => s.shortage > 0);
     if (shortages.length === 0) return alert('No shortage found for this request.');
-    if (!window.confirm(`Create Purchase Request for ${shortages.length} short material(s) against ${selected.mrNumber}?`)) return;
     try {
       setBusy(true);
-      const pr = createPurchaseRequestForShortage({ mrNumber: selected.mrNumber, items: shortages });
+      const request = {
+        prDate: todayStr(),
+        mrNumber: selected.mrNumber,
+        jobCardNumber: selected.jobCardNumber || '',
+        partName: selected.partName || '',
+        projectId: selected.projectId || '',
+        projectName: selected.projectName || '',
+        requestedBy: selected.requestedBy || getCurrentUserInfo().employee?.name || 'Store',
+        department: selected.productionDepartment || 'Store Department',
+        priority: selected.priority || 'Normal',
+        remarks: `Shortage against MR ${selected.mrNumber}`,
+        items: shortages.map((item) => ({
+          materialId: item.materialId,
+          materialName: item.materialName,
+          unit: item.unit || 'Nos',
+          requiredQty: item.required,
+          issuedQty: item.issued,
+          balanceQty: item.balance,
+          availableQty: item.available,
+          shortageQty: item.shortage
+        }))
+      };
+      const result = await createPurchaseRequestApi(request, `store-pr:${crypto.randomUUID()}`);
       setBusy(false);
-      alert(`Purchase Request ${pr.prNumber} created.`);
-      refresh();
-    } catch (err) {
+      alert(`Purchase Request ${result.record.prNumber} saved to PostgreSQL and is pending approval.`);
+      bumpRefresh();
+    } catch (error) {
       setBusy(false);
-      setIssueError(err.message);
+      alert(`Purchase Request was not created: ${error.message}`);
     }
   };
 
-  const handleReject = () => {
+  const handleReject = async () => {
     if (!selected) return;
     const reason = window.prompt(`Reject ${selected.mrNumber}? Enter the rejection reason:`);
     if (reason === null) return;
     try {
-      rejectMaterialRequest(selected.mrNumber, reason);
+      if (!hasPermission('material_issue.confirm')) throw new Error('Permission denied: material_issue.confirm');
+      if (anyIssuedFor(selected.mrNumber, ctx)) throw new Error('Cannot reject — material has already been issued against this request.');
+      await rejectMaterialRequestApi(selected.mrNumber, selected.recordVersion, reason);
       refresh();
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleClose = () => {
+  const handleClose = async () => {
     if (!selected) return;
     if (!window.confirm(`Close ${selected.mrNumber} now that all material is issued?`)) return;
     try {
-      closeMaterialRequest(selected.mrNumber);
+      if (!hasPermission('material_issue.confirm') && !hasPermission('material_request.submit')) {
+        throw new Error('Permission denied: you cannot close a material request.');
+      }
+      const totalRequired = (selected.items || []).reduce((a, it) => a + num(it.requiredQty), 0);
+      const issued = totalsFor(selected.mrNumber, ctx.issues, ctx.returns).issued;
+      const totalIssued = (selected.items || []).reduce((a, it) => a + (issued[it.materialId] || 0), 0);
+      if (!(totalRequired > 0 && totalIssued >= totalRequired)) throw new Error('Only a Fully Issued Material Request can be closed.');
+      await closeMaterialRequestApi(selected.mrNumber, selected.recordVersion, nowDateTimeStr());
       refresh();
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const handleApprovePR = (prNumber) => {
-    const remarks = window.prompt(`Approve ${prNumber}? Enter remarks (optional):`);
-    if (remarks === null) return;
+  const handleApprovePR = async (pr) => {
     try {
-      approvePurchaseRequest(prNumber, remarks);
-      refresh();
-    } catch (err) {
-      alert(err.message);
+      const approvalRemarks = window.prompt(`Optional approval remarks for ${pr.prNumber}:`) || '';
+      await approvePurchaseRequestApi(pr.prNumber, pr.recordVersion || pr.version, approvalRemarks);
+      bumpRefresh();
+    } catch (error) {
+      alert(`Purchase Request could not be approved: ${error.message}`);
     }
   };
 
-  const handleRejectPR = (prNumber) => {
-    const reason = window.prompt(`Reject ${prNumber}? Enter a reason (required):`);
+  const handleRejectPR = async (pr) => {
+    const reason = window.prompt(`Reject ${pr.prNumber}? Enter the rejection reason:`);
     if (reason === null) return;
-    if (!reason || !reason.trim()) { alert('Rejection reason is required.'); return; }
     try {
-      rejectPurchaseRequest(prNumber, reason);
-      refresh();
-    } catch (err) {
-      alert(err.message);
+      await rejectPurchaseRequestApi(pr.prNumber, pr.recordVersion || pr.version, reason);
+      bumpRefresh();
+    } catch (error) {
+      alert(`Purchase Request could not be rejected: ${error.message}`);
     }
   };
 
@@ -426,17 +925,95 @@ const StoreMaterialRequestsPage = () => {
     setAckFlash('');
   };
 
-  const handleSubmitAck = ({ lines, remarks }) => {
+  const acknowledgeFor = (mrNumber) => allMrs.find((m) => m.mrNumber === mrNumber) || null;
+
+  const saveAcknowledgement = (mr, acknowledgement) =>
+    updateMaterialRequestApi(mr.mrNumber, { acknowledgement }, mr.recordVersion);
+
+  const handleSubmitAck = async ({ lines, remarks }) => {
     if (!ackMrNumber) return;
     try {
+      if (!canAcknowledge) throw new Error('Permission denied: material_issue.confirm');
+      const mr = acknowledgeFor(ackMrNumber);
+      if (!mr) throw new Error('Material Request not found.');
+      if (!ACK_ELIGIBLE.has(mr.status)) throw new Error(`Cannot acknowledge a ${mr.status} Material Request.`);
+
+      const previous = getAcknowledgement(mr);
+      const live = computeAckLines(mr, ctx);
+      const submitted = new Map(lines.map((l) => [String(l.materialId), l]));
+      const nextLines = {};
+      for (const line of live) {
+        const entry = submitted.get(line.materialId) || {};
+        const cap = Math.min(line.requiredQty, line.effectiveAvailable);
+        const raw = entry.verifiedQty;
+        const hasVerified = raw !== '' && raw !== null && raw !== undefined && !Number.isNaN(Number(raw));
+        const ackQty = hasVerified ? Math.min(cap, Math.max(0, num(raw))) : cap;
+        nextLines[line.materialId] = {
+          materialName: line.materialName,
+          unit: line.unit,
+          requiredQty: line.requiredQty,
+          availableQty: ackQty,
+          acknowledgedQty: ackQty,
+          shortageQty: Math.max(0, line.requiredQty - ackQty),
+          effectiveAvailable: line.effectiveAvailable,
+          status: lineStatusFor(line.requiredQty, ackQty),
+          verifiedQty: hasVerified ? Math.max(0, num(raw)) : ackQty,
+          remarks: String(entry.remarks || ''),
+          purchaseIndentNumber: String(previous.lines?.[line.materialId]?.purchaseIndentNumber || '')
+        };
+      }
+      const nextStatus = ackStatusForLines(Object.values(nextLines));
+      const totalAvailable = Object.values(nextLines).reduce((a, l) => a + num(l.acknowledgedQty), 0);
+      const totalShortage = Object.values(nextLines).reduce((a, l) => a + num(l.shortageQty), 0);
+      const unchanged =
+        previous.status === nextStatus &&
+        String(previous.remarks || '') === String(remarks || '') &&
+        Object.keys(nextLines).every((key) => num(previous.lines?.[key]?.acknowledgedQty) === num(nextLines[key].acknowledgedQty));
+      if (unchanged && previous.acknowledgedAt) {
+        setAckFlash(`No change — ${ackMrNumber} was already acknowledged with these figures.`);
+        return;
+      }
+
+      const info = getCurrentUserInfo();
+      const at = nowDateTimeStr();
+      const historyEntry = {
+        by: info.employee?.name || info.auth?.username || 'User',
+        byEmpId: info.employee?.employeeId || '-',
+        at,
+        previousStatus: previous.status,
+        newStatus: nextStatus,
+        availableQty: totalAvailable,
+        shortageQty: totalShortage,
+        remarks: String(remarks || '')
+      };
+      const acknowledgement = {
+        ...previous,
+        status: nextStatus,
+        lines: nextLines,
+        remarks: String(remarks || ''),
+        acknowledgedBy: historyEntry.by,
+        acknowledgedByEmpId: historyEntry.byEmpId,
+        acknowledgedAt: at,
+        updatedAt: at,
+        completedAt: nextStatus === ACK_STATUS.FULL ? at : '',
+        purchaseIndentNumber: previous.purchaseIndentNumber || '',
+        history: [...(previous.history || []), historyEntry]
+      };
       setAckBusy(true);
-      const res = submitAcknowledgement({ mrNumber: ackMrNumber, lines, remarks });
+      await saveAcknowledgement(mr, acknowledgement);
+      const materials = Object.values(nextLines)
+        .map((l) => `${l.materialName}: ${l.acknowledgedQty}/${l.requiredQty} ${l.unit} available, ${l.shortageQty} ${l.unit} short (${l.status})`)
+        .join(' | ');
+      pushNotification({
+        title: `Store Acknowledgement — ${nextStatus}`,
+        message: `Material Request ${mr.mrNumber}${mr.salesOrderRef ? ` — SO ${mr.salesOrderRef}` : ''}${mr.projectId ? ` — Project ${mr.projectId}` : ''} — Status: ${nextStatus} — ${materials}${remarks ? ` — Remarks: ${remarks}` : ''}`,
+        type: nextStatus === ACK_STATUS.FULL ? 'success' : 'warning',
+        reference: mr.mrNumber,
+        targetDept: 'Production Department',
+        link: `/production/material-requests?mr=${encodeURIComponent(mr.mrNumber)}`
+      });
       setAckBusy(false);
-      setAckFlash(
-        res.changed
-          ? `Acknowledgement for ${ackMrNumber} submitted — Production has been notified.`
-          : `No change — ${ackMrNumber} was already acknowledged with these figures.`
-      );
+      setAckFlash(`Acknowledgement for ${ackMrNumber} submitted — Production has been notified.`);
       setRefreshTick((t) => t + 1);
     } catch (err) {
       setAckBusy(false);
@@ -444,19 +1021,97 @@ const StoreMaterialRequestsPage = () => {
     }
   };
 
-  const handleLinkIndent = ({ indentNumber = '' }) => {
+  const handleLinkIndent = async ({ indentNumber = '' }) => {
     if (!ackMrNumber) return;
+    if (!indentSyncReady) { setAckError('Purchase Indents are not refreshed from PostgreSQL yet. Retry after the server connection is restored.'); return; }
     try {
+      if (!hasPermission('indent.create')) throw new Error('Permission denied: indent.create');
+      const mr = acknowledgeFor(ackMrNumber);
+      if (!mr) throw new Error('Material Request not found.');
+      if (!ACK_ELIGIBLE.has(mr.status)) throw new Error(`Cannot link a Purchase Indent to a ${mr.status} Material Request.`);
+      const existing = findIndentForMR(ackMrNumber, ctx.indents);
       setAckBusy(true);
-      const res = linkPurchaseIndent({ mrNumber: ackMrNumber, indentNumber });
+
+      if (indentNumber) {
+        const target = ctx.indents.find((i) => String(i.indentNumber || '') === indentNumber);
+        if (!target) throw new Error(`Purchase Indent ${indentNumber} not found.`);
+        if (target.status === INDENT_STATUS.CANCELLED) throw new Error(`Purchase Indent ${indentNumber} is cancelled.`);
+        if (existing && existing.indentNumber !== indentNumber) {
+          throw new Error(`Material Request ${ackMrNumber} is already linked to Purchase Indent ${existing.indentNumber}.`);
+        }
+        if (existing) {
+          setAckBusy(false);
+          setAckFlash(`Purchase Indent ${existing.indentNumber} is already linked to ${ackMrNumber} — no duplicate created.`);
+          return;
+        }
+        const acknowledgement = {
+          ...getAcknowledgement(mr),
+          purchaseIndentNumber: indentNumber
+        };
+        await saveAcknowledgement(mr, acknowledgement);
+        setAckBusy(false);
+        setAckFlash(`Purchase Indent ${indentNumber} linked to ${ackMrNumber}.`);
+        setRefreshTick((t) => t + 1);
+        return;
+      }
+
+      if (existing) {
+        setAckBusy(false);
+        setAckFlash(`Purchase Indent ${existing.indentNumber} is already linked to ${ackMrNumber} — no duplicate created.`);
+        return;
+      }
+      const shortageLines = computeAckLines(mr, ctx).filter((l) => num(l.shortageQty) > 0);
+      if (shortageLines.length === 0) throw new Error('No shortage found — nothing to indent for this Material Request.');
+      const indentNumberReserved = await reserveProcurementNumber('purchaseIndent');
+      const info = getCurrentUserInfo();
+      const draft = {
+        indentNumber: indentNumberReserved,
+        indentDate: todayStr(),
+        soNumber: mr.salesOrderRef || '',
+        projectId: mr.projectId || '',
+        customer: mr.customer || '',
+        deliveryDate: '',
+        requiredDate: mr.requiredDate || '',
+        reason: `Shortage from Material Request ${ackMrNumber}`,
+        sourceType: 'materialRequest',
+        requirementNumber: ackMrNumber,
+        productionJob: mr.jobCardNumber || '',
+        storeRemarks: `Raised from the Store acknowledgement of ${ackMrNumber}.`,
+        purchaseRemarks: '',
+        status: INDENT_STATUS.DRAFT,
+        items: shortageLines.map((l) => ({
+          materialCode: l.materialId,
+          materialName: l.materialName,
+          unit: l.unit,
+          requiredQty: l.requiredQty,
+          availableQty: l.availableQty,
+          shortageQty: l.shortageQty,
+          purchaseQty: l.shortageQty,
+          description: '',
+          specification: '',
+          reason: `Shortage from Material Request ${ackMrNumber}`,
+          remarks: '',
+          source: 'Material Request Shortage'
+        })),
+        additionalRequirements: [],
+        clarifications: [],
+        createdBy: info.employee?.name || info.auth?.username || 'User',
+        createdByEmpId: info.employee?.employeeId || '-',
+        createdByDept: info.employee?.department || '',
+        createdAt: nowDateTimeStr(),
+        updatedAt: nowDateTimeStr(),
+        submittedAt: '',
+        poNumber: '',
+        convertedAt: ''
+      };
+      const { record } = await createProcurementRecord('purchaseIndent', draft, `purchase-indent:${window.crypto?.randomUUID?.() || Date.now()}`);
+      const acknowledgement = {
+        ...getAcknowledgement(mr),
+        purchaseIndentNumber: record.indentNumber || indentNumberReserved
+      };
+      await saveAcknowledgement(mr, acknowledgement);
       setAckBusy(false);
-      setAckFlash(
-        res.created
-          ? `Purchase Indent ${res.indent.indentNumber} created for the shortage and linked to ${ackMrNumber}.`
-          : res.changed
-            ? `Purchase Indent ${res.indent.indentNumber} linked to ${ackMrNumber}.`
-            : `Purchase Indent ${res.indent.indentNumber} is already linked to ${ackMrNumber} — no duplicate created.`
-      );
+      setAckFlash(`Purchase Indent ${record.indentNumber || indentNumberReserved} created for the shortage and linked to ${ackMrNumber}.`);
       setRefreshTick((t) => t + 1);
     } catch (err) {
       setAckBusy(false);
@@ -474,6 +1129,8 @@ const StoreMaterialRequestsPage = () => {
           <NotificationsPanel />
         </div>
       </div>
+
+      {loadError && <div role="alert" className="form-error">{loadError}</div>}
 
       <div className="tab-nav">
         <button type="button" className={`tab-link ${tab === 'queue' ? 'active' : ''}`} onClick={() => setTab('queue')}>Request Queue</button>
@@ -498,6 +1155,7 @@ const StoreMaterialRequestsPage = () => {
           <AckScreen
             mrNumber={ackMrNumber}
             refreshTick={refreshTick}
+            ctx={ctx}
             canAcknowledge={canAcknowledge}
             canIndent={canIndent}
             busy={ackBusy}
@@ -505,6 +1163,7 @@ const StoreMaterialRequestsPage = () => {
             flash={ackFlash}
             onSubmit={handleSubmitAck}
             onLinkIndent={handleLinkIndent}
+            indentSyncReady={indentSyncReady}
             onRefresh={bumpRefresh}
             onBack={() => { setAckMrNumber(null); setAckError(''); setAckFlash(''); }}
           />
@@ -524,6 +1183,7 @@ const StoreMaterialRequestsPage = () => {
       ) : mode === 'edit' && editMr && form ? (
         <EditView
           mr={editMr}
+          inventory={ctx.inventory}
           form={form}
           setFormField={setFormField}
           lines={lines}
@@ -540,7 +1200,7 @@ const StoreMaterialRequestsPage = () => {
       ) : mode === 'detail' && selected ? (
         <DetailView
           mr={selected}
-          inventory={getInventoryItems()}
+          ctx={ctx}
           issueQty={issueQty}
           setQty={setQty}
           batchInfo={batchInfo}
@@ -680,8 +1340,6 @@ const EditView = ({
   onSave,
   onCancel
 }) => {
-  const inventory = getInventoryItems();
-
   return (
     <div className="content-block">
       <div className="block-header">
@@ -803,6 +1461,7 @@ const EditView = ({
 
 const DetailView = ({
   mr,
+  ctx,
   issueQty,
   setQty,
   batchInfo,
@@ -823,7 +1482,7 @@ const DetailView = ({
   onClose,
   onBack
 }) => {
-  const shortages = getMaterialShortages(mr);
+  const shortages = shortagesFor(mr, ctx);
   const totalShortages = shortages.filter((s) => s.shortage > 0);
   const anyIssuable = shortages.some((s) => s.canIssuePartially);
   const completed = mr.status === STATUS.FULL;
@@ -923,13 +1582,13 @@ const DetailView = ({
                   </td>
                   <td>
                     <select className="issue-qty-input" disabled={!canIssue} value={batchInfo[s.materialId]?.receiptBatchId || ''} onChange={(e) => {
-                      const batch = getInventoryBatches().find((candidate) => candidate.id === e.target.value);
+                      const batch = ctx.lots.find((candidate) => String(candidate.id) === String(e.target.value));
                       setBatchField(s.materialId, 'receiptBatchId', e.target.value);
                       setBatchField(s.materialId, 'batchNo', batch?.supplierBatchNumber || batch?.batchNumber || '');
                       setBatchField(s.materialId, 'lotNumber', batch?.lotNumber || '');
                     }}>
                       <option value="">Select receipt batch</option>
-                      {getInventoryBatches().filter((batch) => String(batch.itemCode || '').toLowerCase() === String(s.materialId || '').toLowerCase() && Number(batch.availableQty) > 0)
+                      {ctx.lots.filter((batch) => String(batch.itemCode || '').toLowerCase() === String(s.materialId || '').toLowerCase() && Number(batch.availableQty) > 0)
                         .map((batch) => <option key={batch.id} value={batch.id}>{batch.supplierBatchNumber || batch.batchNumber || 'No supplier batch'} / {batch.internalBatchId || batch.id} — {batch.availableQty} available</option>)}
                     </select>
                     <div className="muted-text">Supplier batch: {batchInfo[s.materialId]?.batchNo || 'Not recorded'}</div>
@@ -1056,14 +1715,31 @@ const DetailView = ({
 
 const PurchaseRequestsView = ({ canApprovePR, onApprovePR, onRejectPR, refreshTick }) => {
   const [prs, setPrs] = useState([]);
+  const [loadError, setLoadError] = useState('');
+  const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('All');
   const [viewPR, setViewPR] = useState(null);
 
-  useEffect(() => {
+  const reload = async () => {
+    setLoading(true);
     try {
-      const raw = localStorage.getItem('storePurchaseRequests');
-      setPrs(raw ? JSON.parse(raw) : []);
-    } catch { setPrs([]); }
+      setPrs(await listPurchaseRequestsApi());
+      setLoadError('');
+    } catch (error) {
+      setLoadError(`Purchase Requests could not be loaded from PostgreSQL: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    listPurchaseRequestsApi()
+      .then((records) => { if (active) { setPrs(records); setLoadError(''); } })
+      .catch((error) => { if (active) setLoadError(`Purchase Requests could not be loaded from PostgreSQL: ${error.message}`); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [refreshTick]);
 
   const filtered = filter === 'All' ? prs : prs.filter((p) => p.status === filter);
@@ -1072,6 +1748,7 @@ const PurchaseRequestsView = ({ canApprovePR, onApprovePR, onRejectPR, refreshTi
     const pr = prs.find((p) => p.prNumber === viewPR) || {};
     return (
       <div className="content-block" style={{ marginTop: '16px' }}>
+        <PurchaseRequestMigrationReview onImported={reload} />
         <div className="block-header">
           <div>
             <h3 className="block-title">Purchase Request: {pr.prNumber}</h3>
@@ -1183,7 +1860,10 @@ const PurchaseRequestsView = ({ canApprovePR, onApprovePR, onRejectPR, refreshTi
           <option value="Converted to PO">Converted to PO</option>
         </select>
       </div>
-      {filtered.length === 0 ? (
+      {loadError && <div className="status-badge st-out" role="alert">{loadError}</div>}
+      {loading ? (
+        <p style={{ color: '#6b7280', padding: '20px' }}>Loading Purchase Requests from PostgreSQL…</p>
+      ) : filtered.length === 0 ? (
         <p style={{ color: '#6b7280', padding: '20px' }}>No purchase requests found.</p>
       ) : (
         <table className="history-table">
@@ -1214,8 +1894,8 @@ const PurchaseRequestsView = ({ canApprovePR, onApprovePR, onRejectPR, refreshTi
                     <button type="button" className="button-secondary button-small" onClick={() => setViewPR(pr.prNumber)}>View</button>
                     {pr.status === 'Pending Approval' && canApprovePR && (
                       <>
-                        <button type="button" className="button-primary button-small" onClick={() => onApprovePR(pr.prNumber)} style={{ background: '#16a34a' }}>Approve</button>
-                        <button type="button" className="button-secondary button-small" onClick={() => onRejectPR(pr.prNumber)} style={{ color: '#dc2626' }}>Reject</button>
+                        <button type="button" className="button-primary button-small" onClick={() => onApprovePR(pr)} style={{ background: '#16a34a' }}>Approve</button>
+                        <button type="button" className="button-secondary button-small" onClick={() => onRejectPR(pr)} style={{ color: '#dc2626' }}>Reject</button>
                       </>
                     )}
                     {pr.status === 'Approved' && <span style={{ color: '#16a34a', fontWeight: 600, fontSize: '12px' }}>✓ Ready for PO</span>}
@@ -1354,6 +2034,7 @@ const AckQueueView = ({ rows, filter, setFilter, search, setSearch, canAcknowled
 const AckScreen = ({
   mrNumber,
   refreshTick,
+  ctx,
   canAcknowledge,
   canIndent,
   busy,
@@ -1361,18 +2042,19 @@ const AckScreen = ({
   flash,
   onSubmit,
   onLinkIndent,
+  indentSyncReady,
   onRefresh,
   onBack
 }) => {
   const mr = useMemo(
-    () => getMaterialRequests().find((m) => m.mrNumber === mrNumber) || null,
-    [mrNumber, refreshTick] // eslint-disable-line react-hooks/exhaustive-deps
+    () => ctx.requests.find((m) => m.mrNumber === mrNumber) || null,
+    [ctx.requests, mrNumber, refreshTick] // eslint-disable-line react-hooks/exhaustive-deps
   );
-  const liveLines = useMemo(() => (mr ? computeAckLines(mr) : []), [mr, refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
-  const linkable = useMemo(() => getLinkableIndents(mrNumber), [mrNumber, refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
+  const liveLines = useMemo(() => (mr ? computeAckLines(mr, ctx) : []), [mr, ctx, refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
+  const linkable = useMemo(() => getLinkableIndents(mrNumber, ctx), [ctx, mrNumber, refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const ack = mr ? getAcknowledgement(mr) : null;
-  const indent = mr ? findIndentForMR(mrNumber) : null;
+  const indent = mr ? findIndentForMR(mrNumber, ctx.indents) : null;
   const indentNumber = (ack && ack.purchaseIndentNumber) || (indent && indent.indentNumber) || '';
 
   const [draft, setDraft] = useState({});
@@ -1641,7 +2323,7 @@ const AckScreen = ({
             </button>
           )}
           {canIndent && totalShortage > 0 && !indentNumber && (
-            <button type="button" className="button-secondary" disabled={busy} onClick={() => onLinkIndent({})}>
+              <button type="button" className="button-secondary" disabled={busy || !indentSyncReady} onClick={() => onLinkIndent({})}>
               Create Purchase Indent for Shortage
             </button>
           )}
@@ -1665,7 +2347,7 @@ const AckScreen = ({
             <button
               type="button"
               className="button-primary button-small"
-              disabled={busy || !linkChoice}
+              disabled={busy || !indentSyncReady || !linkChoice}
               onClick={() => onLinkIndent({ indentNumber: linkChoice })}
             >
               Link Indent

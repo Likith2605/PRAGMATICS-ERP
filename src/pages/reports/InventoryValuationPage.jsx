@@ -1,6 +1,9 @@
 import React, { useMemo } from 'react';
 import ReportRegister from '../../components/ReportRegister.jsx';
-import { getItemStockOverview } from '../../utils/storeService.js';
+import ReportLoadState from '../../components/ReportLoadState.jsx';
+import { useAuthoritativeData } from '../../hooks/useAuthoritativeData.js';
+import { listInventoryItems, listInventoryValuation } from '../../services/inventoryApi.js';
+import { normalizeInventoryItem } from '../../utils/reportApiData.js';
 import { formatQuantityByUnit } from '../../utils/reportFilters.js';
 
 /**
@@ -19,19 +22,31 @@ const categorySummaryRows = (rows) => Object.values(rows.reduce((map, row) => {
 }, {}));
 
 const InventoryValuationPage = () => {
-  const rows = useMemo(() => {
-    const overview = getItemStockOverview().map((it) => ({
-      itemCode: it.itemCode || '',
-      materialName: it.materialName || '',
-      category: it.category || 'Uncategorised',
-      unit: it.unit || '',
-      currentQty: Number(it.currentQty) || 0,
-      unitCost: Number(it.unitCost) || 0,
-      stockValue: Number(it.stockValue) || 0,
-      stockStatus: it.stockStatus || 'Not recorded'
-    }));
-    return overview;
+  const loadValuation = React.useCallback(async () => {
+    const [valuation, items] = await Promise.all([listInventoryValuation(), listInventoryItems()]);
+    return { valuation, items: items.map(normalizeInventoryItem) };
   }, []);
+  const { data, loading, error } = useAuthoritativeData(loadValuation, '', { valuation: [], items: [] });
+  const rows = useMemo(() => {
+    const itemsByCode = new Map(data.items.map((item) => [item.itemCode, item]));
+    return data.valuation.map((row) => {
+      const currentQty = Number(row.current_qty ?? row.currentQty) || 0;
+      const unitCost = Number(row.unit_price ?? row.unitCost) || 0;
+      const item = itemsByCode.get(row.item_code || row.itemCode) || {};
+      const reorderLevel = Number(item.reorderLevel) || 0;
+      return {
+      itemCode: row.item_code || row.itemCode || '',
+      materialName: row.material_name || row.materialName || '',
+      category: row.category || 'Uncategorised',
+      unit: row.unit || '',
+      currentQty,
+      unitCost,
+      stockValue: Number(row.valuation ?? row.stockValue ?? currentQty * unitCost) || 0,
+        stockStatus: currentQty <= 0 ? 'Out of Stock' : currentQty <= reorderLevel ? 'Low Stock' : 'In Stock'
+      };
+    });
+  }, [data]);
+  if (loading || error) return <div className="page-container" style={{ padding: '20px 24px' }}><ReportLoadState loading={loading} error={error} /></div>;
 
   return (
     <div className="page-container" style={{ padding: '20px 24px' }}>

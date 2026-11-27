@@ -1,9 +1,8 @@
 import { useEffect, useState } from 'react';
 import { OFFICIAL_COMPANY_PROFILE } from '../constants/companyProfile.js';
+import { getCachedCompanySettings } from '../services/masterApi.js';
 
-// Company branding is stored with the existing, already-synchronised company
-// settings record (localStorage `companySettings` -> PostgreSQL `erp_state`
-// -> mirrored to every computer by erpStateSync.js). No new table or API.
+// Company branding is read only from the authenticated PostgreSQL master API.
 export const COMPANY_SETTINGS_KEY = 'companySettings';
 export const COMPANY_BRANDING_EVENT = 'company-branding-updated';
 
@@ -12,15 +11,7 @@ export const COMPANY_BRANDING_EVENT = 'company-branding-updated';
 // existing image/PDF code paths keep working without any layout changes.
 export const NEUTRAL_LOGO_DATA_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l6kAAAAASUVORK5CYII=';
 
-const readSettings = () => {
-  try {
-    if (typeof localStorage === 'undefined') return {};
-    const parsed = JSON.parse(localStorage.getItem(COMPANY_SETTINGS_KEY) || '{}');
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
-};
+const readSettings = () => getCachedCompanySettings();
 
 /** Stored company settings with the shipped official profile as a baseline.
  *  Explicitly saved values (including blank ones) always win. */
@@ -46,8 +37,7 @@ export const notifyCompanyBrandingUpdated = () => {
   }
 };
 
-/** React accessor: keeps branding in sync across the Settings page, other
- *  open tabs and PostgreSQL hydration without changing any component layout. */
+/** React accessor: keeps branding in sync with confirmed PostgreSQL settings. */
 export const useCompanyBranding = (fallbackLogoUrl = NEUTRAL_LOGO_DATA_URI) => {
   const snapshot = () => ({
     logoUrl: getCompanyLogoDataUri() || fallbackLogoUrl,
@@ -61,12 +51,8 @@ export const useCompanyBranding = (fallbackLogoUrl = NEUTRAL_LOGO_DATA_URI) => {
     update();
     if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined;
     window.addEventListener(COMPANY_BRANDING_EVENT, update);
-    window.addEventListener('erp-state-hydrated', update);
-    window.addEventListener('storage', update);
     return () => {
       window.removeEventListener(COMPANY_BRANDING_EVENT, update);
-      window.removeEventListener('erp-state-hydrated', update);
-      window.removeEventListener('storage', update);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fallbackLogoUrl]);

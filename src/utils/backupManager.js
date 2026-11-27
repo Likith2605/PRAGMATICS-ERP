@@ -31,7 +31,6 @@ export const ERP_BACKUP_STORAGE_KEYS = [
   'quotationSequence',
   'customerPOHistory',
   'salesOrderHistory',
-  'productionJobCards',
   'inventoryItems',
   'stockTransactions',
   'supplierPOHistory',

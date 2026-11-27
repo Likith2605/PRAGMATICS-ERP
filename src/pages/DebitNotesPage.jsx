@@ -6,40 +6,40 @@ import RecordSearchBar from '../components/RecordSearchBar.jsx';
 import { filterDebitCandidates, filterMaterialRecords } from '../utils/historySearch.js';
 import { hasPermission } from '../utils/permissions.js';
 import {
-  getDebitNotes,
-  getDebitNote,
+  listDebitNotes,
+  getDebitNoteDetail,
+  getDebitNoteCandidates,
   getDebitNoteContext,
-  getRejectionReports,
-  getRejectionReport,
-  getReplacementQCProgress,
   createDebitNote,
   updateDebitNote,
-  issueDebitNote,
-  submitDebitNoteRequest,
-  reviewDebitNote,
+  transitionDebitNote,
   approveDebitNote,
-  approveDebitNoteByAdmin,
-  sendDebitNoteToVendor,
-  closeDebitNote,
-  DEBIT_NOTE_STATUS
-} from '../utils/workflowService.js';
+  rejectDebitNote,
+  cancelDebitNote,
+  debitNoteCreateToken
+} from '../services/debitNoteApi.js';
 import { saveWorkflowDocument, openWorkflowDocument } from '../utils/workflowFiles.js';
 import { generateDebitNotePDF } from '../services/pdfGenerator.js';
 import { numberToWords } from '../utils/numberToWords.js';
 
+/** Mirrors workflowService.DEBIT_NOTE_STATUS so the UI keeps the same vocabulary. */
+export const DEBIT_NOTE_STATUS = Object.freeze({
+  DRAFT: 'Draft',
+  REQUESTED: 'Requested',
+  PURCHASE_REVIEW: 'Purchase Review',
+  ADMIN_REVIEW: 'Admin Approval',
+  APPROVED: 'Approved',
+  ISSUED: 'Issued',
+  SENT_VENDOR: 'Sent to Vendor',
+  CLOSED: 'Closed',
+  CREATED: 'Created',
+  SENT: 'Sent to Purchase',
+  RECORDED: 'Recorded by Purchase'
+});
+
 const badgeClass = (status) => `status-badge st-${String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
 const num = (v) => Number(v) || 0;
 const money = (v) => num(v).toFixed(2);
-
-/* Rejection reports that still have unclaimed rejected quantity for a Debit Note. */
-const eligibleRejections = (reports) =>
-  reports
-    .map((r) => {
-      const ctx = getDebitNoteContext(r.rejectionNumber);
-      return ctx ? { ...ctx, rejection: r } : null;
-    })
-    .filter((c) => c && c.totalRemainingQty > 0)
-    .sort((a, b) => String(b.rejectionNumber).localeCompare(String(a.rejectionNumber)));
 
 /* ------------------------------ create / edit form ------------------------------ */
 
@@ -49,6 +49,8 @@ const DebitNoteForm = ({ context, existing, onDone, onError }) => {
   const [remarks, setRemarks] = useState(existing?.remarks || '');
   const [docs, setDocs] = useState(existing?.documents || []);
   const [uploading, setUploading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [createToken] = useState(() => debitNoteCreateToken());
   const [qty, setQty] = useState(() => {
     const seed = {};
     (context.lines || []).forEach((l) => {
@@ -112,23 +114,28 @@ const DebitNoteForm = ({ context, existing, onDone, onError }) => {
     }
   };
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
+    if (saving || errors.length > 0) return;
+    setSaving(true);
     try {
       const payload = {
         rejectionNumber: context.rejection.rejectionNumber,
         debitNoteDate: date,
         remarks,
+        documents: docs,
         items: context.lines
           .filter((l) => num(qty[keyOf(l)]) > 0)
           .map((l) => ({ materialCode: l.materialCode, materialName: l.materialName, debitQty: num(qty[keyOf(l)]) }))
       };
-      const saved = existing
-        ? updateDebitNote(existing.debitNoteNumber, { ...payload, documents: docs })
-        : createDebitNote({ ...payload, documents: docs });
-      onDone(saved);
+      const response = existing
+        ? await updateDebitNote(existing.debitNoteNumber, existing.version, payload)
+        : await createDebitNote(payload, createToken);
+      onDone(response.record);
     } catch (err) {
       onError(err);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -352,8 +359,8 @@ const DebitNoteForm = ({ context, existing, onDone, onError }) => {
         <button type="button" className="button-secondary" onClick={() => onDone(null)}>
           ← Cancel
         </button>
-        <button type="submit" className="button-primary" disabled={errors.length > 0}>
-          {existing ? 'Save Debit Note' : 'Create Debit Note'}
+        <button type="submit" className="button-primary" disabled={errors.length > 0 || saving}>
+          {saving ? 'Saving…' : existing ? 'Save Debit Note' : 'Create Debit Note'}
         </button>
       </div>
     </form>
@@ -362,32 +369,37 @@ const DebitNoteForm = ({ context, existing, onDone, onError }) => {
 
 /* --------------------------------- details view --------------------------------- */
 
-const DebitNoteDetail = ({ debitNoteNumber, onBack, flash, canCreate, tick, onTick }) => {
+const DebitNoteDetail = ({ note, pendingReplacement = 0, onBack, onRefresh, flash, canCreate }) => {
   const navigate = useNavigate();
-  const note = getDebitNote(debitNoteNumber);
-  if (!note) return null;
-const isDraft = note.status === DEBIT_NOTE_STATUS.DRAFT;
-const canRecord = hasPermission('debitnote.record');
-const canApproveAdmin = hasPermission('debitnote.admin_approve');
+  const [busy, setBusy] = useState(false);
+  const isDraft = note.status === DEBIT_NOTE_STATUS.DRAFT;
+  const canRecord = hasPermission('debitnote.record');
+  const isAdmin = hasPermission('*') || hasPermission('debitnote.admin_approve');
+  const canApproveAdmin = isAdmin;
   const D = DEBIT_NOTE_STATUS;
-
-  /* A Debit Note stays open until the replacement passes Quality Check. */
-  const rejection = note.rejectionNumber ? getRejectionReport(note.rejectionNumber) : null;
-  const pendingReplacement = rejection
-    ? getReplacementQCProgress(rejection.rejectionNumber).pendingQty
-    : 0;
   const closeBlocked = pendingReplacement > 0;
 
-  /** Run a status transition and refresh the view, surfacing the service guard. */
-  const run = (action, okMessage) => {
+  /** Run an API transition; success is announced only after the server confirms it. */
+  const run = async (action, okMessage) => {
+    if (busy) return;
+    setBusy(true);
     try {
-      action(note.debitNoteNumber);
+      await action();
+      await onRefresh();
       flash('ok', okMessage);
-      onTick();
     } catch (err) {
       flash('err', err.message);
+      if (err.current) await onRefresh();
+    } finally {
+      setBusy(false);
     }
   };
+
+  const actionButton = (label, action, message, className = 'button-primary', title = '') => (
+    <button className={className} title={title} disabled={busy} onClick={() => run(action, message)}>
+      {label}
+    </button>
+  );
 
   return (
     <div>
@@ -677,95 +689,79 @@ const canApproveAdmin = hasPermission('debitnote.admin_approve');
         <button className="button-secondary" onClick={() => generateDebitNotePDF(note)}>
           Download PDF
         </button>
-        {isDraft && canCreate && (
-          <button
-            className="button-secondary"
-            title="The Admin must approve the Debit Note before the Purchase Department may issue it"
-            onClick={() =>
-              run(submitDebitNoteRequest, `Debit Note ${note.debitNoteNumber} sent to the Admin for approval.`)
-            }
-          >
-            Submit for Admin Approval
-          </button>
+        {isDraft && canCreate && actionButton(
+          'Submit for Admin Approval',
+          () => transitionDebitNote(note.debitNoteNumber, 'submit', note.version),
+          `Debit Note ${note.debitNoteNumber} sent to the Admin for approval.`,
+          'button-secondary',
+          'The Admin must approve the Debit Note before the Purchase Department may issue it'
         )}
-        {note.status === D.REQUESTED && canRecord && (
-          <button
-            className="button-primary"
-            onClick={() => run(reviewDebitNote, `Purchase review started on Debit Note ${note.debitNoteNumber}.`)}
-          >
-            Start Purchase Review
-          </button>
+        {note.status === D.REQUESTED && canRecord && actionButton(
+          'Start Purchase Review',
+          () => transitionDebitNote(note.debitNoteNumber, 'review', note.version),
+          `Purchase review started on Debit Note ${note.debitNoteNumber}.`
         )}
-        {note.status === D.PURCHASE_REVIEW && canRecord && (
-          <button
-            className="button-primary"
-            title="Purchase authorises the Debit Note and sends it to the Admin for approval"
-            onClick={() =>
-              run(approveDebitNote, `Debit Note ${note.debitNoteNumber} authorised by Purchase — sent to the Admin for approval.`)
-            }
-          >
-            Authorise &amp; Send to Admin
-          </button>
+        {note.status === D.PURCHASE_REVIEW && canRecord && actionButton(
+          'Authorise & Send to Admin',
+          () => transitionDebitNote(note.debitNoteNumber, 'authorise', note.version),
+          `Debit Note ${note.debitNoteNumber} authorised by Purchase — sent to the Admin for approval.`,
+          'button-primary',
+          'Purchase authorises the Debit Note and sends it to the Admin for approval'
         )}
-        {note.status === D.ADMIN_REVIEW && canApproveAdmin && (
-          <button
-            className="button-primary"
-            title="Admin approval hands the Debit Note over to the Purchase Department to send to the vendor"
-            onClick={() =>
-              run(
-                approveDebitNoteByAdmin,
-                `Debit Note ${note.debitNoteNumber} approved by Admin — sent to Purchase to issue and send it to ${note.vendor || 'the vendor'} with the rejection reasons.`
-              )
-            }
-          >
-            Approve &amp; Send to Purchase
-          </button>
+        {note.status === D.ADMIN_REVIEW && canApproveAdmin && actionButton(
+          'Approve & Send to Purchase',
+          () => approveDebitNote(note.debitNoteNumber, note.version),
+          `Debit Note ${note.debitNoteNumber} approved by Admin — sent to Purchase to issue and send it to ${note.vendor || 'the vendor'} with the rejection reasons.`,
+          'button-primary',
+          'Admin approval hands the Debit Note over to the Purchase Department'
         )}
         {note.status === D.ADMIN_REVIEW && !canApproveAdmin && (
           <span className="status-badge st-admin-approval">Awaiting Admin approval</span>
         )}
-        {note.status === D.APPROVED && canRecord && (
-          <button
-            className="button-primary"
-            title="Only the Purchase Department may issue an Admin-approved Debit Note"
-            onClick={() =>
-              run(issueDebitNote, `Debit Note ${note.debitNoteNumber} issued to ${note.vendor || 'vendor'}.`)
-            }
-          >
-            Issue Debit Note
-          </button>
+        {note.status === D.APPROVED && canRecord && actionButton(
+          'Issue Debit Note',
+          () => transitionDebitNote(note.debitNoteNumber, 'issue', note.version),
+          `Debit Note ${note.debitNoteNumber} issued to ${note.vendor || 'vendor'}.`,
+          'button-primary',
+          'Only the Purchase Department may issue an Admin-approved Debit Note'
         )}
-        {[D.ISSUED, D.CREATED, D.SENT].includes(note.status) && canRecord && (
-          <button
-            className="button-primary"
-            title="Forwards the Debit Note to the vendor together with the rejection reasons"
-            onClick={() =>
-              run(
-                sendDebitNoteToVendor,
-                `Debit Note ${note.debitNoteNumber} sent to ${note.vendor || 'the vendor'} with the rejection reasons.`
-              )
-            }
-          >
-            Send to Vendor (with Rejection Reasons)
-          </button>
+        {[D.ISSUED, D.CREATED, D.SENT].includes(note.status) && canRecord && actionButton(
+          'Send to Vendor (with Rejection Reasons)',
+          () => transitionDebitNote(note.debitNoteNumber, 'send', note.version),
+          `Debit Note ${note.debitNoteNumber} sent to ${note.vendor || 'the vendor'} with the rejection reasons.`,
+          'button-primary',
+          'Forwards the Debit Note to the vendor together with the rejection reasons'
         )}
-        {[D.SENT_VENDOR, D.RECORDED].includes(note.status) && canRecord && !closeBlocked && (
-          <button
-            className="button-primary"
-            title={
-              pendingReplacement > 0
-                ? 'Replacement material must pass Quality Check before this Debit Note can close'
-                : 'Close this Debit Note'
-            }
-            onClick={() => run(closeDebitNote, `Debit Note ${note.debitNoteNumber} closed.`)}
-          >
-            Close Debit Note
-          </button>
+        {[D.SENT_VENDOR, D.RECORDED].includes(note.status) && canRecord && !closeBlocked && actionButton(
+          'Close Debit Note',
+          () => transitionDebitNote(note.debitNoteNumber, 'close', note.version),
+          `Debit Note ${note.debitNoteNumber} closed.`,
+          'button-primary',
+          'Close this Debit Note'
         )}
         {[D.SENT_VENDOR, D.RECORDED].includes(note.status) && closeBlocked && (
           <span className="status-badge st-pending-store" title="Store must receive the replacement and Quality must inspect it first">
             Close available after {pendingReplacement} replacement unit(s) pass Quality Check
           </span>
+        )}
+        {[D.DRAFT, D.REQUESTED, D.PURCHASE_REVIEW, D.ADMIN_REVIEW].includes(note.status) && canCreate && actionButton(
+          'Cancel Debit Note',
+          async () => {
+            const reason = window.prompt('Reason for cancelling this Debit Note (optional):') || '';
+            await cancelDebitNote(note.debitNoteNumber, note.version, reason);
+          },
+          `Debit Note ${note.debitNoteNumber} cancelled.`,
+          'button-secondary'
+        )}
+        {[D.DRAFT, D.REQUESTED, D.PURCHASE_REVIEW, D.ADMIN_REVIEW].includes(note.status) && canRecord && actionButton(
+          'Reject Debit Note',
+          async () => {
+            const reason = window.prompt('Reason for rejecting this Debit Note:');
+            if (!reason) throw new Error('A rejection reason is required.');
+            await rejectDebitNote(note.debitNoteNumber, note.version, reason);
+          },
+          `Debit Note ${note.debitNoteNumber} rejected.`,
+          'button-secondary'
         )}
       </div>
 
@@ -798,7 +794,7 @@ const canApproveAdmin = hasPermission('debitnote.admin_approve');
                   .map((h, idx) => (
                     <tr key={idx}>
                       <td>{h.at}</td>
-                      <td>{h.name}</td>
+                      <td>{h.by || h.name}</td>
                       <td>{h.dept}</td>
                       <td>{h.action}</td>
                       <td>{h.details || '—'}</td>
@@ -816,43 +812,117 @@ const canApproveAdmin = hasPermission('debitnote.admin_approve');
 /* ---------------------------------- page shell ---------------------------------- */
 
 const DebitNotesPage = () => {
-  const navigate = useNavigate();
   const location = useLocation();
   const [openNo, setOpenNo] = useState(location.state?.openDebitNote || null);
   const [creatingFor, setCreatingFor] = useState(location.state?.newDebitNoteFor || '');
   const [message, setMessage] = useState(null);
-  const [tick, setTick] = useState(0);
+  const [notes, setNotes] = useState([]);
+  const [candidates, setCandidates] = useState([]);
+  const [note, setNote] = useState(null);
+  const [pendingReplacement, setPendingReplacement] = useState(0);
+  const [context, setContext] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [contextLoading, setContextLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const [candidateSearch, setCandidateSearch] = useState('');
   const [notesSearch, setNotesSearch] = useState('');
 
+  const flash = (type, text) => {
+    setMessage({ type, text });
+    setTimeout(() => setMessage(null), 7000);
+  };
+
+  const reloadLists = async () => {
+    setLoading(true);
+    setLoadError('');
+    try {
+      const [nextNotes, nextCandidates] = await Promise.all([listDebitNotes(), getDebitNoteCandidates()]);
+      setNotes(nextNotes);
+      setCandidates(nextCandidates);
+    } catch (err) {
+      setLoadError(err.message || 'Unable to load Debit Notes from the server.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
-    const s = location.state;
-    if (!s) return;
-    if (s.newDebitNoteFor) {
+    reloadLists();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const state = location.state;
+    if (!state) return;
+    if (state.newDebitNoteFor) {
+      setNote(null);
       setOpenNo(null);
-      setCreatingFor(s.newDebitNoteFor);
-    } else if (s.openDebitNote) {
+      setCreatingFor(state.newDebitNoteFor);
+    } else if (state.openDebitNote) {
+      setContext(null);
       setCreatingFor('');
-      setOpenNo(s.openDebitNote);
+      setOpenNo(state.openDebitNote);
     }
   }, [location.state]);
 
-  const notes = useMemo(() => getDebitNotes(), [tick]);
-  const rejections = useMemo(() => getRejectionReports(), [tick]);
-  const candidates = useMemo(() => eligibleRejections(rejections), [rejections]);
+  useEffect(() => {
+    if (!openNo) {
+      setNote(null);
+      setPendingReplacement(0);
+      return;
+    }
+    let cancelled = false;
+    setDetailLoading(true);
+    getDebitNoteDetail(openNo)
+      .then((result) => {
+        if (cancelled) return;
+        setNote(result.record);
+        setPendingReplacement(Number(result.replacementProgress?.pendingQty) || 0);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        flash('err', err.message);
+        setNote(null);
+        setOpenNo(null);
+      })
+      .finally(() => { if (!cancelled) setDetailLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openNo]);
+
+  useEffect(() => {
+    if (!creatingFor) {
+      setContext(null);
+      return;
+    }
+    let cancelled = false;
+    setContextLoading(true);
+    getDebitNoteContext(creatingFor)
+      .then((result) => { if (!cancelled) setContext(result); })
+      .catch((err) => {
+        if (cancelled) return;
+        flash('err', err.message);
+        setCreatingFor('');
+      })
+      .finally(() => { if (!cancelled) setContextLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creatingFor]);
+
+  const refreshDetail = async () => {
+    if (openNo) {
+      const result = await getDebitNoteDetail(openNo);
+      setNote(result.record);
+      setPendingReplacement(Number(result.replacementProgress?.pendingQty) || 0);
+    }
+    await reloadLists();
+  };
+
   const filteredCandidates = filterDebitCandidates(candidates, candidateSearch);
   const filteredNotes = filterMaterialRecords(notes, notesSearch, ['rejectionNumber','debitNoteNumber','poNumber','qcNumber','receiptNumber','vendor','debitNoteDate','status']);
   const canCreate = hasPermission('debitnote.create');
   const isStoreUser = hasPermission('store.module') && !hasPermission('purchase.order');
-
-  const flash = (type, text) => {
-    setMessage({ type, text });
-    setTick((t) => t + 1);
-    setTimeout(() => setMessage(null), 7000);
-  };
-
-  const context = creatingFor ? getDebitNoteContext(creatingFor) : null;
-  const note = openNo ? getDebitNote(openNo) : null;
 
   return (
     <section className={`page-section${isStoreUser ? ' store-screen' : ''}`}>
@@ -880,17 +950,32 @@ const DebitNotesPage = () => {
         </div>
       )}
 
+      {loading && (
+        <div className="content-block">
+          <p className="muted-text">Loading Debit Notes from PostgreSQL…</p>
+        </div>
+      )}
+      {!loading && loadError && (
+        <div className="content-block">
+          <p style={{ color: '#b91c1c', fontWeight: 600 }}>{loadError}</p>
+          <button className="button-secondary button-small" onClick={reloadLists}>Retry</button>
+        </div>
+      )}
+      {detailLoading && !note && (
+        <div className="content-block"><p className="muted-text">Loading Debit Note…</p></div>
+      )}
+      {contextLoading && !context && (
+        <div className="content-block"><p className="muted-text">Loading rejection details…</p></div>
+      )}
+
       {note && (
         <DebitNoteDetail
-          debitNoteNumber={note.debitNoteNumber}
+          note={note}
+          pendingReplacement={pendingReplacement}
           canCreate={canCreate}
           flash={flash}
-          tick={tick}
-          onTick={() => setTick((t) => t + 1)}
-          onBack={() => {
-            setOpenNo(null);
-            setTick((t) => t + 1);
-          }}
+          onRefresh={refreshDetail}
+          onBack={() => setOpenNo(null)}
         />
       )}
 
@@ -924,6 +1009,9 @@ const DebitNotesPage = () => {
               }
               setCreatingFor('');
               setOpenNo(saved.debitNoteNumber);
+              setNote(saved);
+              setPendingReplacement(0);
+              reloadLists();
               flash('ok', `Debit Note ${saved.debitNoteNumber} saved as draft for ${saved.vendor || 'vendor'}.`);
             }}
           />
