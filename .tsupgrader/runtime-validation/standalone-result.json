@@ -1,16 +1,244 @@
 {
   "planHash": "04ed89fd628ce3562ccff583c3fc084b5ea51b67db88340fe309376a6924f0fc",
   "phase": "standalone",
-  "recordedAtUtc": "2026-11-27T09:06:46.3259741Z",
+  "recordedAtUtc": "2026-11-27T09:08:54.4310205Z",
   "retryCount": 0,
   "resetBaseline": false,
-  "complete": false,
-  "runningStep": "initializing",
+  "complete": true,
   "result": {
-    "setupSucceeded": false,
+    "setupSucceeded": true,
     "setupDurationMs": 0,
     "setupFailureOutput": null,
-    "assertions": [],
-    "executions": []
+    "assertions": [
+      {
+        "name": "production-build",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "\r\n\u003E quotation-management-erp@0.0.1 build\r\n\u003E vite build\r\n\r\n\u001B[36mvite v5.4.21 \u001B[32mbuilding for production...\u001B[36m\u001B[39m\r\ntransforming...\r\n\u001B[32m\u2713\u001B[39m 2303 modules transformed.\r\nrendering chunks...\r\n\u001B[1m\u001B[33m[plugin:vite:reporter]\u001B[39m\u001B[22m \u001B[33m[plugin vite:reporter] \r\n(!) E:/Pragmatics1/src/services/salesOrderApi.js is dynamically imported by E:/Pragmatics1/src/pages/DeliveryChallanPage.jsx but also statically imported by E:/Pragmatics1/src/pages/BackupExportPage.jsx, E:/Pragmatics1/src/pages/CustomersPage.jsx, E:/Pragmatics1/src/pages/DashboardPage.jsx, E:/Pragmatics1/src/pages/ProductionItemRequirementsPage.jsx, E:/Pragmatics1/src/pages/ProductionMaterialRequestsPage.jsx, E:/Pragmatics1/src/pages/ProductionPage.jsx, E:/Pragmatics1/src/pages/SalesDashboardPage.jsx, E:/Pragmatics1/src/pages/SalesOrderPage.jsx, E:/Pragmatics1/src/pages/WorkflowDashboardPage.jsx, E:/Pragmatics1/src/pages/reports/CustomerListPage.jsx, E:/Pragmatics1/src/pages/reports/ReadyToDespatchPage.jsx, E:/Pragmatics1/src/pages/reports/SalesOrderAgeingPage.jsx, E:/Pragmatics1/src/pages/reports/TrackAReportPage.jsx, E:/Pragmatics1/src/utils/projectTracker.js, E:/Pragmatics1/src/utils/workflowService.js, dynamic import will not move module into another chunk.\r\n\u001B[39m\r\n\u001B[1m\u001B[33m[plugin:vite:reporter]\u001B[39m\u001B[22m \u001B[33m[plugin vite:reporter] \r\n(!) E:/Pragmatics1/src/services/qualityApi.js is dynamically imported by E:/Pragmatics1/src/pages/ballooning/DrawingWorkspace.jsx but also statically imported by E:/Pragmatics1/src/pages/QualityReportPage.jsx, E:/Pragmatics1/src/pages/ballooning/Export.jsx, E:/Pragmatics1/src/pages/quality/QualityPage.jsx, dynamic import will not move module into another chunk.\r\n\u001B[39m\r\ncomputing gzip size...\r\n\u001B[2mdist/\u001B[22m\u001B[32mindex.html                          \u001B[39m\u001B[1m\u001B[2m    0.41 kB\u001B[22m\u001B[1m\u001B[22m\u001B[2m \u2502 gzip:     0.29 kB\u001B[22m\r\n\u001B[2mdist/\u001B[22m\u001B[32massets/pdf.worker.min-CHFwMXne.mjs  \u001B[39m\u001B[1m\u001B[2m1,262.40 kB\u001B[22m\u001B[1m\u001B[22m\r\n\u001B[2mdist/\u001B[22m\u001B[35massets/index-DP4Fnl8x.css           \u001B[39m\u001B[1m\u001B[2m  131.19 kB\u001B[22m\u001B[1m\u001B[22m\u001B[2m \u2502 gzip:    23.11 kB\u001B[22m\r\n\u001B[2mdist/\u001B[22m\u001B[36massets/purify.es-BwoZCkIS.js        \u001B[39m\u001B[1m\u001B[2m   22.03 kB\u001B[22m\u001B[1m\u001B[22m\u001B[2m \u2502 gzip:     8.77 kB\u001B[22m\r\n\u001B[2mdist/\u001B[22m\u001B[36massets/index.es-BCpUJo9F.js         \u001B[39m\u001B[1m\u001B[2m  150.81 kB\u001B[22m\u001B[1m\u001B[22m\u001B[2m \u2502 gzip:    51.59 kB\u001B[22m\r\n\u001B[2mdist/\u001B[22m\u001B[36massets/index-hPsSHKwO.js            \u001B[39m\u001B[1m\u001B[33m5,879.92 kB\u001B[39m\u001B[22m\u001B[2m \u2502 gzip: 1,503.50 kB\u001B[22m\r\n\u001B[33m\r\n(!) Some chunks are larger than 500 kB after minification. Consider:\r\n- Using dynamic import() to code-split the application\r\n- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks\r\n- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.\u001B[39m\r\n\u001B[32m\u2713 built in 31.13s\u001B[39m\r\n",
+        "durationMs": 33383
+      },
+      {
+        "name": "tests-pass",
+        "kind": "process",
+        "verificationMethod": "test-results",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "\r\n\u003E quotation-management-erp@0.0.1 test:reports\r\n\u003E node tests/reports-and-lot.test.mjs\r\n\r\n\r\n\u2500\u2500 1. Reports Module Audit\r\n  \u2713  ReportsHomePage component is exported\r\n  \u2713  ReportsHomePage defines SECTIONS catalogue\r\n  \u2713  readLocalStorageList is available\r\n  \u2713  invTotalINR helper is available\r\n  \u2713  invReceivedINR helper is available\r\n  \u2713  invBalanceINR helper is available\r\n  \u2713  getInventoryItems returns an array\r\n  \u2713  getReorderList returns an array\r\n  \u2713  getItemStockOverview returns items\r\n  \u2713  getStockTotals returns totals object\r\n  \u2713  getCategoryWiseStock returns categories array\r\n  \u2713  getStoreIssues returns store issues array\r\n  \u2713  getHTOutsourceRequests returns outsource requests\r\n  \u2713  getMasterCustomerList returns array of customers\r\n\r\n\u2500\u2500 1B. Implemented Report Files and Routes Verification\r\n  \u2713  File exists: src/pages/reports/SalesRegisterPage.jsx\r\n  \u2713  Sales Register imports and uses ReportRegister\r\n  \u2713  Sales Register provides summaryCards\r\n  \u2713  Route registered in App.jsx: /reports/sales-register\r\n  \u2713  File exists: src/pages/reports/SalesOrderAgeingPage.jsx\r\n  \u2713  Sales Order Status \u0026 Ageing imports and uses ReportRegister\r\n  \u2713  Sales Order Status \u0026 Ageing provides summaryCards\r\n  \u2713  Route registered in App.jsx: /reports/sales-orders\r\n  \u2713  File exists: src/pages/reports/SupplierOutstandingPage.jsx\r\n  \u2713  Supplier Outstanding imports and uses ReportRegister\r\n  \u2713  Supplier Outstanding provides summaryCards\r\n  \u2713  Route registered in App.jsx: /reports/purchase/creditors\r\n  \u2713  File exists: src/pages/reports/JobCardPlannedActualPage.jsx\r\n  \u2713  Job Card Planned vs Actual imports and uses ReportRegister\r\n  \u2713  Job Card Planned vs Actual provides summaryCards\r\n  \u2713  Route registered in App.jsx: /reports/production/planned-actual\r\n  \u2713  File exists: src/pages/reports/JobCardMaterialPage.jsx\r\n  \u2713  Job Card Material Issue \u0026 Return imports and uses ReportRegister\r\n  \u2713  Job Card Material Issue \u0026 Return provides summaryCards\r\n  \u2713  Route registered in App.jsx: /reports/production/jc-material\r\n  \u2713  File exists: src/pages/reports/ReadyToDespatchPage.jsx\r\n  \u2713  Ready to Despatch imports and uses ReportRegister\r\n  \u2713  Ready to Despatch provides summaryCards\r\n  \u2713  Route registered in App.jsx: /reports/production/ready-despatch\r\n  \u2713  ReportRegister supports search functionality\r\n  \u2713  ReportRegister supports column sorting\r\n  \u2713  ReportRegister supports explicit Apply and Reset Filters\r\n  \u2713  ReportRegister supports pagination\r\n  \u2713  ReportRegister supports summary cards\r\n\r\n\u2500\u2500 1C. Report Business Logic \u0026 Calculation Verifications\r\n  \u2713  Sales Register total INR calculated (11800)\r\n  \u2713  Sales Register received INR calculated (5000)\r\n  \u2713  Sales Register outstanding INR calculated (6800)\r\n  \u2713  Ageing bucket 15 days = 0\u201330 days\r\n  \u2713  Ageing bucket 45 days = 31\u201360 days\r\n  \u2713  Ageing bucket 75 days = 61\u201390 days\r\n  \u2713  Ageing bucket 120 days = 90\u002B days\r\n  \u2713  Supplier bill outstanding calculated (30000)\r\n  \u2713  Job Card pending qty calculated (15)\r\n  \u2713  Job Card variance calculated (-15)\r\n  \u2713  Job Card net consumption calculated (45)\r\n  \u2713  Ready to Despatch strictly uses QC accepted (80 - 30 = 50, not produced 100)\r\n  \u2713  Produced qty without QC approval is excluded from dispatch\r\n\r\n\u2500\u2500 2. Customer Invoice Optional Lot Number Support\r\n  \u2713  Blank lot number is preserved as empty string\r\n  \u2713  Blank lot item calculation is intact (5000)\r\n  \u2713  Legacy item without lotNumber defaults safely to empty string\r\n  \u2713  Legacy item amount is computed correctly\r\n  \u2713  Specified lot number is preserved exactly\r\n  \u2713  Multiple lots in single line field preserved\r\n  \u2713  Two lines for same product supported\r\n  \u2713  Line 1 lot and quantity correct\r\n  \u2713  Line 2 lot and quantity correct\r\n  \u2713  Total amount across split lot lines matches\r\n  \u2713  Invoice payload serialization preserves line 1 lot number\r\n  \u2713  Invoice payload serialization preserves line 2 lot number\r\n  \u2713  Empty lot number renders clean dash in view mode\r\n  \u2713  Legacy item without lot renders dash in view mode\r\n  \u2713  Item with lot renders lot number in view mode\r\n  \u2713  Invoice with all blank lots hides Lot No. column in Print/PDF\r\n\n\u2026[truncated]",
+        "durationMs": 1466,
+        "testResults": {
+          "testFramework": "unknown",
+          "runnerDetectedFrom": "none",
+          "testsTotal": 0,
+          "testsPassed": 0,
+          "testsFailed": 0,
+          "testsSkipped": 0,
+          "parseFailed": true
+        }
+      },
+      {
+        "name": "track-a-report-calculations",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "Track A report checks passed: 41\r\n  \u2713 Supplier directory\r\n  \u2713 Available / issued stock\r\n  \u2713 Inward\r\n  \u2713 GRN\u2013PO\u2013PR\r\n  \u2713 GRN\u2013PO\u2013PR report uses PostgreSQL Purchase Request and PO sources\r\n  \u2713 Advance shipment empty without source\r\n  \u2713 Customer material status\r\n  \u2713 MRN detail\r\n  \u2713 Outsourcing source coverage\r\n  \u2713 No local-storage fallback\r\n  \u2713 suppliers view and PDF/XLSX/Print controls\r\n  \u2713 suppliers XLSX serialization\r\n  \u2713 suppliers PDF generation\r\n  \u2713 stock view and PDF/XLSX/Print controls\r\n  \u2713 stock XLSX serialization\r\n  \u2713 stock PDF generation\r\n  \u2713 inward view and PDF/XLSX/Print controls\r\n  \u2713 inward XLSX serialization\r\n  \u2713 inward PDF generation\r\n  \u2713 grnPoPr view and PDF/XLSX/Print controls\r\n  \u2713 grnPoPr XLSX serialization\r\n  \u2713 grnPoPr PDF generation\r\n  \u2713 advanceShipment view and PDF/XLSX/Print controls\r\n  \u2713 advanceShipment XLSX serialization\r\n  \u2713 advanceShipment PDF generation\r\n  \u2713 customerMaterialStatus view and PDF/XLSX/Print controls\r\n  \u2713 customerMaterialStatus XLSX serialization\r\n  \u2713 customerMaterialStatus PDF generation\r\n  \u2713 mrnDetail view and PDF/XLSX/Print controls\r\n  \u2713 mrnDetail XLSX serialization\r\n  \u2713 mrnDetail PDF generation\r\n  \u2713 Employee-wise material issue view and PDF/XLSX/Print controls\r\n  \u2713 Employee-wise material issue XLSX serialization\r\n  \u2713 Employee-wise material issue PDF generation\r\n  \u2713 OS material with supplier view and PDF/XLSX/Print controls\r\n  \u2713 OS material with supplier XLSX serialization\r\n  \u2713 OS material with supplier PDF generation\r\n  \u2713 Ready to Dispatch with Value view and PDF/XLSX/Print controls\r\n  \u2713 Ready to Dispatch with Value XLSX serialization\r\n  \u2713 Ready to Dispatch with Value PDF generation\r\n  \u2713 Print full-row behavior and pagination restoration\r\n",
+        "durationMs": 5455
+      },
+      {
+        "name": "store-debit-authority-consumers",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "Store and Debit Note authority consumer checks passed: 23 assertions.\r\n",
+        "durationMs": 184
+      },
+      {
+        "name": "production-authority-consumers",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "Production authority consumer checks passed: 17 assertions.\r\n",
+        "durationMs": 137
+      },
+      {
+        "name": "guarded-postgres-sequence",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "Guarded test database: vyavastha_test\r\n\\n=== enquiries-api.test.mjs ===\r\nPASS refresh replaces the active list with PostgreSQL and never activates local cached rows\r\nPASS Customer Enquiry PDF preview imports its external-link icon\r\nPASS PDF preview opens safely in a new tab and releases its Blob URL when closed\r\nPASS Enquiry drawing preview supports authenticated PDF download after PostgreSQL retrieval\r\nPASS Enquiry client has no local cache-to-active-state restore helper\r\nPASS edit form strips embedded legacy drawing bytes and reloads saved attachments from PostgreSQL\r\nPASS normal Enquiry and BOM previews cannot use embedded/local Enquiry drawing fallbacks\r\nPASS View navigates to a stable enquiry URL and direct navigation loads its PostgreSQL record by ID\r\nPASS active list and migration review use the same PostgreSQL enquiry snapshot\r\nPASS a stale View link refreshes the authoritative list after PostgreSQL returns not found\r\nPASS legacy drawing recovery cannot bypass an Enquiry deletion tombstone\r\nPASS enquiry detail API and persisted attachment reference are used for retrieval\r\nPASS new drawing references are saved only after PostgreSQL read-back verification\r\nPASS embedded legacy bytes are retained only for explicit Admin recovery\r\nPASS checksum inventory and backfill endpoints enforce Admin authorization\r\nPASS drawing access is permission-scoped and attachment inventory is Admin-only\r\nPASS drawing display reads PostgreSQL binary content before any legacy IndexedDB migration helper\r\nPASS drawing preview rejects empty or malformed stored PDFs before opening them\r\nPASS legacy recovery selects actual embedded PDF bytes only for the exact enquiry and drawing\r\nPASS conflicting embedded browser copies are not selected for migration\r\nPASS legacy drawing migration is create-only, verifies stored bytes, and retains the local copy\r\nPASS isolated PostgreSQL database is connected\r\nPASS historical Enquiry deletes are represented by tombstones after migration backfill\r\nPASS Admin read-only inventory includes a missing-checksum attachment\r\nPASS checksum review inventory requires authentication\r\nPASS Admin review returns attachment identity, content, and candidate SHA-256 without changing it\r\nPASS unverified attachment cannot receive checksum backfill\r\nPASS mismatched trusted-original checksum is rejected\r\nPASS ordinary upload cannot overwrite a checksum-less existing attachment\r\nPASS inventory and review remain read-only until trusted verification succeeds\r\nPASS confirmed trusted-original comparison stores the correct SHA-256\r\nPASS checksum backfill leaves attachment bytes and updated_at unchanged\r\nPASS checksum verification records Admin, time, method, source reference, and audit history\r\nPASS create persists and returns a database-assigned enquiry ID\r\nPASS direct enquiry detail endpoint retrieves all persisted item lines by ID\r\nPASS missing enquiry detail returns an explicit PostgreSQL not-found response\r\nPASS direct enquiry detail requires authentication\r\nPASS retry token does not create a duplicate\r\nPASS idempotency token has exactly one PostgreSQL record\r\nPASS second authenticated client reads the shared record\r\nPASS record exists in PostgreSQL module_records\r\nPASS delete requires an authenticated Admin session\r\nPASS migration imports missing legacy IDs without renumbering\r\nPASS reimport recognizes the same ID without duplication\r\nPASS conflicting migration preserves PostgreSQL data\r\nPASS enquiry rejects a drawing file ID that does not match the enquiry and drawing\r\nPASS enquiry does not persist an attachment reference before PostgreSQL has verified file bytes\r\nPASS authenticated non-Admins cannot enumerate attachment metadata\r\nPASS authenticated users without Enquiry drawing permission cannot upload attachments\r\nPASS legacy local-copy migration requires Admin authorization\r\nPASS PDF preview requires an authenticated session\r\nPASS binary PDF retrieval requires an authenticated session\r\nPASS drawing attachment saves to PostgreSQL\r\nPASS PostgreSQL persists PDF bytes, filename, MIME, size, enquiry linkage, and SHA-256\r\nPASS authen\n\u2026[truncated]",
+        "durationMs": 77679
+      },
+      {
+        "name": "recycle-bin-api-guarded",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "PASS Admin session authenticates\r\nPASS Recycle Bin list requires authentication\r\nPASS Inventory fixture is created authoritatively\r\nPASS Inventory fixture is soft-deleted\r\nPASS Deleted inventory item appears in the Recycle Bin list\r\nPASS Recycle Bin list exposes module and document number\r\nPASS Recycle Bin list exposes deletion reason and actor\r\nPASS Admin sees restore and purge actions\r\nPASS Module filter excludes records from other modules\r\nPASS Deletion-date and deleted-by filters include the tombstone\r\nPASS Recycle Bin detail returns the tombstoned record\r\nPASS Recycle Bin detail exposes the module delete audit row\r\nPASS A non-Admin employee account is available\r\nPASS Unauthenticated restore is rejected\r\nPASS Non-Admin cannot permanently delete from the Recycle Bin\r\nPASS Restore requires a reason\r\nPASS Unknown Recycle Bin entity is rejected\r\nPASS Authorised restore clears the tombstone\r\nPASS Restore advances the PostgreSQL version\r\nPASS Restore writes a durable audit row\r\nPASS Restoring an active record is rejected\r\nPASS Restored record leaves the Recycle Bin list\r\nPASS Inventory fixture is soft-deleted again for purge\r\nPASS Permanent delete requires an exact document-number confirmation\r\nPASS Permanent delete requires a reason\r\nPASS Admin can permanently delete an unreferenced tombstone\r\nPASS Permanent delete removes the row from PostgreSQL\r\nPASS Permanent delete writes a durable audit row\r\nPASS A repeated permanent delete is rejected\r\nPASS Restore is blocked while a required parent remains deleted\r\nPASS Restore is blocked when a required parent no longer exists\r\nPASS Parent record restores through the Recycle Bin\r\nPASS Child record restores after its parent is active\r\nPASS Permanent delete is blocked while child records still reference the parent\r\nPASS Unreferenced child record can be permanently deleted (200 )\r\nPASS Parent record can be permanently deleted after children are gone (200 )\r\nPASS Dependency fixtures are physically removed after purge\r\nRECYCLE BIN API CHECKS PASSED (37 assertions)\r\n",
+        "durationMs": 4011
+      },
+      {
+        "name": "purchase-requests-api-guarded",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "PASS Admin session authenticates\r\nPASS Purchase Request list requires authentication\r\nPASS Generic erp_state synchronization rejects the migrated Purchase Request key\r\nPASS Migration preview requires authentication\r\nPASS Dedicated Employee API creates authorization fixture ()\r\nPASS Non-Admin test account authenticates\r\nPASS Purchase Request is created in PostgreSQL pending approval\r\nPASS Database sequence and initial optimistic version are returned\r\nPASS Purchase Request item quantities are stored in normalized PostgreSQL rows\r\nPASS Create retry is idempotent\r\nPASS Idempotency token cannot be reused for different data\r\nPASS Non-Admin without Purchase approval permission cannot approve\r\nPASS Authorized approval advances the optimistic version\r\nPASS Stale Purchase Request transition is rejected\r\nPASS Create and approval history is durably audited\r\nPASS Vendor Enquiry preserves the approved Purchase Request link (201: ; )\r\nPASS Vendor Enquiry source reference is normalized in PostgreSQL\r\nPASS Vendor Quotation can be raised from the PostgreSQL-backed Purchase Request enquiry\r\nPASS Purchase Request Vendor Quotation is accepted in PostgreSQL\r\nPASS Purchase Order conversion advances the linked Purchase Request\r\nPASS Purchase Order stores the Purchase Request relationship in PostgreSQL\r\nPASS Converted Purchase Request cannot be deleted while procurement documents reference it\r\nPASS Second Purchase Request fixture is created\r\nPASS Rejection requires a reason\r\nPASS Authorized rejection persists its reason\r\nPASS Admin soft delete retains the Purchase Request tombstone\r\nPASS Purchase Request tombstone appears in the central Recycle Bin\r\nPASS Admin can restore a Purchase Request through the central Recycle Bin\r\nPASS Restored Purchase Request can be soft-deleted again with its latest version\r\nPASS Recycle Bin detail combines module and restore audit history\r\nPASS Admin can permanently purge a confirmed Purchase Request tombstone\r\nPASS Permanent Purchase Request deletion is durably audited\r\nPASS Admin preview identifies eligible preserved legacy records\r\nPASS Admin selected import creates the PostgreSQL record\r\nPASS Reconciliation recognizes the imported record without overwriting legacy data\r\nPURCHASE REQUEST API CHECKS PASSED (35 assertions)\r\n",
+        "durationMs": 2813
+      },
+      {
+        "name": "frontend-homepage-http-200",
+        "kind": "http-probe",
+        "verificationMethod": "http-status",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": null,
+        "outputSample": "HTTP 200\n\u003C!DOCTYPE html\u003E\r\n\u003Chtml lang=\u0022en\u0022\u003E\r\n\r\n\u003Chead\u003E\n  \u003Cscript type=\u0022module\u0022\u003Eimport { injectIntoGlobalHook } from \u0022/@react-refresh\u0022;\ninjectIntoGlobalHook(window);\nwindow.$RefreshReg$ = () =\u003E {};\nwindow.$RefreshSig$ = () =\u003E (type) =\u003E type;\u003C/script\u003E\n\n  \u003Cscript type=\u0022module\u0022 src=\u0022/@vite/client\u0022\u003E\u003C/script\u003E\n\r\n    \u003Cmeta charset=\u0022UTF-8\u0022 /\u003E\r\n    \u003Cmeta name=\u0022viewport\u0022 content=\u0022width=device-width, initial-scale=1.0\u0022 /\u003E\r\n    \u003Ctitle\u003EVYAVASTA SOFTWARE\u003C/title\u003E\r\n\u003C/head\u003E\r\n\r\n\u003Cbody\u003E\r\n    \u003Cdiv id=\u0022root\u0022\u003E\u003C/div\u003E\r\n    \u003Cscript type=\u0022module\u0022 src=\u0022/src/main.jsx\u0022\u003E\u003C/script\u003E\r\n\u003C/body\u003E\r\n\r\n\u003C/html\u003E\n--- server output ---\n\r\n\u003E quotation-management-erp@0.0.1 dev:frontend\r\n\u003E vite --host 127.0.0.1 --port 5176 --strictPort\r\n\r\n\r\n  \u001B[32m\u001B[1mVITE\u001B[22m v5.4.21\u001B[39m  \u001B[2mready in \u001B[0m\u001B[1m551\u001B[22m\u001B[2m\u001B[0m ms\u001B[22m\r\n\r\n  \u001B[32m\u279C\u001B[39m  \u001B[1mLocal\u001B[22m:   \u001B[36mhttp://127.0.0.1:\u001B[1m5176\u001B[22m/\u001B[39m\r\n",
+        "durationMs": 2822
+      }
+    ],
+    "executions": [
+      {
+        "source": "production-build",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\npm.CMD",
+        "args": [
+          "run",
+          "build"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "tests-pass",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\npm.CMD",
+        "args": [
+          "run",
+          "test:reports"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "track-a-report-calculations",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\node.EXE",
+        "args": [
+          "tests/track-a-reports.test.mjs"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "store-debit-authority-consumers",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\node.EXE",
+        "args": [
+          "tests/store-debit-authority-consumers.test.mjs"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "production-authority-consumers",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\node.EXE",
+        "args": [
+          "tests/production-authority-consumers.test.mjs"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "guarded-postgres-sequence",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\node.EXE",
+        "args": [
+          "--input-type=module",
+          "-e",
+          "import \u0027dotenv/config\u0027; import { spawnSync } from \u0027node:child_process\u0027; import pg from \u0027pg\u0027; const url = process.env.ERP_TEST_DATABASE_URL; if (!url) throw new Error(\u0027ERP_TEST_DATABASE_URL is required; refusing test writes.\u0027); const configuredName = decodeURIComponent(new URL(url).pathname.replace(/^\\/\u002B/, \u0027\u0027)); if (configuredName !== \u0027vyavastha_test\u0027) throw new Error(\u0027ERP_TEST_DATABASE_URL must name exactly vyavastha_test.\u0027); const pool = new pg.Pool({ connectionString: url }); try { const identity = await pool.query(\u0027SELECT current_database() AS name\u0027); console.log(\u0027Guarded test database:\u0027, identity.rows[0]?.name); if (identity.rows[0]?.name !== \u0027vyavastha_test\u0027) throw new Error(\u0027Refusing test writes: current_database() is not exactly vyavastha_test.\u0027); } finally { await pool.end(); } const suites = [\u0027enquiries-api.test.mjs\u0027, \u0027quotation-api.test.mjs\u0027, \u0027customer-po-api.test.mjs\u0027, \u0027sales-orders-api.test.mjs\u0027, \u0027delivery-challans-api.test.mjs\u0027, \u0027customer-invoices-api.test.mjs\u0027, \u0027export-invoices-api.test.mjs\u0027, \u0027procurement-intake-api.test.mjs\u0027, \u0027store-inventory-api.test.mjs\u0027, \u0027masters-api.test.mjs\u0027, \u0027debit-notes-api.test.mjs\u0027, \u0027workflow-ledger-records-api.test.mjs\u0027, \u0027production-api.test.mjs\u0027, \u0027bom-api.test.mjs\u0027, \u0027routing-api.test.mjs\u0027, \u0027authoritative-deletes-api.test.mjs\u0027, \u0027receipt-linked-records-api.test.mjs\u0027, \u0027recycle-bin-api.test.mjs\u0027, \u0027purchase-requests-api.test.mjs\u0027, \u0027financial-advances-api.test.mjs\u0027, \u0027availability-checks-api.test.mjs\u0027, \u0027supplier-outstanding-advances-api.test.mjs\u0027, \u0027employee-master-api.test.mjs\u0027, \u0027auth-login.test.mjs\u0027, \u0027employee-assignment-delete.test.mjs\u0027, \u0027role-permission-integration.test.mjs\u0027, \u0027department-role-catalog-api.test.mjs\u0027, \u0027role-permission-sync.test.mjs\u0027, \u0027production-dispatch.test.mjs\u0027, \u0027shared-masters-client.test.mjs\u0027]; for (const suite of suites) { console.log(\u0027\\\\n=== \u0027 \u002B suite \u002B \u0027 ===\u0027); const result = spawnSync(process.execPath, [\u0027tests/\u0027 \u002B suite], { cwd: process.cwd(), env: process.env, stdio: \u0027inherit\u0027 }); if (result.error) throw result.error; if (result.status !== 0) process.exit(result.status ?? 1); } console.log(\u0027SEQUENTIAL SUITES PASSED: \u0027 \u002B suites.length);"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "recycle-bin-api-guarded",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\node.EXE",
+        "args": [
+          "tests/recycle-bin-api.test.mjs"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "purchase-requests-api-guarded",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\node.EXE",
+        "args": [
+          "tests/purchase-requests-api.test.mjs"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "frontend-homepage-http-200",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\npm.CMD",
+        "args": [
+          "run",
+          "dev:frontend",
+          "--",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "5176",
+          "--strictPort"
+        ],
+        "cwd": "E:\\Pragmatics1",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      }
+    ]
   }
 }
